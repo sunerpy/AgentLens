@@ -1529,10 +1529,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::path::PathBuf;
-    // `Stdio` has unix/linux consumers only, so this stays `cfg(unix)`. Windows'
-    // `assert_windows_process_exits` gets `Command` from the parent module's ungated import
-    // via `use super::*`; widening here would leave `Stdio` unused on Windows.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2301,27 +2298,35 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
     fn ssh_probe_timeout_is_typed_kills_the_windows_job_and_leaves_no_stale_state() {
         use std::time::{Duration, Instant};
 
+        const CHILD_PID_ENV: &str = "AGENTLENS_WINDOWS_JOB_CHILD_PID";
         const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
         const TEST_ALLOWANCE: Duration = Duration::from_secs(15);
+
+        if let Some(child_pid) = env::var_os(CHILD_PID_ENV) {
+            let mut child = Command::new("ping.exe")
+                .args(["-n", "61", "127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn Windows job descendant");
+            fs::write(PathBuf::from(child_pid), child.id().to_string())
+                .expect("publish Windows job descendant pid");
+            child.wait().expect("wait for Windows job descendant");
+            return;
+        }
 
         let temp = tempfile::tempdir().expect("fake ssh tempdir");
         let ssh = temp.path().join("ssh.cmd");
         let scp = temp.path().join("scp.cmd");
-        let sleeper = temp.path().join("hang.ps1");
         let child_pid = temp.path().join("child.pid");
-        fs::write(
-            &sleeper,
-            format!(
-                "$child = Start-Process powershell.exe -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -PassThru\nSet-Content -Path '{}' -Value $child.Id -NoNewline\nWait-Process -Id $child.Id\n",
-                child_pid.display()
-            ),
-        )
-        .expect("write PowerShell sleeper");
+        let test_exe = env::current_exe().expect("resolve current Windows test executable");
         fs::write(
             &ssh,
             format!(
-                "@echo off\r\nif \"%~1\"==\"-V\" exit /b 0\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"\r\n",
-                sleeper.display()
+                "@echo off\r\nif \"%~1\"==\"-V\" exit /b 0\r\nset \"{CHILD_PID_ENV}={}\"\r\n\"{}\" --exact transport::ssh::tests::ssh_probe_timeout_is_typed_kills_the_windows_job_and_leaves_no_stale_state --nocapture\r\n",
+                child_pid.display(),
+                test_exe.display()
             ),
         )
         .expect("write fake ssh");
@@ -2332,9 +2337,8 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
         for attempt in 1..=2 {
             let started = Instant::now();
             let transport = SshTransport::new(
-                // Hosted Windows runners can take several seconds to cold-start the nested
-                // PowerShell processes. The PID file remains the handshake proving that a real
-                // descendant existed before the timeout terminated the job.
+                // Re-enter this test in fixture mode so the job owns a known descendant without
+                // depending on environment-sensitive PowerShell process startup.
                 StdCommandRunner::with_timeout(PROBE_TIMEOUT),
                 tools.clone(),
                 SshAuthentication::Batch {
