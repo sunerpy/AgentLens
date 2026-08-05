@@ -136,8 +136,31 @@ mod tests {
         )
         .expect("write generated bindings index");
 
-        run(&frontend, "npx", &["prettier", "--write", "src/generated"]);
-        run(&frontend, "npx", &["tsc", "--noEmit"]);
+        run(
+            &frontend,
+            node_package_runner(),
+            &["prettier", "--write", "src/generated"],
+        );
+        run(&frontend, node_package_runner(), &["tsc", "--noEmit"]);
+    }
+
+    #[cfg(windows)]
+    fn node_package_runner() -> &'static str {
+        "npx.cmd"
+    }
+
+    #[cfg(not(windows))]
+    fn node_package_runner() -> &'static str {
+        "npx"
+    }
+
+    #[test]
+    fn node_package_runner_uses_the_platform_executable_shim() {
+        #[cfg(windows)]
+        assert_eq!(node_package_runner(), "npx.cmd");
+
+        #[cfg(not(windows))]
+        assert_eq!(node_package_runner(), "npx");
     }
 
     fn run(current_dir: &Path, program: &str, arguments: &[&str]) {
