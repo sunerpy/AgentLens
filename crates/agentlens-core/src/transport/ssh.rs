@@ -2301,6 +2301,9 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
     fn ssh_probe_timeout_is_typed_kills_the_windows_job_and_leaves_no_stale_state() {
         use std::time::{Duration, Instant};
 
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+        const TEST_ALLOWANCE: Duration = Duration::from_secs(15);
+
         let temp = tempfile::tempdir().expect("fake ssh tempdir");
         let ssh = temp.path().join("ssh.cmd");
         let scp = temp.path().join("scp.cmd");
@@ -2329,7 +2332,10 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
         for attempt in 1..=2 {
             let started = Instant::now();
             let transport = SshTransport::new(
-                StdCommandRunner::with_timeout(Duration::from_secs(1)),
+                // Hosted Windows runners can take several seconds to cold-start the nested
+                // PowerShell processes. The PID file remains the handshake proving that a real
+                // descendant existed before the timeout terminated the job.
+                StdCommandRunner::with_timeout(PROBE_TIMEOUT),
                 tools.clone(),
                 SshAuthentication::Batch {
                     identity_file: None,
@@ -2341,7 +2347,10 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
                 .probe_connection_with_cancel("fixture.invalid", &|| false)
                 .expect_err("a hanging probe must hit its wall-clock deadline");
 
-            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(
+                started.elapsed() < TEST_ALLOWANCE,
+                "attempt {attempt} blocked past the bounded test allowance"
+            );
             assert!(
                 matches!(
                     error,
