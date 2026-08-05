@@ -203,16 +203,6 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: 临时探针 Windows npx shim 解析
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Write-Output "PATH=$env:PATH"
-          where.exe npx
-          Get-Command npx -All | Format-List Name,CommandType,Source,Path
-          npx --version
-          throw "temporary npx probe completed"
-
       # 硬安装、硬断言：`make fmt-check` 在缺少 oxfmt 时只打印提示并**静默跳过**
       # YAML/JSON/Markdown 格式检查，把格式门禁悄悄降级成「只查 Rust」。
       - name: 安装 oxfmt（缺它会让 make fmt-check 静默降级）
