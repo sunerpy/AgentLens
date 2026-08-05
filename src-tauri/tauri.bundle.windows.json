@@ -1,0 +1,11 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": ["../target/dist/binaries/agentlens-askpass"],
+    "resources": {
+      "../target/dist/binaries/agentlens-collector-x86_64-unknown-linux-musl": "",
+      "../target/dist/binaries/agentlens-collector-aarch64-unknown-linux-musl": "",
+      "../target/dist/binaries/collectors.sha256": ""
+    }
+  }
+}

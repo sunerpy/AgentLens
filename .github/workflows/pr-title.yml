@@ -1,0 +1,90 @@
+name: pr-title
+
+# ===========================================================================
+# PR 标题门禁：强制 Conventional Commits。
+#
+# 为什么这道门禁是发布链路的一部分，而不是风格洁癖：
+#   仓库以 squash 合并时，release-please 只看得到 squash 提交的**标题**。
+#   一个分支里塞了 feat: / fix: 提交、但 PR 标题写成 chore: 或 refactor: 的 PR，
+#   合并后会被折叠成不可发布的 subject —— release-please 于是**静默停止升版**，
+#   没有报错、没有告警，只是再也不开发布 PR。所以：
+#     - 仓库的 squash 合并策略必须设为 PR_TITLE（Settings -> General ->
+#       Pull Requests -> Default commit message: "Pull request title"）；
+#     - PR 标题就是那次发布本身，必须由本 workflow 强制成 Conventional Commits。
+#
+# 刻意不引第三方 action：这道检查是一行正则，手写的 bash 完全可审计，
+# 也不必为一个几百 star 的 action 承担供应链风险。
+#
+# PR 标题是**攻击者可控输入**，因此只通过 env 传给 shell，绝不直接把
+# ${{ github.event.pull_request.title }} 插进 run 脚本里 —— 后者会让标题里的
+# 反引号或 $() 在 runner 上执行（script injection）。
+#
+# 刻意**不**校验标题长度：仓库规范里的「≤72 字」是按字符数说的，而 bash 的
+# ${#var} 在多字节中文上数的是字节，直接卡长度会让合规的中文标题假红。
+# ===========================================================================
+
+on:
+  pull_request:
+    # edited 必须在：改标题后要重新判定，否则改坏了也不会再跑。
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  conventional-title:
+    name: PR 标题符合 Conventional Commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # type 枚举 = 仓库提交规范的七类（feat|fix|docs|style|refactor|test|chore）
+      # 加上 release-please 同样识别、且历史里已在用的 perf|build|ci|revert。
+      # scope 必填：git log 里每一条提交都带 scope，这里保持一致。
+      # `!` 可选，用于标记 BREAKING CHANGE。
+      - name: 校验标题
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)\([a-z0-9._/-]+\)!?: .+'
+
+          echo "PR 标题：${PR_TITLE}"
+
+          if ! printf '%s\n' "$PR_TITLE" | grep -qE "$pattern"; then
+            cat <<'EOF'
+          标题不符合 Conventional Commits。要求形如：
+
+            <type>(<scope>): <中文祈使句主题>
+
+          type 只能是 feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert，
+          scope 必填且为小写英文，冒号后必须有一个空格。
+
+          例：
+            feat(archive): 增加 app_settings 读写 API
+            fix(portability): 修复 Windows 平台四处产品缺陷
+            ci(release): 接入 release-please 与三平台发布流程
+
+          注意 squash 合并时本标题就是落到 main 上的提交 subject，
+          release-please 靠它判定升版。写成 chore(...) 的 PR 不会触发版本发布。
+          EOF
+            exit 1
+          fi
+
+          # 主题结尾不带标点（仓库规范）。用 case 做**字面量后缀**匹配而不是正则
+          # 字符集：多字节的「。」在非 UTF-8 locale 下会被正则按字节拆开，可能误判
+          # 合规的中文标题；case 的后缀匹配是逐字节比较，任何 locale 下都准确。
+          case "$PR_TITLE" in
+            *.|*。)
+              echo "标题结尾不要标点：${PR_TITLE}"
+              exit 1
+              ;;
+          esac
+
+          echo "gate ok: PR 标题合规"

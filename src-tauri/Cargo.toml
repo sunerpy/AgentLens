@@ -1,0 +1,52 @@
+[package]
+name = "agentlens-tauri"
+description = "AgentLens 桌面壳（Tauri 2）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# `_lib` 后缀是 Tauri 官方模板约定：避免 Windows 上 lib 与 bin 同名冲突
+# （https://github.com/rust-lang/cargo/issues/8519）。
+name = "agentlens_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+ts-export = ["dep:ts-rs"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agentlens-core = { workspace = true }
+# tray-icon：托盘常驻能力（托盘行为本身由后续 todo 实现，此处仅启用 feature）
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+ts-rs = { version = "=11.0.1", optional = true, features = ["serde-json-impl"] }
+# OS 钥匙串（口令/passphrase 唯一落地点，绝不写配置文件）。
+# 默认 feature 会退化成进程内 mock store —— 那等于"看起来通过"的假绿灯，
+# 所以显式关掉 default 并按平台钉死真实后端：Linux libsecret / Windows Credential Manager。
+keyring = { version = "=3.6.3", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = [
+  "sync-secret-service",
+  "crypto-rust",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = [
+  "windows-native",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
