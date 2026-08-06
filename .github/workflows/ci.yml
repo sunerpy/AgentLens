@@ -90,15 +90,26 @@ name: ci
 # ===========================================================================
 
 on:
+  # push 只跑 main：徽章（无 ?branch= 参数时取默认分支）与 Codecov 的主线基线都需要它。
+  # 功能分支不在这里触发 —— 否则同一个提交会被 push 与 pull_request 各触发一次，
+  # 白跑一遍三平台（约 60 分钟机时），还会让「哪个 run 才是准的」变得含糊。
+  # 代价是：没开 PR 的分支推上去不会有 CI。本仓库 main 受保护、只允许 squash 合并，
+  # 一切改动都要过 PR，所以这个代价不存在实际盲区。
   push:
+    branches:
+      - main
   pull_request:
 
 permissions:
   contents: read
 
-# 同一分支的重复运行相互取消：push 与 pull_request 会对同一提交各触发一次。
+# group 里必须带 github.event_name。少了它，push 与 pull_request 的 run 会落进同一组，
+# cancel-in-progress 于是让两者互相击杀：实测提交 63502bb 上三平台的成功证据被打散到两个
+# run 里（push 的 macOS 绿、PR 的 Linux 绿），而 Windows 在两个 run 里都是 cancelled ——
+# 从未真正跑完，PR 因此永远拿不到完整绿灯。
+# 排查时要留意：cancelled 不是 failure，失败步骤显示为「Set up job」时说明根本没进到代码。
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 defaults:
