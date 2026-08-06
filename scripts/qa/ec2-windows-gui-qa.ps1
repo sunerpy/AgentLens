@@ -15,8 +15,10 @@
 #   1. Pre-flight: record OS, session id, screen metrics, WebView2 presence.
 #   2. Install the WebView2 Evergreen Runtime if absent. Without it the
 #      WebView2 window cannot render at all, so this gates everything.
-#   3. Download AgentLens_0.1.0_x64-setup.exe from S3 and VERIFY its SHA-256.
-#      A mismatch is a hard failure; nothing is installed.
+#   3. Download the AgentLens x64 NSIS setup from S3 and VERIFY its SHA-256.
+#      The file name is derived from the workspace version, so it changes with
+#      every release; see $script:SetupName. A mismatch is a hard failure;
+#      nothing is installed.
 #   4. Install silently (/S /NS), then resolve the real install directory out
 #      of the registry rather than assuming it.
 #   5. Launch the app, wait for a visible top-level HWND owned by its pid.
@@ -160,7 +162,13 @@ $script:WorkDir = 'C:\agentlens-qa'
 $script:OutDir = Join-Path $script:WorkDir 'out'
 $script:LogPath = Join-Path $script:OutDir 'qa.log'
 $script:ProductName = 'AgentLens'
-$script:SetupName = 'AgentLens_0.1.0_x64-setup.exe'
+# SINGLE SOURCE for the version; the setup file name is DERIVED from it so a
+# release-please version bump does not leave this harness looking for an artifact
+# that no longer exists. The default is the version currently in the root
+# Cargo.toml [workspace.package]; unlike AGENTLENS_QA_BUCKET that is an honest
+# default rather than a guess, so it is optional and not a hard throw.
+$script:Version = if ($env:AGENTLENS_QA_VERSION) { $env:AGENTLENS_QA_VERSION } else { '0.1.0' }
+$script:SetupName = "AgentLens_$($script:Version)_x64-setup.exe"
 
 # The main binary is NOT productName.exe. tauri.conf.json declares no
 # bundle.windows.mainBinaryName, so the NSIS template ships the Cargo bin name:
