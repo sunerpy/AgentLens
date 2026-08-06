@@ -319,16 +319,13 @@ fn run_process(
             break;
         }
         if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            terminate_child(&mut child, process_tree.as_ref())?;
-            join_reader(stdout_reader)?;
-            join_reader(stderr_reader)?;
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!(
-                    "process exceeded the {} ms wall-clock limit and its process tree was terminated",
-                    timeout.expect("checked timeout").as_millis()
-                ),
-            ));
+            let limit = timeout.expect("checked timeout");
+            let cleanup_error = terminate_child(&mut child, process_tree.as_ref()).err();
+            if cleanup_error.is_none() {
+                join_reader(stdout_reader)?;
+                join_reader(stderr_reader)?;
+            }
+            return Err(process_timeout_error(limit, cleanup_error));
         }
         thread::sleep(COMMAND_POLL_INTERVAL);
     }
@@ -341,6 +338,21 @@ fn run_process(
         stdout: join_reader(stdout_reader)?,
         stderr: join_reader(stderr_reader)?,
     })
+}
+
+fn process_timeout_error(timeout: Duration, cleanup_error: Option<io::Error>) -> io::Error {
+    let message = if let Some(cleanup_error) = cleanup_error {
+        format!(
+            "process exceeded the {} ms wall-clock limit; process tree cleanup also failed: {cleanup_error}",
+            timeout.as_millis()
+        )
+    } else {
+        format!(
+            "process exceeded the {} ms wall-clock limit and its process tree was terminated",
+            timeout.as_millis()
+        )
+    };
+    io::Error::new(io::ErrorKind::TimedOut, message)
 }
 
 fn read_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {
@@ -2029,6 +2041,20 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
+    #[test]
+    fn timeout_error_preserves_timeout_kind_when_process_cleanup_fails() {
+        let error = process_timeout_error(
+            Duration::from_secs(1),
+            Some(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "process cleanup denied",
+            )),
+        );
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("process cleanup denied"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn std_runner_without_timeout_frames_stdin_and_detaches_successfully() {
@@ -2060,17 +2086,21 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
     #[cfg(unix)]
     #[test]
     fn timed_runner_shares_one_deadline_across_processes() {
-        let runner = StdCommandRunner::with_timeout(Duration::from_secs(10));
-        let spec = local_shell_spec("sleep 6");
+        let mut runner = StdCommandRunner::with_timeout(Duration::from_secs(10));
 
         runner
-            .run(&spec)
+            .run(&local_shell_spec("printf first"))
             .expect("first process fits the shared budget");
+        runner.started = runner
+            .started
+            .checked_sub(runner.timeout)
+            .expect("the monotonic clock supports a ten-second test rewind");
         let error = runner
-            .run(&spec)
+            .run(&local_shell_spec("printf second"))
             .expect_err("second process must not receive a fresh timeout budget");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("before process start"));
     }
 
     #[cfg(unix)]
