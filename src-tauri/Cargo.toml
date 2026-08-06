@@ -50,3 +50,7 @@ keyring = { version = "=3.6.3", default-features = false, features = [
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `test` feature 只进 dev-dependencies：它带来的 MockRuntime 让 IPC 命令能在没有 GTK/WebView2
+# 的环境里被真实调用一遍（否则 async 壳只能靠类型断言覆盖），而 release 构建不含 dev-deps，
+# 因此这个 mock 运行时不会进产物。
+tauri = { version = "2", features = ["test"] }

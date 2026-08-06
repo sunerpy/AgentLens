@@ -20,7 +20,7 @@ use agentlens_core::transport::ssh::{
 };
 use chrono::NaiveDate;
 use serde_json::Value;
-use tauri::State;
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::contract::{
     AggregateFilters, AppSettings, BreakdownDimensions, BreakdownRow, DateRange, DetailFilters,
@@ -81,15 +81,54 @@ impl Drop for ProbeRegistration {
     }
 }
 
+/// Runs a synchronous command body on Tauri's blocking pool.
+///
+/// A `#[tauri::command] pub fn` runs **on the main thread**, so every millisecond it spends
+/// in SQLite, the OS keyring or a platform lookup is a millisecond the webview cannot paint
+/// or accept input. Opening the hosts view fires four or more queries at once, which used to
+/// queue up on that one thread and freeze the window. An `async fn` command is polled on the
+/// async runtime instead, and `spawn_blocking` moves the synchronous body to a worker thread.
+async fn on_blocking_pool<T, F>(command: &'static str, task: F) -> IpcResult<T>
+where
+    F: FnOnce() -> IpcResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|error| {
+            IpcError::new(
+                IpcErrorCode::Internal,
+                format!("{command} worker failed: {error}"),
+            )
+        })?
+}
+
+/// Same, for bodies that need the managed [`AppState`].
+///
+/// `State<'_, AppState>` borrows the invoke message and is therefore not `'static`, so it
+/// cannot cross `spawn_blocking`. `AppHandle` is `'static` and cheap to clone, so the shell
+/// moves the handle and re-resolves the managed state on the worker thread instead.
+async fn with_state<R, T, F>(command: &'static str, app: AppHandle<R>, task: F) -> IpcResult<T>
+where
+    R: Runtime,
+    F: FnOnce(&AppState) -> IpcResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    on_blocking_pool(command, move || task(&app.state::<AppState>())).await
+}
+
 #[tauri::command]
-pub fn get_summary(
-    state: State<'_, AppState>,
+pub async fn get_summary<R: Runtime>(
+    app: AppHandle<R>,
     range: DateRange,
     tz: String,
     filters: AggregateFilters,
 ) -> IpcResult<Summary> {
-    state.tick_due()?;
-    get_summary_impl(&state, range, tz, filters)
+    with_state("get_summary", app, move |state: &AppState| {
+        state.tick_due()?;
+        get_summary_impl(state, range, tz, filters)
+    })
+    .await
 }
 
 pub(crate) fn get_summary_impl(
@@ -108,15 +147,18 @@ pub(crate) fn get_summary_impl(
 }
 
 #[tauri::command]
-pub fn get_trend(
-    state: State<'_, AppState>,
+pub async fn get_trend<R: Runtime>(
+    app: AppHandle<R>,
     range: DateRange,
     tz: String,
     granularity: Granularity,
     filters: Option<AggregateFilters>,
 ) -> IpcResult<Vec<SeriesPoint>> {
-    state.tick_due()?;
-    get_trend_impl(&state, range, tz, granularity, filters.unwrap_or_default())
+    with_state("get_trend", app, move |state: &AppState| {
+        state.tick_due()?;
+        get_trend_impl(state, range, tz, granularity, filters.unwrap_or_default())
+    })
+    .await
 }
 
 pub(crate) fn get_trend_impl(
@@ -144,13 +186,16 @@ pub(crate) fn get_trend_impl(
 }
 
 #[tauri::command]
-pub fn get_breakdown(
-    state: State<'_, AppState>,
+pub async fn get_breakdown<R: Runtime>(
+    app: AppHandle<R>,
     range: DateRange,
     dims: BreakdownDimensions,
 ) -> IpcResult<Vec<BreakdownRow>> {
-    state.tick_due()?;
-    get_breakdown_impl(&state, range, dims)
+    with_state("get_breakdown", app, move |state: &AppState| {
+        state.tick_due()?;
+        get_breakdown_impl(state, range, dims)
+    })
+    .await
 }
 
 pub(crate) fn get_breakdown_impl(
@@ -176,14 +221,17 @@ pub(crate) fn get_breakdown_impl(
 }
 
 #[tauri::command]
-pub fn query_messages(
-    state: State<'_, AppState>,
+pub async fn query_messages<R: Runtime>(
+    app: AppHandle<R>,
     filters: MessageFilters,
     limit: Value,
     offset: Value,
 ) -> IpcResult<MessagePage> {
-    state.tick_due()?;
-    query_messages_impl(&state, filters, limit, offset)
+    with_state("query_messages", app, move |state: &AppState| {
+        state.tick_due()?;
+        query_messages_impl(state, filters, limit, offset)
+    })
+    .await
 }
 
 pub(crate) fn query_messages_impl(
@@ -204,9 +252,12 @@ pub(crate) fn query_messages_impl(
 }
 
 #[tauri::command]
-pub fn hosts_list(state: State<'_, AppState>) -> IpcResult<Vec<Host>> {
-    state.tick_due()?;
-    hosts_list_impl(&state)
+pub async fn hosts_list<R: Runtime>(app: AppHandle<R>) -> IpcResult<Vec<Host>> {
+    with_state("hosts_list", app, |state: &AppState| {
+        state.tick_due()?;
+        hosts_list_impl(state)
+    })
+    .await
 }
 
 pub(crate) fn hosts_list_impl(state: &AppState) -> IpcResult<Vec<Host>> {
@@ -217,9 +268,12 @@ pub(crate) fn hosts_list_impl(state: &AppState) -> IpcResult<Vec<Host>> {
 }
 
 #[tauri::command]
-pub fn hosts_get(state: State<'_, AppState>, host_id: String) -> IpcResult<Host> {
-    state.tick_due()?;
-    hosts_get_impl(&state, &host_id)
+pub async fn hosts_get<R: Runtime>(app: AppHandle<R>, host_id: String) -> IpcResult<Host> {
+    with_state("hosts_get", app, move |state: &AppState| {
+        state.tick_due()?;
+        hosts_get_impl(state, &host_id)
+    })
+    .await
 }
 
 pub(crate) fn hosts_get_impl(state: &AppState, host_id: &str) -> IpcResult<Host> {
@@ -232,8 +286,14 @@ pub(crate) fn hosts_get_impl(state: &AppState, host_id: &str) -> IpcResult<Host>
 }
 
 #[tauri::command]
-pub fn hosts_create(state: State<'_, AppState>, input: HostCreateInput) -> IpcResult<Host> {
-    hosts_create_impl(&state, input)
+pub async fn hosts_create<R: Runtime>(
+    app: AppHandle<R>,
+    input: HostCreateInput,
+) -> IpcResult<Host> {
+    with_state("hosts_create", app, move |state: &AppState| {
+        hosts_create_impl(state, input)
+    })
+    .await
 }
 
 pub(crate) fn hosts_create_impl(state: &AppState, input: HostCreateInput) -> IpcResult<Host> {
@@ -257,8 +317,14 @@ pub(crate) fn hosts_create_impl(state: &AppState, input: HostCreateInput) -> Ipc
 }
 
 #[tauri::command]
-pub fn hosts_update(state: State<'_, AppState>, input: HostUpdateInput) -> IpcResult<Host> {
-    hosts_update_impl(&state, input)
+pub async fn hosts_update<R: Runtime>(
+    app: AppHandle<R>,
+    input: HostUpdateInput,
+) -> IpcResult<Host> {
+    with_state("hosts_update", app, move |state: &AppState| {
+        hosts_update_impl(state, input)
+    })
+    .await
 }
 
 pub(crate) fn hosts_update_impl(state: &AppState, input: HostUpdateInput) -> IpcResult<Host> {
@@ -290,8 +356,11 @@ pub(crate) fn hosts_update_impl(state: &AppState, input: HostUpdateInput) -> Ipc
 }
 
 #[tauri::command]
-pub fn hosts_delete(state: State<'_, AppState>, host_id: String) -> IpcResult<()> {
-    hosts_delete_impl(&state, &host_id)
+pub async fn hosts_delete<R: Runtime>(app: AppHandle<R>, host_id: String) -> IpcResult<()> {
+    with_state("hosts_delete", app, move |state: &AppState| {
+        hosts_delete_impl(state, &host_id)
+    })
+    .await
 }
 
 pub(crate) fn hosts_delete_impl(state: &AppState, host_id: &str) -> IpcResult<()> {
@@ -308,17 +377,23 @@ pub(crate) fn hosts_delete_impl(state: &AppState, host_id: &str) -> IpcResult<()
 }
 
 #[tauri::command]
-pub fn trigger_refresh(
-    state: State<'_, AppState>,
+pub async fn trigger_refresh<R: Runtime>(
+    app: AppHandle<R>,
     host_id: String,
 ) -> IpcResult<TriggerRefreshResult> {
-    state.trigger_refresh(&host_id)
+    with_state("trigger_refresh", app, move |state: &AppState| {
+        state.trigger_refresh(&host_id)
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn get_refresh_status(state: State<'_, AppState>) -> IpcResult<Vec<SourceStatus>> {
-    state.tick_due()?;
-    get_refresh_status_impl(&state)
+pub async fn get_refresh_status<R: Runtime>(app: AppHandle<R>) -> IpcResult<Vec<SourceStatus>> {
+    with_state("get_refresh_status", app, |state: &AppState| {
+        state.tick_due()?;
+        get_refresh_status_impl(state)
+    })
+    .await
 }
 
 pub(crate) fn get_refresh_status_impl(state: &AppState) -> IpcResult<Vec<SourceStatus>> {
@@ -331,8 +406,8 @@ pub(crate) fn get_refresh_status_impl(state: &AppState) -> IpcResult<Vec<SourceS
 }
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> IpcResult<AppSettings> {
-    get_settings_impl(&state)
+pub async fn get_settings<R: Runtime>(app: AppHandle<R>) -> IpcResult<AppSettings> {
+    with_state("get_settings", app, get_settings_impl).await
 }
 
 pub(crate) fn get_settings_impl(state: &AppState) -> IpcResult<AppSettings> {
@@ -341,8 +416,14 @@ pub(crate) fn get_settings_impl(state: &AppState) -> IpcResult<AppSettings> {
 }
 
 #[tauri::command]
-pub fn set_settings(state: State<'_, AppState>, settings: AppSettings) -> IpcResult<AppSettings> {
-    set_settings_impl(&state, settings)
+pub async fn set_settings<R: Runtime>(
+    app: AppHandle<R>,
+    settings: AppSettings,
+) -> IpcResult<AppSettings> {
+    with_state("set_settings", app, move |state: &AppState| {
+        set_settings_impl(state, settings)
+    })
+    .await
 }
 
 pub(crate) fn set_settings_impl(state: &AppState, settings: AppSettings) -> IpcResult<AppSettings> {
@@ -353,8 +434,8 @@ pub(crate) fn set_settings_impl(state: &AppState, settings: AppSettings) -> IpcR
 }
 
 #[tauri::command]
-pub fn prices_get(state: State<'_, AppState>) -> IpcResult<PriceTable> {
-    prices_get_impl(&state)
+pub async fn prices_get<R: Runtime>(app: AppHandle<R>) -> IpcResult<PriceTable> {
+    with_state("prices_get", app, prices_get_impl).await
 }
 
 pub(crate) fn prices_get_impl(state: &AppState) -> IpcResult<PriceTable> {
@@ -362,8 +443,11 @@ pub(crate) fn prices_get_impl(state: &AppState) -> IpcResult<PriceTable> {
 }
 
 #[tauri::command]
-pub fn prices_set(state: State<'_, AppState>, prices: Value) -> IpcResult<PriceTable> {
-    prices_set_impl(&state, prices)
+pub async fn prices_set<R: Runtime>(app: AppHandle<R>, prices: Value) -> IpcResult<PriceTable> {
+    with_state("prices_set", app, move |state: &AppState| {
+        prices_set_impl(state, prices)
+    })
+    .await
 }
 
 pub(crate) fn prices_set_impl(state: &AppState, prices: Value) -> IpcResult<PriceTable> {
@@ -380,8 +464,8 @@ pub(crate) fn prices_set_impl(state: &AppState, prices: Value) -> IpcResult<Pric
 /// Only Rust can answer this: `machine_id_hash` is SHA-256 over the trimmed machine-id,
 /// and a wrong value would register the same machine twice and double-count its usage.
 #[tauri::command]
-pub fn local_machine_identity() -> IpcResult<LocalIdentity> {
-    local_machine_identity_impl()
+pub async fn local_machine_identity() -> IpcResult<LocalIdentity> {
+    on_blocking_pool("local_machine_identity", local_machine_identity_impl).await
 }
 
 pub(crate) fn local_machine_identity_impl() -> IpcResult<LocalIdentity> {
@@ -397,16 +481,10 @@ pub(crate) fn local_machine_identity_impl() -> IpcResult<LocalIdentity> {
 pub async fn ssh_probe(input: SshProbeInput, request_id: String) -> IpcResult<SshProbeResult> {
     let registration = ProbeRegistration::register(request_id)?;
     let cancellation = Arc::clone(&registration.cancellation);
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let result = on_blocking_pool("SSH probe", move || {
         ssh_probe_impl_with_cancel(input, &|| cancellation.load(Ordering::Acquire))
     })
-    .await
-    .map_err(|error| {
-        IpcError::new(
-            IpcErrorCode::Internal,
-            format!("SSH probe worker failed: {error}"),
-        )
-    })?;
+    .await;
     drop(registration);
     result
 }
@@ -444,6 +522,12 @@ fn ssh_probe_impl_with_cancel(
     ))
 }
 
+/// Deliberately the one command that stays synchronous.
+///
+/// It validates an ASCII id and stores an `AtomicBool` — nanoseconds, no I/O, so a worker-thread
+/// hop would cost more than the work. It also must not queue: the probe it cancels is itself
+/// occupying a blocking-pool thread, so routing the cancellation through that same pool would
+/// let a saturated pool delay the signal behind the very task it is meant to stop.
 #[tauri::command]
 pub fn ssh_probe_cancel(request_id: String) -> IpcResult<()> {
     validate_probe_request_id(&request_id)?;
@@ -476,12 +560,15 @@ fn validate_probe_request_id(request_id: &str) -> IpcResult<()> {
 /// Store a password or key passphrase in the OS keyring. It never reaches a config file,
 /// a log line or a DTO; the response only reports presence.
 #[tauri::command]
-pub fn credential_set(
+pub async fn credential_set(
     host_id: String,
     kind: CredentialKind,
     secret: String,
 ) -> IpcResult<CredentialStatus> {
-    credential_set_impl(&OsKeyringStore, &host_id, kind, secret)
+    on_blocking_pool("credential_set", move || {
+        credential_set_impl(&OsKeyringStore, &host_id, kind, secret)
+    })
+    .await
 }
 
 pub(crate) fn credential_set_impl(
@@ -496,8 +583,14 @@ pub(crate) fn credential_set_impl(
 }
 
 #[tauri::command]
-pub fn credential_status(host_id: String, kind: CredentialKind) -> IpcResult<CredentialStatus> {
-    credential_status_impl(&OsKeyringStore, &host_id, kind)
+pub async fn credential_status(
+    host_id: String,
+    kind: CredentialKind,
+) -> IpcResult<CredentialStatus> {
+    on_blocking_pool("credential_status", move || {
+        credential_status_impl(&OsKeyringStore, &host_id, kind)
+    })
+    .await
 }
 
 pub(crate) fn credential_status_impl(
@@ -511,8 +604,14 @@ pub(crate) fn credential_status_impl(
 }
 
 #[tauri::command]
-pub fn credential_delete(host_id: String, kind: CredentialKind) -> IpcResult<CredentialStatus> {
-    credential_delete_impl(&OsKeyringStore, &host_id, kind)
+pub async fn credential_delete(
+    host_id: String,
+    kind: CredentialKind,
+) -> IpcResult<CredentialStatus> {
+    on_blocking_pool("credential_delete", move || {
+        credential_delete_impl(&OsKeyringStore, &host_id, kind)
+    })
+    .await
 }
 
 pub(crate) fn credential_delete_impl(
@@ -718,6 +817,22 @@ mod tests {
         (data_dir, state)
     }
 
+    /// A real Tauri app on the mock runtime, so the `async` command shells can be invoked the
+    /// way the webview invokes them — no GTK, no WebView2, no window.
+    ///
+    /// Without this the shells could only be checked by type, and "does `AppHandle` still
+    /// resolve the managed `AppState` after the closure has been moved onto a worker thread?"
+    /// is precisely the question a type check cannot answer.
+    fn mock_app() -> (TempDir, AppHandle<tauri::test::MockRuntime>) {
+        let (data_dir, state) = state();
+        let app = tauri::test::mock_builder()
+            .manage(state)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock tauri app");
+        let handle = app.handle().clone();
+        (data_dir, handle)
+    }
+
     fn range(start_date: &str, end_date_exclusive: &str) -> DateRange {
         DateRange {
             start_date: start_date.to_owned(),
@@ -778,7 +893,8 @@ mod tests {
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
                 assert_eq!(identity.hostname.as_deref(), Some("fixture-workstation"));
                 assert_eq!(
-                    local_machine_identity().expect("public command delegates to the same source"),
+                    tauri::async_runtime::block_on(local_machine_identity())
+                        .expect("public command delegates to the same source"),
                     identity
                 );
             }
@@ -786,7 +902,7 @@ mod tests {
                 assert_eq!(error.code, IpcErrorCode::InvalidInput);
                 assert!(!error.message.is_empty());
                 assert_eq!(
-                    local_machine_identity()
+                    tauri::async_runtime::block_on(local_machine_identity())
                         .expect_err("a missing platform identity stays missing")
                         .code,
                     error.code
@@ -1014,6 +1130,231 @@ mod tests {
             },
             "probe_async_contract".to_owned(),
         ));
+    }
+
+    /// Type-level guard over the whole command surface.
+    ///
+    /// A `#[tauri::command] pub fn` runs on the main thread and freezes the webview for its
+    /// whole duration — the defect this file was restructured to remove. Reverting any command
+    /// below to `pub fn` makes `F` a plain `IpcResult<_>`, which does not implement `Future`,
+    /// so the reversion cannot compile. A comment could not enforce that.
+    #[test]
+    fn every_blocking_command_returns_a_future_so_the_webview_never_stalls() {
+        macro_rules! assert_command_is_async {
+            ($command:path, ($($argument:ty),* $(,)?)) => {{
+                fn assert_async<T, F>(_: fn($($argument),*) -> F)
+                where
+                    F: Future<Output = IpcResult<T>>,
+                {
+                }
+                assert_async($command);
+            }};
+        }
+
+        assert_command_is_async!(
+            get_summary,
+            (AppHandle, DateRange, String, AggregateFilters)
+        );
+        assert_command_is_async!(
+            get_trend,
+            (
+                AppHandle,
+                DateRange,
+                String,
+                Granularity,
+                Option<AggregateFilters>,
+            )
+        );
+        assert_command_is_async!(get_breakdown, (AppHandle, DateRange, BreakdownDimensions));
+        assert_command_is_async!(query_messages, (AppHandle, MessageFilters, Value, Value));
+        assert_command_is_async!(hosts_list, (AppHandle));
+        assert_command_is_async!(hosts_get, (AppHandle, String));
+        assert_command_is_async!(hosts_create, (AppHandle, HostCreateInput));
+        assert_command_is_async!(hosts_update, (AppHandle, HostUpdateInput));
+        assert_command_is_async!(hosts_delete, (AppHandle, String));
+        assert_command_is_async!(trigger_refresh, (AppHandle, String));
+        assert_command_is_async!(get_refresh_status, (AppHandle));
+        assert_command_is_async!(get_settings, (AppHandle));
+        assert_command_is_async!(set_settings, (AppHandle, AppSettings));
+        assert_command_is_async!(prices_get, (AppHandle));
+        assert_command_is_async!(prices_set, (AppHandle, Value));
+        assert_command_is_async!(local_machine_identity, ());
+        assert_command_is_async!(ssh_probe, (SshProbeInput, String));
+        assert_command_is_async!(credential_set, (String, CredentialKind, String));
+        assert_command_is_async!(credential_status, (String, CredentialKind));
+        assert_command_is_async!(credential_delete, (String, CredentialKind));
+
+        // `ssh_probe_cancel` is the deliberate exception: pure in-memory, and it must not queue
+        // behind the blocking-pool task it exists to cancel. This binding pins that choice, so
+        // making it `async` breaks the build just as loudly as un-asyncing the rest.
+        let _: fn(String) -> IpcResult<()> = ssh_probe_cancel;
+
+        assert_eq!(REGISTERED_COMMANDS.len(), 21);
+    }
+
+    #[test]
+    fn credential_commands_reject_a_blank_host_id_without_reaching_the_os_keyring() {
+        for error in [
+            tauri::async_runtime::block_on(credential_set(
+                "  ".to_owned(),
+                CredentialKind::Password,
+                "x".to_owned(),
+            ))
+            .expect_err("a blank host id must fail in the worker"),
+            tauri::async_runtime::block_on(credential_status(
+                "  ".to_owned(),
+                CredentialKind::Password,
+            ))
+            .expect_err("a blank host id must fail in the worker"),
+            tauri::async_runtime::block_on(credential_delete(
+                "  ".to_owned(),
+                CredentialKind::Passphrase,
+            ))
+            .expect_err("a blank host id must fail in the worker"),
+        ] {
+            assert_eq!(error.code, IpcErrorCode::InvalidInput);
+            assert_eq!(
+                error.fields.get("variant").map(String::as_str),
+                Some("blankHostId")
+            );
+        }
+    }
+
+    /// Behavioural half of the async-command guard.
+    ///
+    /// Every shell here is invoked exactly as the webview invokes it, so this proves the
+    /// `AppHandle` still resolves the managed `AppState` after the body was moved onto a
+    /// worker thread — and, because `block_on` only accepts a `Future`, reverting any of
+    /// these commands to `pub fn` also breaks this test.
+    #[test]
+    fn state_backed_command_shells_work_end_to_end_on_a_worker_thread() {
+        use tauri::async_runtime::block_on;
+
+        let (_data_dir, app) = mock_app();
+
+        let created = block_on(hosts_create(
+            app.clone(),
+            HostCreateInput {
+                display_name: "Mock workstation".to_owned(),
+                kind: HostKind::Local,
+                machine_id_hash: "c".repeat(64),
+                ssh_target: None,
+                remote_data_dir: None,
+            },
+        ))
+        .expect("create a host through the async shell");
+        assert_eq!(
+            block_on(hosts_list(app.clone())).expect("list hosts"),
+            vec![created.clone()]
+        );
+        assert_eq!(
+            block_on(hosts_get(app.clone(), created.host_id.clone())).expect("get host"),
+            created
+        );
+        assert_eq!(
+            block_on(hosts_update(
+                app.clone(),
+                HostUpdateInput {
+                    host_id: created.host_id.clone(),
+                    display_name: "Renamed workstation".to_owned(),
+                    kind: HostKind::Local,
+                    ssh_target: None,
+                    remote_data_dir: None,
+                },
+            ))
+            .expect("update host")
+            .display_name,
+            "Renamed workstation"
+        );
+        assert_eq!(
+            block_on(get_refresh_status(app.clone()))
+                .expect("read refresh status")
+                .len(),
+            1
+        );
+        assert_eq!(
+            block_on(trigger_refresh(app.clone(), "   ".to_owned()))
+                .expect_err("a blank host id must fail in the worker")
+                .code,
+            IpcErrorCode::InvalidInput
+        );
+        block_on(hosts_delete(app.clone(), created.host_id.clone())).expect("delete host");
+        assert!(block_on(hosts_list(app.clone()))
+            .expect("list hosts after delete")
+            .is_empty());
+
+        let window = range("2026-01-01", "2026-02-01");
+        assert_eq!(
+            block_on(get_summary(
+                app.clone(),
+                window.clone(),
+                "UTC".to_owned(),
+                AggregateFilters::default(),
+            ))
+            .expect("summarise an empty archive")
+            .message_count,
+            0
+        );
+        assert!(block_on(get_trend(
+            app.clone(),
+            window.clone(),
+            "UTC".to_owned(),
+            Granularity::Day,
+            None,
+        ))
+        .expect("trend over an empty archive")
+        .iter()
+        .all(|point| point.message_count.unwrap_or_default() == 0));
+        assert!(block_on(get_breakdown(
+            app.clone(),
+            window,
+            BreakdownDimensions {
+                timezone: "UTC".to_owned(),
+                filters: AggregateFilters::default(),
+                expand_variant: false,
+            },
+        ))
+        .expect("breakdown over an empty archive")
+        .is_empty());
+        assert_eq!(
+            block_on(query_messages(
+                app.clone(),
+                message_filters(),
+                json!(50),
+                json!(0),
+            ))
+            .expect("page an empty archive")
+            .total_count,
+            0
+        );
+
+        let settings = block_on(set_settings(
+            app.clone(),
+            AppSettings {
+                values: BTreeMap::from([("theme".to_owned(), "dark".to_owned())]),
+            },
+        ))
+        .expect("write settings through the async shell");
+        assert_eq!(
+            block_on(get_settings(app.clone())).expect("read settings back"),
+            settings
+        );
+
+        let empty_table = PriceTable {
+            schema_version: 1,
+            entries: Vec::new(),
+            extra: BTreeMap::new(),
+        };
+        let prices = block_on(prices_set(
+            app.clone(),
+            serde_json::to_value(&empty_table).expect("serialize price input"),
+        ))
+        .expect("reset the price table");
+        assert_eq!(prices, empty_table);
+        assert_eq!(
+            block_on(prices_get(app.clone())).expect("read prices back"),
+            prices
+        );
     }
 
     #[test]

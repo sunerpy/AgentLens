@@ -22,4 +22,14 @@ export type SshProbeResult = {
    * Which machine-id source answered on the remote host.
    */
   machineIdSource: string
+  /**
+   * SHA-256 of the remote machine id, computed on the remote host.
+   *
+   * Carried verbatim from [`SshProbe::machine_id_hash`], which `parse_probe` already
+   * constrains to 64 lowercase hex characters — re-validating here would only add a
+   * second, divergable definition of the same rule. The hosts view feeds it straight
+   * back into `hosts_create`, so the operator never retypes it and cannot register the
+   * same machine twice under two hashes.
+   */
+  machineIdHash: string
 }

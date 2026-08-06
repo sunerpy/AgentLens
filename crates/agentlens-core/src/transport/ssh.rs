@@ -16,6 +16,13 @@
 //! STAGE4 校验 sha256、执行 collect、stdout 回传 NDJSON、trap 清理；
 //! 每次连接顺带 GC 超过 24h 的 `run.*`。
 //!
+//! STAGE1 的 machine-id **只在远端就地摘要**：脚本用
+//! `printf '%s' "$(tr -d '[:space:]' < "$FILE")" | sha256sum` 去掉全部空白后再算 SHA-256，
+//! 与本地 [`crate::host::MachineIdentity::from_machine_id`]（先 `trim` 再 SHA-256、小写 hex）
+//! 逐字节一致；直接 `sha256sum < "$FILE"` 会把尾部换行算进摘要，故不可用。原文永不过网，
+//! 回传的只有 [`MACHINE_ID_HASH_HEX_LENGTH`] 位小写十六进制摘要，且由 `parse_probe` 在核心侧
+//! 校验格式，不把远端垃圾透传给界面。
+//!
 //! 认证：默认 agent / 密钥路径配 `-o BatchMode=yes`；钥匙串口令走非 BatchMode 分支加
 //! `SSH_ASKPASS=<打包的 agentlens-askpass>`、`SSH_ASKPASS_REQUIRE=force`、`DISPLAY=:0` 占位、
 //! 进程无 TTY。Windows 下 ssh/scp 定位顺序为 PATH → 显式设置 → `%WINDIR%\System32\OpenSSH`，
@@ -40,6 +47,8 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+
+use crate::host::MACHINE_ID_HASH_HEX_LENGTH;
 
 /// The only remote command passed to OpenSSH.
 pub const REMOTE_COMMAND: &str = "sh -s";
@@ -71,10 +80,15 @@ if [ -r /etc/machine-id ] && [ -n "$(tr -d '[:space:]' < /etc/machine-id)" ]; th
 elif [ -r /var/lib/dbus/machine-id ] && [ -n "$(tr -d '[:space:]' < /var/lib/dbus/machine-id)" ]; then
   MACHINE_ID_SOURCE=/var/lib/dbus/machine-id
 fi
+MACHINE_ID_HASH=
+if [ -n "$MACHINE_ID_SOURCE" ]; then
+  MACHINE_ID_HASH=$(printf '%s' "$(tr -d '[:space:]' < "$MACHINE_ID_SOURCE")" | sha256sum | cut -d' ' -f1)
+fi
 printf 'AGENTLENS_ARCH=%s\n' "$ARCH"
 printf 'AGENTLENS_XDG_DATA_HOME=%s\n' "$XDG_VALUE"
 printf 'AGENTLENS_AVAILABLE_KIB=%s\n' "$AVAILABLE_KIB"
 printf 'AGENTLENS_MACHINE_ID_SOURCE=%s\n' "$MACHINE_ID_SOURCE"
+printf 'AGENTLENS_MACHINE_ID_HASH=%s\n' "$MACHINE_ID_HASH"
 "#;
 
 const STAGE2_SCRIPT: &str = r#"AGENTLENS_PAYLOAD=$1
@@ -805,6 +819,12 @@ pub struct SshProbe {
     pub xdg_data_home: Option<String>,
     pub available_kib: u64,
     pub machine_id_source: String,
+    /// SHA-256 of the remote machine id, computed on the remote host.
+    ///
+    /// Always [`MACHINE_ID_HASH_HEX_LENGTH`] lowercase hex characters — `parse_probe` rejects
+    /// anything else, so callers may feed this straight to
+    /// [`crate::host::MachineIdentity::from_machine_id_hash`].
+    pub machine_id_hash: String,
 }
 
 /// Input to one SSH collection.
@@ -1335,12 +1355,31 @@ fn parse_probe(bytes: &[u8], artifacts: &CollectorArtifacts) -> Result<SshProbe>
             detail: "远端 /etc/machine-id 与 /var/lib/dbus/machine-id 均不可读或为空".into(),
         });
     }
+    let machine_id_hash = required_probe_value(&values, "AGENTLENS_MACHINE_ID_HASH")?;
+    if !is_machine_id_hash(machine_id_hash) {
+        return Err(SshError::InvalidResponse {
+            stage: CommandStage::Stage1,
+            detail: format!(
+                "远端 machine-id 摘要不是 {MACHINE_ID_HASH_HEX_LENGTH} 位小写十六进制：{machine_id_hash:?}"
+            ),
+        });
+    }
     Ok(SshProbe {
         architecture,
         xdg_data_home: (!xdg.is_empty()).then(|| xdg.to_owned()),
         available_kib,
         machine_id_source: machine_id_source.to_owned(),
+        machine_id_hash: machine_id_hash.to_owned(),
     })
+}
+
+/// Uppercase hex is rejected on purpose: [`crate::host::MachineIdentity::from_machine_id_hash`]
+/// accepts lowercase only, so accepting it here would just move the failure to the UI.
+fn is_machine_id_hash(value: &str) -> bool {
+    value.len() == MACHINE_ID_HASH_HEX_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn required_probe_value<'a>(values: &'a BTreeMap<&str, &str>, key: &str) -> Result<&'a str> {
@@ -1548,10 +1587,15 @@ mod tests {
 
     use super::*;
 
+    const PROBE_MACHINE_ID_HASH: &str =
+        "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+    const STAGE1_DIGEST_EXPR: &str =
+        r#"printf '%s' "$(tr -d '[:space:]' < "$MACHINE_ID_SOURCE")" | sha256sum | cut -d' ' -f1"#;
     const PROBE_X86_64: &str = "AGENTLENS_ARCH=x86_64\n\
 AGENTLENS_XDG_DATA_HOME=/home/test/.local/share\n\
 AGENTLENS_AVAILABLE_KIB=1048576\n\
-AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
+AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n\
+AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n";
     const REMOTE_RUN_DIR: &str = "/home/test/.cache/agentlens/run.A1b2C3";
     const META_LINE: &str = "{\"protocol_version\":1,\"machine_id_hash\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"hostname\":\"fixture\",\"collector_version\":\"0.1.0\",\"sources\":[{\"source\":\"opencode\",\"data_dir\":\"/data\",\"scan_window\":{\"since\":0,\"cutoff\":0},\"eligible_count\":0,\"skipped_count\":0}]}\n";
 
@@ -1697,7 +1741,7 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
             .with_x86_64("/fixtures/collector-x86_64")
             .with_aarch64("/fixtures/collector-aarch64");
         let probe = parse_probe(
-            b"AGENTLENS_ARCH=arm64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=42\nAGENTLENS_MACHINE_ID_SOURCE=/var/lib/dbus/machine-id\n",
+            b"AGENTLENS_ARCH=arm64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=42\nAGENTLENS_MACHINE_ID_SOURCE=/var/lib/dbus/machine-id\nAGENTLENS_MACHINE_ID_HASH=0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0\n",
             &artifacts,
         )
         .expect("arm64 alias with matching artifact");
@@ -1705,6 +1749,10 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
         assert_eq!(probe.xdg_data_home, None);
         assert_eq!(probe.available_kib, 42);
         assert_eq!(probe.machine_id_source, "/var/lib/dbus/machine-id");
+        assert_eq!(
+            probe.machine_id_hash,
+            "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+        );
         assert_eq!(architecture_name(probe.architecture), "aarch64");
         assert_eq!(architecture_name(RemoteArchitecture::X86_64), "x86_64");
         assert_eq!(
@@ -1723,24 +1771,44 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
                 matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("UTF-8"))
             }),
             (
-                b"AGENTLENS_ARCH=x86_64\0\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                b"AGENTLENS_ARCH=x86_64\0\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n",
                 |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("控制字符")),
             ),
             (
-                b"AGENTLENS_ARCH=riscv64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                b"AGENTLENS_ARCH=riscv64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n",
                 |error| matches!(error, SshError::ArchMismatch { remote_arch, .. } if remote_arch == "riscv64"),
             ),
             (
-                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=many\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=many\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n",
                 |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("不是整数")),
             ),
             (
-                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=\n",
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=\nAGENTLENS_MACHINE_ID_HASH=\n",
                 |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("machine-id")),
             ),
             (
                 b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\n",
                 |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("缺少 AGENTLENS_MACHINE_ID_SOURCE")),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("缺少 AGENTLENS_MACHINE_ID_HASH")),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=/etc/machine-id\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("64 位小写十六进制")),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f9\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("64 位小写十六进制")),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F90\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("64 位小写十六进制")),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=g1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("64 位小写十六进制")),
             ),
         ];
 
@@ -1752,6 +1820,58 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
         let missing_artifact = parse_probe(PROBE_X86_64.as_bytes(), &CollectorArtifacts::default())
             .expect_err("known architecture without artifact must fail");
         assert!(matches!(missing_artifact, SshError::ArchMismatch { .. }));
+    }
+
+    #[test]
+    fn ssh_probe_reports_remote_machine_id_digest_and_never_the_raw_value() {
+        let artifacts = CollectorArtifacts::default().with_x86_64("/fixtures/collector");
+        let probe =
+            parse_probe(PROBE_X86_64.as_bytes(), &artifacts).expect("complete probe parses");
+        assert_eq!(probe.machine_id_hash, PROBE_MACHINE_ID_HASH);
+        assert_eq!(probe.machine_id_hash.len(), MACHINE_ID_HASH_HEX_LENGTH);
+        assert!(crate::host::MachineIdentity::from_machine_id_hash(&probe.machine_id_hash).is_ok());
+
+        assert!(STAGE1_SCRIPT.contains(STAGE1_DIGEST_EXPR));
+        assert!(STAGE1_SCRIPT.contains("if [ -n \"$MACHINE_ID_SOURCE\" ]; then"));
+        assert!(
+            STAGE1_SCRIPT.contains("printf 'AGENTLENS_MACHINE_ID_HASH=%s\\n' \"$MACHINE_ID_HASH\"")
+        );
+        assert!(!STAGE1_SCRIPT.contains("sha256sum < "));
+        assert!(!STAGE1_SCRIPT.contains("AGENTLENS_MACHINE_ID="));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_stage1_digest_expression_matches_local_machine_id_hashing() {
+        let temp = tempfile::tempdir().expect("digest tempdir");
+        let path = temp.path().join("machine-id");
+        fs::write(&path, b"3f2a1b0c9d8e7f6055443322110aabbc\n").expect("write machine-id fixture");
+
+        let digest = Command::new("sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(format!("MACHINE_ID_SOURCE=$1\n{STAGE1_DIGEST_EXPR}\n"))
+            .arg("sh")
+            .arg(&path)
+            .output()
+            .expect("shell digest runs");
+        assert!(digest.status.success(), "digest stderr: {digest:?}");
+        let shell_hash = String::from_utf8(digest.stdout).expect("digest is UTF-8");
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"3f2a1b0c9d8e7f6055443322110aabbc");
+        assert_eq!(shell_hash.trim_end(), hex::encode(hasher.finalize()));
+
+        let blank = Command::new("sh")
+            .arg("-eu")
+            .arg("-c")
+            .arg(format!(
+                "MACHINE_ID_SOURCE=\nMACHINE_ID_HASH=\nif [ -n \"$MACHINE_ID_SOURCE\" ]; then\n  MACHINE_ID_HASH=$({STAGE1_DIGEST_EXPR})\nfi\nprintf 'AGENTLENS_MACHINE_ID_HASH=%s\\n' \"$MACHINE_ID_HASH\"\n"
+            ))
+            .output()
+            .expect("blank-source guard runs");
+        assert!(blank.status.success(), "blank-source stderr: {blank:?}");
+        assert_eq!(blank.stdout, b"AGENTLENS_MACHINE_ID_HASH=\n");
     }
 
     #[test]
@@ -2281,7 +2401,7 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
                 name: "ArchMismatch",
                 stage1: (
                     0,
-                    "AGENTLENS_ARCH=aarch64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                    "AGENTLENS_ARCH=aarch64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\nAGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n",
                     "",
                 ),
                 stage2: None,
