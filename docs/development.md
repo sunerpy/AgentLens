@@ -1,6 +1,6 @@
 # Development and build
 
-[← README](../README.md) · [简体中文](readme/development.zh.md)
+[← README](readme/README.en.md) · [简体中文](readme/development.zh.md)
 
 ## Everyday targets
 

@@ -1,6 +1,6 @@
 # Adding remote hosts
 
-[← README](../README.md) · [简体中文](readme/remote-hosts.zh.md)
+[← README](readme/README.en.md) · [简体中文](readme/remote-hosts.zh.md)
 
 The local machine self-registers the first time you open Host Management, so it
 needs no configuration. Add remote hosts in this order.

@@ -1,6 +1,6 @@
 # 开发与构建
 
-[← README](README.zh.md) · [English](../development.md)
+[← README](../../README.md) · [English](../development.md)
 
 ## 日常目标
 

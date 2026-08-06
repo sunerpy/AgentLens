@@ -1,6 +1,6 @@
 # 架构
 
-[← README](README.zh.md) · [English](../architecture.md)
+[← README](../../README.md) · [English](../architecture.md)
 
 ## 组成
 

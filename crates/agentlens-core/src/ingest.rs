@@ -871,6 +871,154 @@ mod tests {
         assert_eq!(query_count(archive.connection()), 1);
     }
 
+    #[test]
+    fn ingest_round_rejects_identity_and_provenance_mismatches() {
+        let temp = tempfile::tempdir().expect("archive tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+
+        let error = match IngestRound::begin(archive.connection_mut(), "  ", Origin::Live) {
+            Ok(_) => panic!("blank round host must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, IngestError::EmptyHostId));
+
+        let cases = [
+            (
+                {
+                    let mut value = record("host-mismatch", Origin::Live, 100, 1);
+                    value.host_id = "another-host".into();
+                    value
+                },
+                "does not match round host",
+            ),
+            (
+                {
+                    let mut value = record("source-mismatch", Origin::Live, 101, 1);
+                    value.source = "codex".into();
+                    value
+                },
+                "invalid; expected constant",
+            ),
+            (
+                record("origin-mismatch", Origin::Bak, 102, 1),
+                "does not match round origin",
+            ),
+            (
+                {
+                    let mut value = record("priority-mismatch", Origin::Live, 103, 1);
+                    value.origin_priority = Origin::Legacy.priority();
+                    value
+                },
+                "does not match origin live priority",
+            ),
+        ];
+
+        for (invalid, expected) in cases {
+            let mut round = IngestRound::begin(archive.connection_mut(), TEST_HOST, Origin::Live)
+                .expect("begin validation round");
+            let error = round
+                .ingest_batch(&[invalid])
+                .expect_err("identity mismatch must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+            drop(round);
+        }
+        assert_eq!(query_count(archive.connection()), 0);
+    }
+
+    #[test]
+    fn ingest_rejects_every_out_of_range_token_bucket_and_infinite_cost() {
+        let temp = tempfile::tempdir().expect("archive tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+
+        for field in [
+            "tok_input",
+            "tok_output",
+            "tok_reasoning",
+            "tok_cache_read",
+            "tok_cache_write",
+        ] {
+            let mut invalid = record(format!("oversized-{field}"), Origin::Live, 110, 1);
+            match field {
+                "tok_input" => invalid.tok_input = u64::MAX,
+                "tok_output" => invalid.tok_output = u64::MAX,
+                "tok_reasoning" => invalid.tok_reasoning = u64::MAX,
+                "tok_cache_read" => invalid.tok_cache_read = u64::MAX,
+                "tok_cache_write" => invalid.tok_cache_write = u64::MAX,
+                _ => unreachable!(),
+            }
+            let mut round = IngestRound::begin(archive.connection_mut(), TEST_HOST, Origin::Live)
+                .expect("begin oversized-token round");
+            let error = round
+                .ingest_batch(&[invalid])
+                .expect_err("out-of-range token must fail");
+            assert!(
+                matches!(error, IngestError::TokenOutOfRange { field: actual, value } if actual == field && value == u64::MAX),
+                "unexpected token error for {field}: {error}"
+            );
+            drop(round);
+        }
+
+        for cost in [f64::INFINITY, f64::NEG_INFINITY] {
+            let mut invalid = record("infinite-cost", Origin::Live, 111, 1);
+            invalid.cost = Some(cost);
+            let mut round = IngestRound::begin(archive.connection_mut(), TEST_HOST, Origin::Live)
+                .expect("begin non-finite-cost round");
+            let error = round
+                .ingest_batch(&[invalid])
+                .expect_err("infinite cost must fail");
+            assert!(matches!(error, IngestError::NonFiniteCost { value } if value == cost));
+            drop(round);
+        }
+        assert_eq!(query_count(archive.connection()), 0);
+    }
+
+    #[test]
+    fn ingest_stats_exclude_stale_conflicts_and_custom_cursor_reads_full_key() {
+        let temp = tempfile::tempdir().expect("archive tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+
+        let first = ingest_direct_round(
+            &mut archive,
+            Origin::Live,
+            &[vec![record("same-priority", Origin::Live, 200, 20)]],
+            &scan_result(true, Some(200)),
+        );
+        assert_eq!(first.received_records, 1);
+        assert_eq!(first.changed_records, 1);
+        assert!(first.committed);
+
+        let stale = ingest_direct_round(
+            &mut archive,
+            Origin::Live,
+            &[vec![record("same-priority", Origin::Live, 199, 99)]],
+            &scan_result(true, Some(200)),
+        );
+        assert_eq!(stale.received_records, 1);
+        assert_eq!(stale.changed_records, 0);
+        assert_eq!(query_tokens(archive.connection(), "same-priority"), 20);
+
+        archive
+            .connection()
+            .execute(
+                "INSERT INTO source_cursor (host_id, source, cursor_time_updated) VALUES (?1, ?2, ?3)",
+                (TEST_HOST, "another-source", 321_i64),
+            )
+            .expect("insert custom source cursor");
+        assert_eq!(
+            read_source_cursor(archive.connection(), TEST_HOST, "another-source")
+                .expect("read custom cursor"),
+            Some(321)
+        );
+        assert_eq!(
+            read_source_cursor(archive.connection(), TEST_HOST, "missing-source")
+                .expect("read absent cursor"),
+            None
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn ingest_read_only_archive_returns_readable_error_without_panicking() {

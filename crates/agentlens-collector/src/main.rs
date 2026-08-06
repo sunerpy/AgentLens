@@ -6,14 +6,14 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::process::{self, Command, Output};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use agentlens_core::archive::NormalizedUsageRecord;
 use agentlens_core::host::{self, MachineIdentity};
 use agentlens_core::source::opencode::{
-    self, OpenCodeError, ScanRequest, SinkError, SqliteSourceConnection,
+    self, OpenCodeError, ScanRequest, ScanResult, SinkError, SqliteSourceConnection,
 };
 use base64::Engine as _;
 use rusqlite::{params, Connection, OpenFlags};
@@ -153,15 +153,23 @@ impl std::error::Error for CollectorError {}
 
 fn main() {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
-    let exit_code = match parse_program_action(&args).and_then(run_action) {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("{error}");
-            error.exit_code()
-        }
-    };
+    let stderr = io::stderr();
+    let exit_code = program_exit_code(
+        parse_program_action(&args).and_then(run_action),
+        &mut stderr.lock(),
+    );
     if exit_code != 0 {
         process::exit(exit_code);
+    }
+}
+
+fn program_exit_code(result: CollectorResult<()>, stderr: &mut impl io::Write) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            writeln!(stderr, "{error}").expect("write collector error");
+            error.exit_code()
+        }
     }
 }
 
@@ -371,20 +379,7 @@ fn collect_with_space_probe(
     })
     .map_err(map_source_error)?;
 
-    if request.snapshot && snapshot_interrupted() {
-        return Err(CollectorError::Interrupted);
-    }
-    if !scan_result.reached_eof {
-        return Err(CollectorError::SourceUnreadable(format!(
-            "扫描未到达 EOF：{:?}",
-            scan_result.skip_reason
-        )));
-    }
-    if records.iter().any(|record| record.source != SOURCE_NAME) {
-        return Err(CollectorError::SourceUnreadable(
-            "共享 scanner 返回了缺失或错误的 source 字段".into(),
-        ));
-    }
+    validate_scan_completion(request, &scan_result, &records)?;
 
     let cutoff = scan_result
         .observed_max_time_updated
@@ -412,6 +407,28 @@ fn collect_with_space_probe(
         }],
     };
     Ok(Collection { meta, records })
+}
+
+fn validate_scan_completion(
+    request: &CollectRequest,
+    scan_result: &ScanResult,
+    records: &[NormalizedUsageRecord],
+) -> CollectorResult<()> {
+    if request.snapshot && snapshot_interrupted() {
+        return Err(CollectorError::Interrupted);
+    }
+    if !scan_result.reached_eof {
+        return Err(CollectorError::SourceUnreadable(format!(
+            "扫描未到达 EOF：{:?}",
+            scan_result.skip_reason
+        )));
+    }
+    if records.iter().any(|record| record.source != SOURCE_NAME) {
+        return Err(CollectorError::SourceUnreadable(
+            "共享 scanner 返回了缺失或错误的 source 字段".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_database_path(data_dir: Option<&Path>) -> CollectorResult<PathBuf> {
@@ -579,13 +596,14 @@ fn snapshot_source_error(source: &Path, error: rusqlite::Error) -> CollectorErro
 }
 
 fn free_space_bytes(path: &Path) -> CollectorResult<u64> {
-    let output = Command::new("df")
-        .arg("-Pk")
-        .arg(path)
-        .output()
-        .map_err(|error| {
-            CollectorError::Snapshot(format!("无法执行 df -Pk {}：{error}", path.display()))
-        })?;
+    let output = Command::new("df").arg("-Pk").arg(path).output();
+    free_space_from_df_output(path, output)
+}
+
+fn free_space_from_df_output(path: &Path, output: io::Result<Output>) -> CollectorResult<u64> {
+    let output = output.map_err(|error| {
+        CollectorError::Snapshot(format!("无法执行 df -Pk {}：{error}", path.display()))
+    })?;
     if !output.status.success() {
         return Err(CollectorError::Snapshot(format!(
             "df -Pk {} 退出状态为 {}：{}",
@@ -654,7 +672,7 @@ mod snapshot_signal {
         fn signal(signal: i32, handler: usize) -> usize;
     }
 
-    extern "C" fn mark_interrupted(_: i32) {
+    pub(super) extern "C" fn mark_interrupted(_: i32) {
         SNAPSHOT_INTERRUPTED.store(true, Ordering::SeqCst);
     }
 
@@ -715,7 +733,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
+    use std::process::{ExitStatus, Output};
     // These three are reached only from the unix-gated WAL-permission fixture, so on
     // Windows (where that test is not compiled) an ungated import is an unused import and
     // clippy `-D warnings` rejects it.
@@ -762,6 +782,22 @@ mod tests {
             .expect("read directory")
             .map(|entry| entry.expect("read entry").file_name())
             .collect()
+    }
+
+    fn arguments(values: &[&str]) -> Vec<OsString> {
+        values.iter().map(OsString::from).collect()
+    }
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt as _;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(windows)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::windows::process::ExitStatusExt as _;
+        ExitStatus::from_raw(code as u32)
     }
 
     #[test]
@@ -913,7 +949,7 @@ mod tests {
         let snapshot_dir = tempfile::tempdir().expect("snapshot tempdir");
         for path in [
             empty.path().to_path_buf(),
-            empty.path().join("not-a-directory"),
+            empty.path().join("not-a-directory.txt"),
         ] {
             if path.extension().is_some() {
                 fs::write(&path, b"file").expect("create file data-dir probe");
@@ -1023,13 +1059,15 @@ mod tests {
 
         // collect 转交内层解析器。
         let request = owned(&["collect", "--since", "7", "--data-dir", "/tmp/x"]);
-        match action(&request).expect("collect delegates to the request parser") {
-            ProgramAction::Collect(parsed) => {
-                assert_eq!(parsed.since, 7);
-                assert_eq!(parsed.data_dir.as_deref(), Some(Path::new("/tmp/x")));
-            }
-            other => panic!("expected Collect, got {other:?}"),
-        }
+        let parsed = action(&request).expect("collect delegates to the request parser");
+        assert!(matches!(
+            parsed,
+            ProgramAction::Collect(CollectRequest {
+                since: 7,
+                data_dir: Some(path),
+                snapshot: false,
+            }) if path == Path::new("/tmp/x")
+        ));
 
         let unknown = action(&owned(&["frobnicate"])).expect_err("unknown subcommand must fail");
         assert_eq!(unknown.exit_code(), 1);
@@ -1063,5 +1101,397 @@ mod tests {
         assert_eq!(error.exit_code(), 1);
         assert!(!target.exists());
         assert!(directory_entries(snapshot_dir.path()).is_empty());
+    }
+
+    #[test]
+    fn collector_help_and_version_actions_finish_without_touching_a_data_source() {
+        assert!(run_action(ProgramAction::Help).is_ok());
+        assert!(run_action(ProgramAction::Version).is_ok());
+    }
+
+    #[test]
+    fn collector_program_exit_code_reports_errors_and_keeps_success_silent() {
+        let mut stderr = Vec::new();
+        assert_eq!(program_exit_code(Ok(()), &mut stderr), 0);
+        assert!(stderr.is_empty());
+
+        let exit = program_exit_code(
+            Err(CollectorError::NoDataDirectory("missing source".into())),
+            &mut stderr,
+        );
+        assert_eq!(exit, 2);
+        let message = String::from_utf8(stderr).expect("diagnostic is UTF-8");
+        assert!(message.contains("missing source"));
+        assert!(message.contains("--data-dir"));
+    }
+
+    #[test]
+    fn collector_error_variants_keep_stable_exit_classes_and_actionable_messages() {
+        let cases = [
+            (
+                CollectorError::Snapshot("snapshot detail".into()),
+                1,
+                "snapshot detail",
+            ),
+            (
+                CollectorError::Identity("identity detail".into()),
+                1,
+                "identity detail",
+            ),
+            (
+                CollectorError::Output("output detail".into()),
+                1,
+                "output detail",
+            ),
+            (CollectorError::Interrupted, 1, "已被中断"),
+        ];
+
+        for (error, expected_exit, expected_message) in cases {
+            assert_eq!(error.exit_code(), expected_exit);
+            assert!(error.to_string().contains(expected_message));
+        }
+    }
+
+    #[test]
+    fn collector_collect_parser_rejects_missing_duplicate_and_non_utf8_values_precisely() {
+        let text_cases = [
+            (vec!["--since", "1"], "缺少 collect 子命令"),
+            (vec!["collect", "--since"], "--since 缺少值"),
+            (vec!["collect", "--data-dir"], "--data-dir 缺少值"),
+            (
+                vec!["collect", "--request-base64url"],
+                "--request-base64url 缺少值",
+            ),
+            (
+                vec!["collect", "--since", "1", "--since", "2"],
+                "--since 不能重复指定",
+            ),
+            (
+                vec!["collect", "--data-dir", "a", "--data-dir", "b"],
+                "--data-dir 不能重复指定",
+            ),
+            (
+                vec![
+                    "collect",
+                    "--request-base64url",
+                    "e30",
+                    "--request-base64url",
+                    "e30",
+                ],
+                "--request-base64url 不能重复指定",
+            ),
+            (
+                vec!["collect", "--since", "1", "--snapshot", "--snapshot"],
+                "--snapshot 不能重复指定",
+            ),
+        ];
+        for (values, message) in text_cases {
+            let error = parse_collect_request(&arguments(&values))
+                .expect_err("invalid collect arguments must fail");
+            assert!(error.to_string().contains(message));
+        }
+
+        let non_utf8_cases = [
+            vec![OsString::from("collect"), non_utf8_arg()],
+            vec![
+                OsString::from("collect"),
+                OsString::from("--since"),
+                non_utf8_arg(),
+            ],
+            vec![
+                OsString::from("collect"),
+                OsString::from("--request-base64url"),
+                non_utf8_arg(),
+            ],
+        ];
+        for values in non_utf8_cases {
+            let error =
+                parse_collect_request(&values).expect_err("non-UTF-8 collect argument must fail");
+            assert!(error.to_string().contains("有效的 UTF-8"));
+        }
+    }
+
+    #[test]
+    fn collector_encoded_request_validates_schema_since_and_precedence() {
+        let encode = |value: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+        };
+        let invalid_cases = [
+            (
+                encode(serde_json::json!({"since": 1, "unexpected": true})),
+                "unknown field",
+            ),
+            (encode(serde_json::json!({"since": -1})), "不能为负数"),
+            (
+                encode(serde_json::json!({"snapshot": true})),
+                "缺少 --since",
+            ),
+        ];
+        for (payload, message) in invalid_cases {
+            let error = parse_collect_request(&[
+                OsString::from("collect"),
+                OsString::from("--request-base64url"),
+                OsString::from(payload),
+            ])
+            .expect_err("invalid encoded request must fail");
+            assert!(error.to_string().contains(message));
+        }
+
+        let payload = encode(serde_json::json!({"since": 9, "snapshot": false}));
+        let parsed = parse_collect_request(&arguments(&[
+            "collect",
+            "--since",
+            "1",
+            "--snapshot",
+            "--request-base64url",
+            &payload,
+        ]))
+        .expect("encoded fields override command-line fields");
+        assert_eq!(parsed.since, 9);
+        assert!(!parsed.snapshot);
+    }
+
+    #[test]
+    fn collector_maps_discovery_failure_separately_from_other_source_failures() {
+        let missing = map_source_error(OpenCodeError::DatabaseNotFound {
+            probed_paths: vec![PathBuf::from("missing.db")],
+        });
+        assert_eq!(missing.exit_code(), 2);
+        assert!(missing.to_string().contains("missing.db"));
+
+        let unreadable = map_source_error(OpenCodeError::InvalidBatchSize);
+        assert_eq!(unreadable.exit_code(), 4);
+        assert!(unreadable.to_string().contains("batch_size"));
+    }
+
+    #[test]
+    fn collector_scan_completion_rejects_interruption_partial_scan_and_wrong_source() {
+        use agentlens_core::source::opencode::{ScanSkipReason, SkippedBreakdown};
+
+        let complete = ScanResult {
+            delivered_records: 0,
+            delivered_batches: 0,
+            eligible_count: 0,
+            skipped_count: 0,
+            skipped_breakdown: SkippedBreakdown::default(),
+            observed_max_time_updated: Some(9),
+            reached_eof: true,
+            busy_retry_count: 0,
+            last_success_utc: None,
+            skip_reason: None,
+        };
+        let snapshot_request = CollectRequest {
+            since: 0,
+            data_dir: None,
+            snapshot: true,
+        };
+        SNAPSHOT_INTERRUPTED.store(true, Ordering::SeqCst);
+        let interrupted = validate_scan_completion(&snapshot_request, &complete, &[])
+            .expect_err("interrupted snapshot must not publish partial data");
+        SNAPSHOT_INTERRUPTED.store(false, Ordering::SeqCst);
+        assert!(matches!(interrupted, CollectorError::Interrupted));
+
+        let mut partial = complete.clone();
+        partial.reached_eof = false;
+        partial.skip_reason = Some(ScanSkipReason::Busy);
+        let partial_error = validate_scan_completion(
+            &CollectRequest {
+                snapshot: false,
+                ..snapshot_request.clone()
+            },
+            &partial,
+            &[],
+        )
+        .expect_err("scan that did not reach EOF must fail");
+        assert_eq!(partial_error.exit_code(), 4);
+        assert!(partial_error.to_string().contains("Busy"));
+
+        let (_temp, directory, _manifest) = fixture_directory();
+        let snapshot_dir = tempfile::tempdir().expect("snapshot tempdir");
+        let collection = collect_with_space_probe(
+            &request(&directory, false),
+            &identity(),
+            "fixture-host",
+            snapshot_dir.path(),
+            &abundant_space,
+        )
+        .expect("collect a valid record for source validation");
+        let mut wrong_source = collection.records[0].clone();
+        wrong_source.source = "not-opencode".into();
+        let source_error =
+            validate_scan_completion(&request(&directory, false), &complete, &[wrong_source])
+                .expect_err("record source must match collector source");
+        assert_eq!(source_error.exit_code(), 4);
+        assert!(source_error.to_string().contains("错误的 source"));
+    }
+
+    #[test]
+    fn collector_snapshot_refuses_overwrite_and_cleans_success_interruption_and_missing_files() {
+        let (_temp, directory, _manifest) = fixture_directory();
+        let database = directory.join(DATABASE_FILE);
+        let snapshot_dir = tempfile::tempdir().expect("snapshot tempdir");
+
+        let existing = snapshot_dir.path().join("existing.db");
+        fs::write(&existing, b"keep me").expect("write existing target");
+        let error = snapshot_database_with(
+            &database,
+            &existing,
+            &abundant_space,
+            &vacuum_into_read_only_source,
+        )
+        .expect_err("snapshot must not overwrite an existing target");
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("拒绝覆盖"));
+        assert_eq!(
+            fs::read(&existing).expect("read preserved target"),
+            b"keep me"
+        );
+
+        let completed = snapshot_dir.path().join("completed.db");
+        let snapshot =
+            snapshot_database_with(&database, &completed, &abundant_space, &|source, target| {
+                fs::copy(source, target)
+                    .map(|_| ())
+                    .map_err(|error| CollectorError::Snapshot(error.to_string()))
+            })
+            .expect("create injected snapshot");
+        let debug = format!("{snapshot:?}");
+        drop(snapshot);
+        assert!(debug.contains("SnapshotDatabase"));
+        // Windows 的 Path Debug 会转义反斜杠，不能用未转义的 Display 整路径做 contains。
+        let file_name = completed.file_name().expect("snapshot target file name");
+        assert!(debug.contains(&file_name.to_string_lossy().into_owned()));
+        assert!(!completed.exists());
+
+        let interrupted = snapshot_dir.path().join("interrupted-after-vacuum.db");
+        let error =
+            snapshot_database_with(&database, &interrupted, &abundant_space, &|_, target| {
+                fs::write(target, b"partial").expect("write partial snapshot");
+                SNAPSHOT_INTERRUPTED.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .expect_err("interruption after vacuum must discard the snapshot");
+        assert!(matches!(error, CollectorError::Interrupted));
+        assert!(!interrupted.exists());
+
+        let absent = snapshot_dir.path().join("already-absent.db");
+        drop(SnapshotCleanup {
+            path: absent.clone(),
+        });
+        assert!(!absent.exists());
+
+        let directory_cleanup = snapshot_dir.path().join("directory-cleanup");
+        fs::create_dir(&directory_cleanup).expect("create non-file cleanup target");
+        drop(SnapshotCleanup {
+            path: directory_cleanup.clone(),
+        });
+        assert!(directory_cleanup.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collector_snapshot_rejects_non_utf8_target_and_formats_source_errors() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+
+        let (_temp, directory, _manifest) = fixture_directory();
+        let snapshot_dir = tempfile::tempdir().expect("snapshot tempdir");
+        let mut target = snapshot_dir.path().as_os_str().as_bytes().to_vec();
+        target.extend_from_slice(b"/snapshot-\xff.db");
+        let target = PathBuf::from(OsString::from_vec(target));
+        let error = vacuum_into_read_only_source(&directory.join(DATABASE_FILE), &target)
+            .expect_err("non-UTF-8 target cannot be passed to SQLite");
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("不是有效 UTF-8"));
+
+        let error = snapshot_source_error(Path::new("source.db"), rusqlite::Error::InvalidQuery);
+        assert_eq!(error.exit_code(), 4);
+        let message = error.to_string();
+        assert!(message.contains("source.db"));
+        assert!(message.contains("chmod"));
+        assert!(message.contains("snapshot/VACUUM"));
+    }
+
+    #[test]
+    fn collector_df_output_maps_process_failures_and_parses_only_the_last_data_line() {
+        let path = Path::new("snapshot-dir");
+        let spawn_error = free_space_from_df_output(
+            path,
+            Err(io::Error::new(io::ErrorKind::NotFound, "df missing")),
+        )
+        .expect_err("spawn failure must be reported");
+        assert!(spawn_error.to_string().contains("df missing"));
+        assert!(spawn_error.to_string().contains("snapshot-dir"));
+
+        let status_error = free_space_from_df_output(
+            path,
+            Ok(Output {
+                status: exit_status(7),
+                stdout: Vec::new(),
+                stderr: b"df denied\n".to_vec(),
+            }),
+        )
+        .expect_err("non-zero df status must be reported");
+        assert!(status_error.to_string().contains("df denied"));
+
+        let available = free_space_from_df_output(
+            path,
+            Ok(Output {
+                status: exit_status(0),
+                stdout: b"Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/x 100 58 42 58% /\n\n"
+                    .to_vec(),
+                stderr: Vec::new(),
+            }),
+        )
+        .expect("parse valid df output");
+        assert_eq!(available, 42 * 1024);
+
+        let saturated = free_space_from_df_output(
+            path,
+            Ok(Output {
+                status: exit_status(0),
+                stdout: format!("/dev/x 1 1 {} 1% /\n", u64::MAX).into_bytes(),
+                stderr: Vec::new(),
+            }),
+        )
+        .expect("large df values saturate instead of wrapping");
+        assert_eq!(saturated, u64::MAX);
+    }
+
+    #[test]
+    fn collector_df_output_rejects_non_utf8_empty_short_and_non_numeric_data() {
+        let cases = [
+            (vec![0xff], "不是 UTF-8"),
+            (Vec::new(), "没有输出"),
+            (b"too short\n".to_vec(), "无法解析 df 输出"),
+            (b"/dev/x 1 1 nope 1% /\n".to_vec(), "无法解析 df 可用空间"),
+        ];
+        for (stdout, expected) in cases {
+            let error = free_space_from_df_output(
+                Path::new("."),
+                Ok(Output {
+                    status: exit_status(0),
+                    stdout,
+                    stderr: Vec::new(),
+                }),
+            )
+            .expect_err("malformed df output must fail");
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn collector_local_hostname_always_returns_a_nonempty_trimmed_value() {
+        let hostname = local_hostname();
+        assert!(!hostname.is_empty());
+        assert_eq!(hostname, hostname.trim());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collector_signal_handler_marks_snapshot_interrupted() {
+        SNAPSHOT_INTERRUPTED.store(false, Ordering::SeqCst);
+        snapshot_signal::mark_interrupted(2);
+        assert!(snapshot_interrupted());
+        SNAPSHOT_INTERRUPTED.store(false, Ordering::SeqCst);
     }
 }

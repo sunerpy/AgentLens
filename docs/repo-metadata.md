@@ -1,6 +1,6 @@
 # Repository metadata and the pending-remote checklist
 
-[← README](../README.md) · [简体中文](readme/repo-metadata.zh.md)
+[← README](readme/README.en.md) · [简体中文](readme/repo-metadata.zh.md)
 
 This repository **has no git remote**. `git remote -v` prints nothing. Everything
 on this page is therefore *drafted and ready to paste*, not applied: no `gh`
@@ -123,7 +123,7 @@ why the pathspec excludes them.
 | File | Sites |
 | --- | --- |
 | `README.md` | 4 badge URLs, 2 installer one-liners |
-| `docs/readme/README.zh.md` | Same, Chinese mirror |
+| `docs/readme/README.en.md` | Same, English mirror |
 | `scripts/install.sh` | `DEFAULT_REPO`, usage one-liner, usage default text |
 | `scripts/install.ps1` | `$DefaultRepo`, usage one-liner |
 | `docs/installation.md` | 2 installer one-liners |

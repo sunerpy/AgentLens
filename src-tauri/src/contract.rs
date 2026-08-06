@@ -726,6 +726,7 @@ impl From<PriceTable> for CorePriceTable {
 
 #[cfg(test)]
 mod tests {
+    use agentlens_core::hostsource::{RefreshAction, TriggerReason};
     use serde_json::json;
 
     use super::*;
@@ -781,5 +782,291 @@ mod tests {
         assert_eq!(encoded["code"], "invalidInput");
         assert_eq!(encoded["message"], "invalid date");
         assert_eq!(encoded["fields"]["field"], "range.startDate");
+    }
+
+    fn core_tokens() -> CoreTokenValues {
+        CoreTokenValues {
+            tok_input: 11,
+            tok_output: 12,
+            tok_reasoning: 13,
+            tok_cache_read: 14,
+            tok_cache_write: 15,
+            total_input: 40,
+        }
+    }
+
+    fn core_cost() -> CoreCostTotals {
+        CoreCostTotals {
+            actual_sum: 1.25,
+            estimated_sum: 2.5,
+            unavailable_count: 3,
+        }
+    }
+
+    #[test]
+    fn enum_and_error_contracts_keep_every_wire_discriminator_stable() {
+        assert_eq!(
+            agentlens_core::query::WeekStart::from(WeekStart::Monday),
+            agentlens_core::query::WeekStart::Monday
+        );
+        assert_eq!(
+            agentlens_core::query::WeekStart::from(WeekStart::Sunday),
+            agentlens_core::query::WeekStart::Sunday
+        );
+
+        for (dto, core) in [
+            (Granularity::Hour, agentlens_core::query::Granularity::Hour),
+            (Granularity::Day, agentlens_core::query::Granularity::Day),
+            (Granularity::Week, agentlens_core::query::Granularity::Week),
+            (
+                Granularity::Month,
+                agentlens_core::query::Granularity::Month,
+            ),
+        ] {
+            assert_eq!(agentlens_core::query::Granularity::from(dto), core);
+        }
+
+        for (dto, core) in [
+            (HostKind::Local, CoreHostKind::Local),
+            (HostKind::Ssh, CoreHostKind::Ssh),
+        ] {
+            assert_eq!(CoreHostKind::from(dto), core);
+            assert_eq!(HostKind::from(core), dto);
+        }
+
+        for (core, dto) in [
+            (CoreCoverageStatus::Full, CoverageStatus::Full),
+            (CoreCoverageStatus::Partial, CoverageStatus::Partial),
+            (CoreCoverageStatus::None, CoverageStatus::None),
+        ] {
+            assert_eq!(CoverageStatus::from(core), dto);
+        }
+        for (core, dto) in [
+            (CoreTriggerMode::Auto, TriggerMode::Auto),
+            (CoreTriggerMode::Manual, TriggerMode::Manual),
+        ] {
+            assert_eq!(TriggerMode::from(core), dto);
+        }
+
+        let error = IpcError::not_found("host", "missing-host");
+        assert_eq!(error.to_string(), "host \"missing-host\" does not exist");
+        assert_eq!(error.fields.get("entity").map(String::as_str), Some("host"));
+        assert_eq!(
+            error.fields.get("identifier").map(String::as_str),
+            Some("missing-host")
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn aggregate_and_detail_conversions_preserve_every_numeric_and_identity_field() {
+        let tokens = TokenValues::from(core_tokens());
+        assert_eq!(tokens.tok_input, 11);
+        assert_eq!(tokens.tok_output, 12);
+        assert_eq!(tokens.tok_reasoning, 13);
+        assert_eq!(tokens.tok_cache_read, 14);
+        assert_eq!(tokens.tok_cache_write, 15);
+        assert_eq!(tokens.total_input, 40);
+
+        let cost = CostTotals::from(core_cost());
+        assert_eq!(cost.actual_sum, 1.25);
+        assert_eq!(cost.estimated_sum, 2.5);
+        assert_eq!(cost.unavailable_count, 3);
+
+        let summary = Summary::from(CoreSummary {
+            tokens: core_tokens(),
+            cost: core_cost(),
+            message_count: 21,
+            active_session_count: 8,
+        });
+        assert_eq!(summary.tokens, tokens);
+        assert_eq!(summary.cost, cost);
+        assert_eq!(summary.message_count, 21);
+        assert_eq!(summary.active_session_count, 8);
+
+        let series = SeriesPoint::from(CoreSeriesBucket {
+            bucket: agentlens_core::query::TimeBucket {
+                start_utc_ms: 100,
+                end_utc_ms: 200,
+                label: "fixture-hour".to_owned(),
+            },
+            coverage: CoreCoverageStatus::Full,
+            tokens: Some(core_tokens()),
+            cost: Some(core_cost()),
+            message_count: Some(5),
+        });
+        assert_eq!(series.bucket.start_utc_ms, 100);
+        assert_eq!(series.bucket.end_utc_ms, 200);
+        assert_eq!(series.bucket.label, "fixture-hour");
+        assert_eq!(series.coverage, CoverageStatus::Full);
+        assert_eq!(series.tokens, Some(tokens));
+        assert_eq!(series.cost, Some(cost));
+        assert_eq!(series.message_count, Some(5));
+
+        let breakdown = BreakdownRow::from(CoreBreakdownRow {
+            source: "opencode".to_owned(),
+            agent_key: "build".to_owned(),
+            agent_raw: "Build Agent".to_owned(),
+            provider_id: "provider".to_owned(),
+            model_id: "model".to_owned(),
+            variant: Some("xhigh".to_owned()),
+            tokens: core_tokens(),
+            cost: core_cost(),
+            message_count: 34,
+            active_session_count: 9,
+        });
+        assert_eq!(breakdown.source, "opencode");
+        assert_eq!(breakdown.agent_key, "build");
+        assert_eq!(breakdown.agent_raw, "Build Agent");
+        assert_eq!(breakdown.provider_id, "provider");
+        assert_eq!(breakdown.model_id, "model");
+        assert_eq!(breakdown.variant.as_deref(), Some("xhigh"));
+        assert_eq!(breakdown.tokens, tokens);
+        assert_eq!(breakdown.cost, cost);
+        assert_eq!(breakdown.message_count, 34);
+        assert_eq!(breakdown.active_session_count, 9);
+
+        let detail_cost = DetailCost::from(CoreDetailCost {
+            actual: Some(0.75),
+            estimated: Some(1.5),
+            unavailable: false,
+        });
+        assert_eq!(detail_cost.actual, Some(0.75));
+        assert_eq!(detail_cost.estimated, Some(1.5));
+        assert!(!detail_cost.unavailable);
+
+        let page = MessagePage::from(CoreDetailPage {
+            rows: vec![CoreDetailRow {
+                host_id: "host-1".to_owned(),
+                source: "opencode".to_owned(),
+                message_id: "message-1".to_owned(),
+                session_id: "session-1".to_owned(),
+                time_created_utc: 1_234,
+                agent_raw: "Build Agent".to_owned(),
+                agent_key: "build".to_owned(),
+                provider_id: "provider".to_owned(),
+                model_id: "model".to_owned(),
+                variant: Some("high".to_owned()),
+                tokens: core_tokens(),
+                cost: CoreDetailCost {
+                    actual: Some(0.75),
+                    estimated: None,
+                    unavailable: false,
+                },
+                is_incomplete: true,
+                project_dir: "/workspace/project".to_owned(),
+            }],
+            total_count: 17,
+            limit: 25,
+            offset: 50,
+        });
+        assert_eq!(page.total_count, 17);
+        assert_eq!(page.limit, 25);
+        assert_eq!(page.offset, 50);
+        assert_eq!(page.rows.len(), 1);
+        let row = &page.rows[0];
+        assert_eq!(row.host_id, "host-1");
+        assert_eq!(row.source, "opencode");
+        assert_eq!(row.message_id, "message-1");
+        assert_eq!(row.session_id, "session-1");
+        assert_eq!(row.time_created_utc, 1_234);
+        assert_eq!(row.agent_raw, "Build Agent");
+        assert_eq!(row.agent_key, "build");
+        assert_eq!(row.provider_id, "provider");
+        assert_eq!(row.model_id, "model");
+        assert_eq!(row.variant.as_deref(), Some("high"));
+        assert_eq!(row.tokens, tokens);
+        assert_eq!(row.cost.actual, Some(0.75));
+        assert!(row.is_incomplete);
+        assert_eq!(row.project_dir, "/workspace/project");
+    }
+
+    #[test]
+    fn scheduler_state_and_trigger_conversions_preserve_lifecycle_context() {
+        assert_eq!(SourceState::from(CoreSourceState::Idle), SourceState::Idle);
+        assert_eq!(
+            SourceState::from(CoreSourceState::Running),
+            SourceState::Running
+        );
+        assert_eq!(
+            SourceState::from(CoreSourceState::Error {
+                last_error: "network failed".to_owned(),
+                last_success: Some(99),
+            }),
+            SourceState::Error {
+                last_error: "network failed".to_owned(),
+                last_success: Some(99),
+            }
+        );
+
+        let status = SourceStatus::from(CoreSourceStatus {
+            host_id: "host-a".to_owned(),
+            display_name: "Host A".to_owned(),
+            kind: CoreHostKind::Ssh,
+            state: CoreSourceState::Error {
+                last_error: "timeout".to_owned(),
+                last_success: Some(10),
+            },
+            trigger: CoreTriggerMode::Manual,
+            last_error: Some("timeout".to_owned()),
+            last_success_utc: Some(10),
+            last_completed_utc: Some(20),
+            last_duration_ms: Some(30),
+            interval_ms: 900_000,
+            next_due_utc: None,
+            interrupted: false,
+            cursor_time_updated: Some(40),
+        });
+        assert_eq!(status.host_id, "host-a");
+        assert_eq!(status.display_name, "Host A");
+        assert_eq!(status.kind, HostKind::Ssh);
+        assert!(matches!(status.state, SourceState::Error { .. }));
+        assert_eq!(status.trigger, TriggerMode::Manual);
+        assert_eq!(status.last_error.as_deref(), Some("timeout"));
+        assert_eq!(status.last_success_utc, Some(10));
+        assert_eq!(status.last_completed_utc, Some(20));
+        assert_eq!(status.last_duration_ms, Some(30));
+        assert_eq!(status.interval_ms, 900_000);
+        assert_eq!(status.next_due_utc, None);
+        assert!(!status.interrupted);
+        assert_eq!(status.cursor_time_updated, Some(40));
+
+        let started = TriggerRefreshResult::try_from(CoreTriggerOutcome::Started(RefreshAction {
+            host_id: "host-a".to_owned(),
+            kind: CoreHostKind::Local,
+            reason: TriggerReason::Manual,
+            started_at_utc: 100,
+        }))
+        .expect("started outcome");
+        assert_eq!(
+            started,
+            TriggerRefreshResult::Started {
+                host_id: "host-a".to_owned(),
+                started_at_utc: 100,
+            }
+        );
+
+        let already_running = TriggerRefreshResult::try_from(CoreTriggerOutcome::AlreadyRunning {
+            host_id: "host-a".to_owned(),
+            started_at_utc: 100,
+        })
+        .expect("already-running outcome");
+        assert_eq!(
+            already_running,
+            TriggerRefreshResult::AlreadyRunning {
+                host_id: "host-a".to_owned(),
+                started_at_utc: 100,
+            }
+        );
+
+        let unknown = TriggerRefreshResult::try_from(CoreTriggerOutcome::UnknownHost {
+            host_id: "missing-host".to_owned(),
+        })
+        .expect_err("unknown host must become an IPC error");
+        assert_eq!(unknown.code, IpcErrorCode::NotFound);
+        assert_eq!(
+            unknown.fields.get("identifier").map(String::as_str),
+            Some("missing-host")
+        );
     }
 }

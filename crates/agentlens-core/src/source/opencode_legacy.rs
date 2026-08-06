@@ -1405,6 +1405,245 @@ mod tests {
     }
 
     #[test]
+    fn legacy_coverage_store_unions_origins_filters_pairs_and_rejects_corrupt_intervals() {
+        let temp = tempfile::tempdir().expect("coverage tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+        for (origin, start, end) in [
+            (Origin::Live, 0, 50),
+            (Origin::Bak, 40, 75),
+            (Origin::Legacy, 75, 100),
+        ] {
+            replace_origin_coverage(
+                archive.connection_mut(),
+                TEST_HOST,
+                OPENCODE_SOURCE,
+                origin,
+                Some(CoverageInterval::new(start, end).expect("valid interval")),
+            )
+            .expect("store origin interval");
+        }
+        archive
+            .connection()
+            .execute(
+                "INSERT INTO coverage_interval (
+                    host_id, source, origin, interval_start, interval_end
+                 ) VALUES (?1, ?2, 'bak', 150, 200)",
+                (TEST_HOST, OPENCODE_SOURCE),
+            )
+            .expect("seed a disjoint interval for the same pair");
+        let store = CoverageStore::load(archive.connection()).expect("load unioned coverage");
+        assert_eq!(
+            store.intervals_for(TEST_HOST, OPENCODE_SOURCE),
+            &[
+                CoverageInterval { start: 0, end: 100 },
+                CoverageInterval {
+                    start: 150,
+                    end: 200,
+                },
+            ]
+        );
+        assert!(store
+            .intervals_for("missing-host", OPENCODE_SOURCE)
+            .is_empty());
+        assert_eq!(
+            store.status(&bucket(0, 0), &AggregateFilters::default()),
+            CoverageStatus::None
+        );
+        assert_eq!(
+            store.status(
+                &bucket(0, 100),
+                &AggregateFilters {
+                    host_id: Some("missing-host".to_string()),
+                    ..AggregateFilters::default()
+                },
+            ),
+            CoverageStatus::None
+        );
+        assert!(matches!(
+            CoverageInterval::new(2, 1),
+            Err(LegacyError::InvalidInterval { start: 2, end: 1 })
+        ));
+
+        let corrupt = Connection::open_in_memory().expect("open corrupt interval fixture");
+        corrupt
+            .execute_batch(
+                "CREATE TABLE coverage_interval (
+                    host_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    interval_start INTEGER NOT NULL,
+                    interval_end INTEGER NOT NULL
+                 );
+                 INSERT INTO coverage_interval VALUES ('host', 'opencode', 9, 3);",
+            )
+            .expect("seed reversed interval");
+        assert!(matches!(
+            CoverageStore::load(&corrupt),
+            Err(LegacyError::InvalidInterval { start: 9, end: 3 })
+        ));
+    }
+
+    #[test]
+    fn legacy_origin_removal_and_live_cutoff_validation_leave_no_stale_coverage() {
+        let temp = tempfile::tempdir().expect("coverage tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+        replace_origin_coverage(
+            archive.connection_mut(),
+            TEST_HOST,
+            OPENCODE_SOURCE,
+            Origin::Legacy,
+            Some(CoverageInterval::new(10, 20).expect("valid interval")),
+        )
+        .expect("store legacy coverage");
+        replace_origin_coverage(
+            archive.connection_mut(),
+            TEST_HOST,
+            OPENCODE_SOURCE,
+            Origin::Legacy,
+            None,
+        )
+        .expect("remove empty legacy coverage");
+        assert_eq!(count_coverage_rows(archive.connection()), 0);
+
+        let error = extend_live_coverage(
+            archive.connection_mut(),
+            TEST_HOST,
+            OPENCODE_SOURCE,
+            Some(101),
+            100,
+        )
+        .expect_err("cutoff cannot precede an observed record");
+        assert!(matches!(
+            error,
+            LegacyError::CutoffBeforeRecord {
+                earliest: 101,
+                cutoff: 100
+            }
+        ));
+        assert_eq!(count_coverage_rows(archive.connection()), 0);
+    }
+
+    #[test]
+    fn legacy_bounded_backfill_uses_sorted_cap_and_one_record_batches() {
+        let (_fixture_temp, fixture_directory, manifest) = fixture_directory();
+        let archive_temp = tempfile::tempdir().expect("archive tempdir");
+        let mut archive = Archive::open_in_data_dir(archive_temp.path()).expect("open archive");
+        let options = LegacyBackfillOptions {
+            batch_size: 1,
+            max_files: Some(1),
+        };
+        let stats =
+            backfill_legacy_with_options(&mut archive, &fixture_directory, TEST_HOST, &options)
+                .expect("run bounded backfill");
+
+        assert!(stats.limited);
+        assert_eq!(stats.files_seen, manifest.legacy_message_rows);
+        assert_eq!(stats.files_attempted, 1);
+        assert_eq!(stats.eligible_records, 1);
+        assert_eq!(stats.ingest.received_records, 1);
+        assert!(stats.ingest.committed);
+        assert!(stats.interval.is_some());
+        assert_eq!(count_rows(archive.connection()), 1);
+
+        let invalid = LegacyBackfillOptions {
+            batch_size: 0,
+            max_files: None,
+        };
+        assert!(matches!(
+            backfill_legacy_with_options(&mut archive, &fixture_directory, TEST_HOST, &invalid,),
+            Err(LegacyError::InvalidBatchSize)
+        ));
+    }
+
+    #[test]
+    fn legacy_path_parser_falls_back_to_path_identity_and_coerces_timestamp_variants() {
+        let temp = tempfile::tempdir().expect("legacy parser tempdir");
+        let session = temp.path().join("session-from-path");
+        std::fs::create_dir(&session).expect("create session directory");
+        let path = session.join("message-from-path.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "   ",
+                "sessionID": "",
+                "role": "assistant",
+                "agent": "Legacy Agent",
+                "time": {"created": "1000", "updated": 1005.9},
+                "providerID": "legacy-provider",
+                "modelID": "legacy-model",
+                "variant": "must-be-cleared",
+                "cost": 0.5,
+                "tokens": {
+                    "input": 11,
+                    "output": 7,
+                    "reasoning": 3,
+                    "cache": {"read": 2, "write": 1}
+                }
+            }))
+            .expect("serialize legacy row"),
+        )
+        .expect("write legacy row");
+        let mut warnings = LegacyWarningCounts::default();
+        let record = parse_legacy_path(
+            &path,
+            &ParseContext::new(TEST_HOST, Origin::Legacy),
+            &mut warnings,
+        )
+        .expect("path fallbacks keep a valid assistant row");
+        assert_eq!(record.message_id, "message-from-path");
+        assert_eq!(record.session_id, "session-from-path");
+        assert_eq!(record.time_created_utc, 1_000);
+        assert_eq!(record.source_time_updated, 1_005);
+        assert_eq!(record.variant, None);
+        assert_eq!(record.cost, Some(0.5));
+        assert_eq!(warnings.total(), 0);
+
+        let invalid = session.join("invalid-time.json");
+        std::fs::write(&invalid, br#"{"role":"assistant","time":{},"tokens":{}}"#)
+            .expect("write invalid-time row");
+        assert!(parse_legacy_path(
+            &invalid,
+            &ParseContext::new(TEST_HOST, Origin::Legacy),
+            &mut warnings,
+        )
+        .is_none());
+        assert_eq!(warnings.invalid_records, 1);
+    }
+
+    #[test]
+    fn legacy_live_import_maps_archive_sink_failure_and_rolls_back_future_cutoff_rows() {
+        let (_fixture_temp, fixture_directory, _manifest) = fixture_directory();
+        let database = fixture_directory.join("opencode.db");
+
+        let sink_temp = tempfile::tempdir().expect("sink archive tempdir");
+        let mut sink_archive =
+            Archive::open_in_data_dir(sink_temp.path()).expect("open sink archive");
+        sink_archive
+            .connection()
+            .execute("DROP TABLE usage_record", [])
+            .expect("remove sink table");
+        let sink_error =
+            ingest_live_database(&mut sink_archive, &database, TEST_HOST, None, i64::MAX)
+                .expect_err("archive sink failure must be surfaced");
+        assert!(matches!(sink_error, LegacyError::Sink(_)));
+
+        let cutoff_temp = tempfile::tempdir().expect("cutoff archive tempdir");
+        let mut cutoff_archive =
+            Archive::open_in_data_dir(cutoff_temp.path()).expect("open cutoff archive");
+        let cutoff_error = ingest_live_database(&mut cutoff_archive, &database, TEST_HOST, None, 0)
+            .expect_err("records after the snapshot cutoff must reject the round");
+        assert!(matches!(
+            cutoff_error,
+            LegacyError::CutoffBeforeRecord { cutoff: 0, .. }
+        ));
+        assert_eq!(count_rows(cutoff_archive.connection()), 0);
+        assert_eq!(count_coverage_rows(cutoff_archive.connection()), 0);
+        assert_eq!(
+            read_cursor(cutoff_archive.connection(), TEST_HOST).expect("read rolled-back cursor"),
+            None
+        );
+    }
+
+    #[test]
     #[ignore = "manual QA invokes external sqlite3 and prints manifest coverage states"]
     fn legacy_manual_qa_fixture_external_sqlite3_and_tri_state_dump() {
         let (fixture_temp, archive_temp, _fixture_directory, archive, manifest) = fixture_archive();

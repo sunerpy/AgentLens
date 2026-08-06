@@ -1188,7 +1188,7 @@ mod tests {
 
     use crate::archive::{Archive, CostSource, NormalizedUsageRecord, Origin};
     use crate::fixture::{generate, Manifest};
-    use crate::pricing::PriceTable;
+    use crate::pricing::{PriceEntry, PriceTable};
     use crate::source::opencode::{scan_database, ScanRequest};
 
     use super::*;
@@ -1751,6 +1751,271 @@ mod tests {
         .expect("summary after insert");
         assert_eq!(after_insert.message_count, first.message_count + 1);
         assert_eq!(after_insert.tokens.tok_input, first.tokens.tok_input + 20);
+    }
+
+    #[test]
+    fn query_week_month_hour_and_skipped_local_day_buckets_follow_calendar_boundaries() {
+        let utc: chrono_tz::Tz = "UTC".parse().expect("UTC timezone");
+        let final_supported_day = LocalDateRange::new(
+            date("2100-12-31"),
+            date("2101-01-01"),
+            utc,
+            WeekStart::Monday,
+        )
+        .expect("the final supported day is queryable");
+        assert_eq!(
+            generate_buckets(&final_supported_day, Granularity::Day)
+                .expect("generate final supported day")
+                .len(),
+            1
+        );
+        assert!(matches!(
+            LocalDateRange::new(
+                date("2100-12-31"),
+                date("2101-01-02"),
+                utc,
+                WeekStart::Monday,
+            ),
+            Err(QueryError::UnsupportedYear { .. })
+        ));
+
+        assert_eq!(
+            label_for_epoch_ms(0, utc, Granularity::Hour, WeekStart::Monday)
+                .expect("label Unix epoch hour"),
+            "1970-01-01T00:00+00:00"
+        );
+        assert!(matches!(
+            label_for_epoch_ms(i64::MAX, utc, Granularity::Day, WeekStart::Monday),
+            Err(QueryError::InvalidTimestamp(i64::MAX))
+        ));
+
+        let weeks = generate_buckets(
+            &report_range("2026-07-29", "2026-08-12", "UTC"),
+            Granularity::Week,
+        )
+        .expect("generate clipped week buckets");
+        assert_eq!(
+            weeks
+                .iter()
+                .map(|bucket| bucket.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2026-W31", "2026-W32", "2026-W33"]
+        );
+        assert!(weeks
+            .windows(2)
+            .all(|pair| pair[0].end_utc_ms == pair[1].start_utc_ms));
+
+        let months = generate_buckets(
+            &report_range("2026-07-31", "2026-09-02", "UTC"),
+            Granularity::Month,
+        )
+        .expect("generate clipped month buckets");
+        assert_eq!(
+            months
+                .iter()
+                .map(|bucket| bucket.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["2026-07", "2026-08", "2026-09"]
+        );
+        assert_eq!(months[0].end_utc_ms - months[0].start_utc_ms, 86_400_000);
+
+        let skipped_day = report_range("2011-12-30", "2011-12-31", "Pacific/Apia");
+        let (start, end) = skipped_day.utc_bounds().expect("resolve skipped Apia day");
+        assert_eq!(start, end);
+        assert!(generate_buckets(&skipped_day, Granularity::Day)
+            .expect("a skipped local date is an empty interval")
+            .is_empty());
+    }
+
+    #[test]
+    fn query_collapsed_breakdown_and_detail_rows_keep_all_four_cost_states_distinct() {
+        let (_temp, archive) = empty_archive();
+        let range = report_range("2026-07-31", "2026-08-01", "UTC");
+        let (start, _) = range.utc_bounds().expect("cost-state bounds");
+
+        let mut actual = fixed_record("cost-actual", start + 1_000, 10);
+        actual.variant = Some("high".to_string());
+        actual.cost = Some(0.1);
+        actual.cost_source = CostSource::Actual;
+        let mut stored_estimate = fixed_record("cost-stored-estimate", start + 2_000, 20);
+        stored_estimate.variant = Some("low".to_string());
+        stored_estimate.cost = Some(0.2);
+        stored_estimate.cost_source = CostSource::Estimated;
+        let mut dynamic_estimate = fixed_record("cost-dynamic-estimate", start + 3_000, 30);
+        dynamic_estimate.variant = None;
+        let mut unavailable = fixed_record("cost-unavailable", start + 4_000, 40);
+        unavailable.provider_id = "unpriced-provider".to_string();
+        unavailable.model_id = "unpriced-model".to_string();
+        for record in [&actual, &stored_estimate, &dynamic_estimate, &unavailable] {
+            insert_record(&archive, record);
+        }
+
+        let prices = PriceTable::from_entries(vec![PriceEntry::new(
+            "query-provider",
+            "query-model",
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        )]);
+        let expected_dynamic = prices
+            .estimate(
+                "query-provider",
+                "query-model",
+                crate::pricing::TokenCounts {
+                    input: dynamic_estimate.tok_input,
+                    output: dynamic_estimate.tok_output,
+                    cache_read: dynamic_estimate.tok_cache_read,
+                    cache_write: dynamic_estimate.tok_cache_write,
+                },
+            )
+            .expect("priced model has an estimate");
+        let collapsed = query_breakdown(
+            &archive,
+            &range,
+            &AggregateFilters::default(),
+            BreakdownOptions {
+                expand_variant: false,
+            },
+            &prices,
+        )
+        .expect("query collapsed cost breakdown");
+        let priced_group = collapsed
+            .iter()
+            .find(|row| row.provider_id == "query-provider")
+            .expect("priced collapsed group");
+        assert_eq!(priced_group.variant, None);
+        assert_eq!(priced_group.message_count, 3);
+        assert_eq!(priced_group.cost.actual_sum, 0.1);
+        assert_eq!(priced_group.cost.estimated_sum, 0.2 + expected_dynamic);
+        assert_eq!(priced_group.cost.unavailable_count, 0);
+        let unavailable_group = collapsed
+            .iter()
+            .find(|row| row.provider_id == "unpriced-provider")
+            .expect("unpriced collapsed group");
+        assert_eq!(unavailable_group.cost.unavailable_count, 1);
+
+        let filters = DetailFilters {
+            host_id: Some("host-query-test".to_string()),
+            source: Some("opencode".to_string()),
+            agent_key: Some("atlas-plan-executor".to_string()),
+            provider_id: Some("query-provider".to_string()),
+            model_id: Some("query-model".to_string()),
+            is_incomplete: Some(false),
+        };
+        let details = query_details(&archive, &range, &filters, 50, 0, &prices)
+            .expect("query all priced detail cost states");
+        assert_eq!(details.total_count, 3);
+        let by_id = details
+            .rows
+            .iter()
+            .map(|row| (row.message_id.as_str(), row.cost))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            by_id["cost-actual"],
+            DetailCost {
+                actual: Some(0.1),
+                estimated: None,
+                unavailable: false,
+            }
+        );
+        assert_eq!(
+            by_id["cost-stored-estimate"],
+            DetailCost {
+                actual: None,
+                estimated: Some(0.2),
+                unavailable: false,
+            }
+        );
+        assert_eq!(
+            by_id["cost-dynamic-estimate"],
+            DetailCost {
+                actual: None,
+                estimated: Some(expected_dynamic),
+                unavailable: false,
+            }
+        );
+
+        let unpriced_details = query_details(
+            &archive,
+            &range,
+            &DetailFilters {
+                provider_id: Some("unpriced-provider".to_string()),
+                ..DetailFilters::default()
+            },
+            50,
+            0,
+            &prices,
+        )
+        .expect("query unavailable detail state");
+        assert_eq!(unpriced_details.total_count, 1);
+        assert_eq!(
+            unpriced_details.rows[0].cost,
+            DetailCost {
+                actual: None,
+                estimated: None,
+                unavailable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn query_reports_corrupt_negative_tokens_and_unknown_cost_provenance_by_column() {
+        let (_temp, archive) = empty_archive();
+        let range = report_range("2026-07-31", "2026-08-01", "UTC");
+        let (start, _) = range.utc_bounds().expect("corrupt-row bounds");
+        insert_record(&archive, &fixed_record("corrupt-row", start + 1_000, 10));
+        archive
+            .connection()
+            .execute(
+                "UPDATE usage_record SET tok_input = -1 WHERE message_id = 'corrupt-row'",
+                [],
+            )
+            .expect("inject a negative token count");
+        let negative = query_summary(
+            &archive,
+            &range,
+            &AggregateFilters::default(),
+            &PriceTable::new(),
+        )
+        .expect_err("negative archive counters must be rejected");
+        assert!(matches!(
+            negative,
+            QueryError::InvalidStoredInteger {
+                column: "tok_input",
+                value: -1
+            }
+        ));
+
+        archive
+            .connection()
+            .execute(
+                "UPDATE usage_record SET tok_input = 10 WHERE message_id = 'corrupt-row'",
+                [],
+            )
+            .expect("restore token count");
+        archive
+            .connection()
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("allow corruption fixture");
+        archive
+            .connection()
+            .execute(
+                "UPDATE usage_record SET cost_source = 'mystery' WHERE message_id = 'corrupt-row'",
+                [],
+            )
+            .expect("inject unknown cost provenance");
+        let provenance = query_summary(
+            &archive,
+            &range,
+            &AggregateFilters::default(),
+            &PriceTable::new(),
+        )
+        .expect_err("unknown cost provenance must be rejected");
+        assert!(matches!(
+            provenance,
+            QueryError::InvalidCostSource(ref value) if value == "mystery"
+        ));
     }
 
     #[test]

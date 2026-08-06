@@ -61,15 +61,17 @@ OXFMT_HINT := 未找到 oxfmt，跳过 YAML/JSON/Markdown 格式化（安装：m
 # 门禁读的是 lcov.info 的 LF/LH（Codecov 消费的同一份数据），所以本地门禁数字与
 # Codecov 面板数字同源，不存在「本地过了线上红」的漂移。
 #
-# COVERAGE_MIN 的取法：2026-08-01 实测 workspace 行覆盖率 78.8%，据此把地板定在 75，
-# 留约 4pp 余量。**不要把它调成一个当下达不到的理想值**——上任即红的门禁只会被绕过。
-# 后续棘轮：覆盖率稳定上一档后（例如实测到 82%），把 COVERAGE_MIN 提到 78，逐档往上。
-# 注意 18 个 #[ignore] 用例（真实大库 / 需 GUI）不参与统计，天花板本就低于纸面。
+# COVERAGE_MIN 的取法：2026-08-06 在 Linux 以 `cargo llvm-cov --workspace` 实测
+# workspace 行覆盖率 91.63%（基线 15894/17346；门禁复验 15895/17346），据此把硬地板
+# 定在 90，留 1.63pp 余量。复验分母稳定、命中仅差 1 行（约 0.006pp）；历史上分母不同的
+# 2.6pp 读数来自插桩范围或代码状态不同，不是 runner 随机抖动。后续仍按棘轮逐档上调。
+# 注意 11 个 #[ignore] 用例（真实大库 / 外部二进制 / 真实钥匙串）不参与统计，天花板低于纸面。
 # ---------------------------------------------------------------------------
 COVERAGE_DIR := artifacts/coverage
 COVERAGE_LCOV := $(COVERAGE_DIR)/lcov.info
 COVERAGE_SUMMARY := $(COVERAGE_DIR)/summary.txt
-COVERAGE_MIN ?= 75
+# 用 := 压过同名环境变量，避免硬地板被静默降低；命令行 COVERAGE_MIN=... 仍保持最高优先级。
+COVERAGE_MIN := 90
 
 # 钩子安装方式：auto = 有 pre-commit 就用框架，否则退化为纯 .git/hooks 脚本；
 # plain = 强制走纯脚本（用于验证退化路径本身可用）。
@@ -224,7 +226,7 @@ coverage: ## Rust 覆盖率报告 → artifacts/coverage/{summary.txt,lcov.info}
 	@test -s $(COVERAGE_LCOV) || { echo '$(COVERAGE_LCOV) 缺失或为空'; exit 1; }
 	@echo '[coverage] $(COVERAGE_SUMMARY) 与 $(COVERAGE_LCOV) 已生成'
 
-coverage-gate: ## 行覆盖率低于门槛即失败（可覆盖：make coverage-gate COVERAGE_MIN=80）
+coverage-gate: ## 行覆盖率低于门槛即失败（可覆盖：make coverage-gate COVERAGE_MIN=99.9）
 	@# 先校验门槛再跑覆盖率：门槛写错时 1 秒内失败，而不是白跑几分钟插桩测试。
 	@# 也因此这里用递归 make 而非 prerequisite —— prerequisite 一定先于本 recipe 执行。
 	@[[ '$(COVERAGE_MIN)' =~ ^[0-9]+([.][0-9]+)?$$ ]] || { \

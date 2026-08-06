@@ -1811,8 +1811,14 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use rusqlite::{Connection, OpenFlags};
+    use serde_json::json;
 
-    use super::{generate, FixtureGuard, Manifest};
+    use super::{
+        collect_json_files, daily_expectations, generate, normalize_agent_key,
+        parse_fixture_assistant, query_count, remove_path_if_exists,
+        tree_size as fixture_tree_size, AggregateRecord, ExpectedCostSource, FixtureError,
+        FixtureGuard, Manifest, TokenExpectation,
+    };
 
     const MAX_FIXTURE_BYTES: u64 = 5 * 1024 * 1024;
     const EXPECTED_MESSAGE_DDL: &str = "CREATE TABLE `message` (\n  `id` text PRIMARY KEY,\n  `session_id` text NOT NULL,\n  `time_created` integer NOT NULL,\n  `time_updated` integer NOT NULL,\n  `data` text NOT NULL,\n  CONSTRAINT `fk_message_session_id_session_id_fk` FOREIGN KEY (`session_id`)\n    REFERENCES `session`(`id`) ON DELETE CASCADE\n)";
@@ -2006,6 +2012,275 @@ mod tests {
             error.to_string().contains("eligible_assistant_count"),
             "validation error must name the mismatched field: {error}"
         );
+    }
+
+    #[test]
+    fn fixture_gen_rejects_non_directory_and_invalid_output_paths() {
+        let root = tempfile::tempdir().expect("create fixture tempdir");
+        let output_file = root.path().join("fixture-file");
+        fs::write(&output_file, b"do not replace").expect("write occupied output path");
+
+        let error = generate(&output_file).expect_err("existing file must not be replaced");
+        assert!(matches!(
+            error,
+            FixtureError::OutputNotDirectory(path) if path == output_file
+        ));
+        assert_eq!(
+            fs::read(&output_file).expect("read preserved output file"),
+            b"do not replace"
+        );
+
+        let error = generate(Path::new("/")).expect_err("root has no replaceable final name");
+        assert!(matches!(error, FixtureError::InvalidOutputPath(path) if path == Path::new("/")));
+    }
+
+    #[test]
+    fn fixture_manifest_validation_names_each_drifted_section() {
+        let root = tempfile::tempdir().expect("create fixture tempdir");
+        let out_dir = root.path().join("fixture");
+        let manifest = generate(&out_dir).expect("generate fixture");
+
+        type ManifestMutation = (&'static str, Box<dyn Fn(&mut Manifest)>);
+        let mutations: Vec<ManifestMutation> = vec![
+            (
+                "schema_version",
+                Box::new(|value| value.schema_version += 1),
+            ),
+            (
+                "fixture_version",
+                Box::new(|value| value.fixture_version += 1),
+            ),
+            (
+                "total_message_rows",
+                Box::new(|value| value.total_message_rows += 1),
+            ),
+            (
+                "skipped_breakdown",
+                Box::new(|value| {
+                    value.skipped_breakdown.insert("non_assistant".into(), 99);
+                }),
+            ),
+            ("skipped_count", Box::new(|value| value.skipped_count += 1)),
+            (
+                "same_timestamp_bucket.count",
+                Box::new(|value| {
+                    value.same_timestamp_bucket.count += 1;
+                }),
+            ),
+            (
+                "legacy_message_rows",
+                Box::new(|value| value.legacy_message_rows += 1),
+            ),
+            (
+                "combined_unique_message_count",
+                Box::new(|value| {
+                    value.combined_unique_message_count += 1;
+                }),
+            ),
+            (
+                "daily_expectations",
+                Box::new(|value| {
+                    value.daily_expectations.clear();
+                }),
+            ),
+        ];
+        for (field, mutate) in mutations {
+            let mut drifted = manifest.clone();
+            mutate(&mut drifted);
+            let error = drifted
+                .validate(&out_dir)
+                .expect_err("manifest drift must fail validation");
+            assert!(
+                error.to_string().contains(field),
+                "validation error must name {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_manifest_validation_rejects_special_and_coverage_drift() {
+        let root = tempfile::tempdir().expect("create fixture tempdir");
+        let out_dir = root.path().join("fixture");
+        let manifest = generate(&out_dir).expect("generate fixture");
+
+        let mut special = manifest.clone();
+        special
+            .special_rows
+            .get_mut("flat_with_variant")
+            .expect("special row")
+            .session_id
+            .push_str("-wrong");
+        let error = special
+            .validate(&out_dir)
+            .expect_err("special-row drift must fail");
+        assert!(error
+            .to_string()
+            .contains("special_rows.flat_with_variant.session_id"));
+
+        let mut lagged = manifest.clone();
+        lagged.special_rows.remove("lagged_update");
+        let error = lagged
+            .validate(&out_dir)
+            .expect_err("missing lagged row must fail");
+        assert!(error.to_string().contains("special_rows.lagged_update"));
+
+        let mut stale = manifest.clone();
+        stale.lagged_update.stale_tokens.input = 1;
+        let error = stale
+            .validate(&out_dir)
+            .expect_err("nonzero stale tokens must fail");
+        assert!(error
+            .to_string()
+            .contains("lagged_update.stale_tokens expected all zero"));
+
+        let mut coverage = manifest.clone();
+        coverage.coverage.db_start += 1;
+        let error = coverage
+            .validate(&out_dir)
+            .expect_err("database coverage drift must fail");
+        assert!(error.to_string().contains("coverage.db_start"));
+
+        let mut span = manifest.clone();
+        span.coverage.covered_zero_usage.end -= 1;
+        let error = span
+            .validate(&out_dir)
+            .expect_err("zero-usage coverage must span seven days");
+        assert!(error
+            .to_string()
+            .contains("covered_zero_usage must span exactly seven days"));
+
+        let mut cutoff = manifest.clone();
+        cutoff.coverage.live_cutoff = super::DST_FALL_SECOND;
+        let error = cutoff
+            .validate(&out_dir)
+            .expect_err("cutoff before final live row must fail");
+        assert!(error
+            .to_string()
+            .contains("live_cutoff must extend beyond the final live record"));
+    }
+
+    #[test]
+    fn fixture_parser_supports_nested_models_and_reports_missing_fields() {
+        let complete = json!({
+            "role": "assistant",
+            "agent": "  Atlas__规划 / EXECUTOR  ",
+            "model": {"providerID": "nested-provider", "modelID": "nested-model"},
+            "variant": "xhigh",
+            "cost": 1.25,
+            "tokens": {
+                "input": 3,
+                "output": 5,
+                "reasoning": 7,
+                "cache": {"read": 11, "write": 13},
+                "total": 999
+            },
+            "time": {"completed": 42}
+        });
+        let parsed = parse_fixture_assistant(&complete).expect("parse nested model fixture");
+        assert_eq!(parsed.agent_key, "atlas-规划-executor");
+        assert_eq!(parsed.provider_id, "nested-provider");
+        assert_eq!(parsed.model_id, "nested-model");
+        assert_eq!(parsed.variant.as_deref(), Some("xhigh"));
+        assert_eq!(parsed.tokens, TokenExpectation::new(3, 5, 7, 11, 13));
+        assert_eq!(parsed.source_tokens_total, Some(999));
+        assert_eq!(parsed.cost, Some(1.25));
+        assert_eq!(parsed.cost_source, ExpectedCostSource::Actual);
+        assert!(!parsed.is_incomplete);
+        assert_eq!(normalize_agent_key(" !!! "), "");
+
+        let zero = json!({
+            "agent": "Build",
+            "providerID": "provider",
+            "modelID": "model",
+            "cost": 0,
+            "tokens": {
+                "input": 0, "output": 0, "reasoning": 0,
+                "cache": {"read": 0, "write": 0}
+            },
+            "time": {}
+        });
+        let parsed = parse_fixture_assistant(&zero).expect("parse incomplete row");
+        assert_eq!(parsed.cost, None);
+        assert_eq!(parsed.cost_source, ExpectedCostSource::Unavailable);
+        assert!(parsed.is_incomplete);
+
+        for (field, mut malformed) in [
+            ("/agent", complete.clone()),
+            ("providerID", complete.clone()),
+            ("modelID", complete.clone()),
+            ("/tokens/input", complete.clone()),
+            ("numeric cost", complete.clone()),
+        ] {
+            match field {
+                "/agent" => {
+                    malformed.as_object_mut().expect("object").remove("agent");
+                }
+                "providerID" => {
+                    malformed["model"]
+                        .as_object_mut()
+                        .expect("model object")
+                        .remove("providerID");
+                }
+                "modelID" => {
+                    malformed["model"]
+                        .as_object_mut()
+                        .expect("model object")
+                        .remove("modelID");
+                }
+                "/tokens/input" => {
+                    malformed["tokens"]
+                        .as_object_mut()
+                        .expect("tokens object")
+                        .remove("input");
+                }
+                "numeric cost" => malformed["cost"] = json!("unknown"),
+                _ => unreachable!(),
+            };
+            let error = parse_fixture_assistant(&malformed)
+                .expect_err("malformed assistant fixture must fail");
+            assert!(
+                error.to_string().contains(field),
+                "error must identify {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_aggregation_and_filesystem_helpers_enforce_boundaries() {
+        let invalid_time = AggregateRecord {
+            session_id: "session".into(),
+            time_created: i64::MAX,
+            tokens: TokenExpectation::default(),
+            source_cost: 0.0,
+            is_incomplete: false,
+        };
+        let error = daily_expectations([invalid_time])
+            .expect_err("out-of-range epoch milliseconds must fail");
+        assert!(error
+            .to_string()
+            .contains("invalid fixture epoch milliseconds"));
+
+        let connection = Connection::open_in_memory().expect("open in-memory database");
+        let error =
+            query_count(&connection, "SELECT -1", []).expect_err("negative SQL count must fail");
+        assert!(error.to_string().contains("negative count"));
+
+        let root = tempfile::tempdir().expect("create helper tempdir");
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).expect("create nested directory");
+        fs::write(root.path().join("ignored.txt"), b"12").expect("write text file");
+        fs::write(root.path().join("z.json"), b"123").expect("write root json");
+        fs::write(nested.join("a.json"), b"1234").expect("write nested json");
+        assert_eq!(
+            collect_json_files(root.path()).expect("collect json files"),
+            vec![nested.join("a.json"), root.path().join("z.json")]
+        );
+        assert_eq!(fixture_tree_size(root.path()).expect("measure tree"), 9);
+
+        remove_path_if_exists(&root.path().join("ignored.txt")).expect("remove file");
+        remove_path_if_exists(&nested).expect("remove directory");
+        remove_path_if_exists(&nested).expect("missing path is a no-op");
+        assert!(!nested.exists());
     }
 
     fn tree_size(path: &Path) -> u64 {

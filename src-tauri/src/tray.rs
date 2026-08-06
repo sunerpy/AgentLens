@@ -49,6 +49,23 @@ const MENU_ID_OPEN: &str = "tray-open";
 const MENU_ID_REFRESH: &str = "tray-refresh";
 const MENU_ID_QUIT: &str = "tray-quit";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrayMenuAction {
+    Open,
+    Refresh,
+    Quit,
+    Ignore,
+}
+
+fn tray_menu_action(menu_id: &str) -> TrayMenuAction {
+    match menu_id {
+        MENU_ID_OPEN => TrayMenuAction::Open,
+        MENU_ID_REFRESH => TrayMenuAction::Refresh,
+        MENU_ID_QUIT => TrayMenuAction::Quit,
+        _ => TrayMenuAction::Ignore,
+    }
+}
+
 // Native tray menu labels live here rather than in `frontend/src/i18n/zh.ts`: the menu is an
 // OS-level widget built by Rust, so it cannot read the frontend dictionary. `check-i18n` only
 // governs `frontend/src/**`, which is where every browser-rendered string still comes from.
@@ -73,11 +90,11 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         .tooltip(TRAY_TOOLTIP)
         .menu(&menu)
         .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            MENU_ID_OPEN => show_main_window(app),
-            MENU_ID_REFRESH => refresh_all_hosts(app),
-            MENU_ID_QUIT => app.exit(0),
-            _ => {}
+        .on_menu_event(|app, event| match tray_menu_action(event.id().as_ref()) {
+            TrayMenuAction::Open => show_main_window(app),
+            TrayMenuAction::Refresh => refresh_all_hosts(app),
+            TrayMenuAction::Quit => app.exit(0),
+            TrayMenuAction::Ignore => {}
         });
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
@@ -113,17 +130,35 @@ fn show_main_window(app: &AppHandle) {
 
 fn refresh_all_hosts(app: &AppHandle) {
     let state = app.state::<AppState>();
-    let Ok(host_ids) = state.lock_scheduler().map(|scheduler| scheduler.host_ids()) else {
+    let Ok(outcomes) = trigger_all_hosts(&state) else {
         return;
     };
-    for host_id in host_ids {
-        if let Err(error) = state.trigger_refresh(&host_id) {
+    for (host_id, outcome) in outcomes {
+        if let Err(error) = outcome {
             eprintln!(
                 "agentlens: tray refresh for {host_id} failed: {}",
                 error.message
             );
         }
     }
+}
+
+type HostRefreshOutcome = (
+    String,
+    Result<crate::contract::TriggerRefreshResult, crate::contract::IpcError>,
+);
+
+fn trigger_all_hosts(
+    state: &AppState,
+) -> Result<Vec<HostRefreshOutcome>, crate::contract::IpcError> {
+    let host_ids = state.lock_scheduler()?.host_ids();
+    Ok(host_ids
+        .into_iter()
+        .map(|host_id| {
+            let outcome = state.trigger_refresh(&host_id);
+            (host_id, outcome)
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -259,20 +294,12 @@ pub fn spawn_selftest_driver(app: &AppHandle) {
 
 #[cfg(debug_assertions)]
 fn run_selftest(app: &AppHandle, dir: &std::path::Path) {
-    use std::thread::sleep;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     const STEP: Duration = Duration::from_millis(100);
 
-    let poll = |deadline: Duration, mut ready: Box<dyn FnMut() -> bool>| -> bool {
-        let started = Instant::now();
-        while started.elapsed() < deadline {
-            if ready() {
-                return true;
-            }
-            sleep(STEP);
-        }
-        false
+    let poll = |deadline: Duration, ready: Box<dyn FnMut() -> bool>| -> bool {
+        poll_until(deadline, STEP, ready)
     };
 
     let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
@@ -322,6 +349,22 @@ fn run_selftest(app: &AppHandle, dir: &std::path::Path) {
     println!("SELFTEST STEP invoked=test_quit");
 }
 
+#[cfg(debug_assertions)]
+fn poll_until(
+    deadline: std::time::Duration,
+    step: std::time::Duration,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < deadline {
+        if ready() {
+            return true;
+        }
+        std::thread::sleep(step);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
@@ -332,7 +375,7 @@ mod tests {
     };
     use crate::contract::{
         AggregateFilters, AppSettings, DateRange, Granularity, HostCreateInput,
-        HostKind as ContractHostKind, WeekStart,
+        HostKind as ContractHostKind, TriggerRefreshResult, WeekStart,
     };
     use crate::state::AppState;
 
@@ -450,6 +493,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tray_menu_ids_map_to_explicit_actions_and_unknown_ids_are_ignored() {
+        assert_eq!(tray_menu_action(MENU_ID_OPEN), TrayMenuAction::Open);
+        assert_eq!(tray_menu_action(MENU_ID_REFRESH), TrayMenuAction::Refresh);
+        assert_eq!(tray_menu_action(MENU_ID_QUIT), TrayMenuAction::Quit);
+        assert_eq!(tray_menu_action("future-menu-item"), TrayMenuAction::Ignore);
+    }
+
+    #[test]
+    fn tray_refresh_dispatches_every_registered_host_without_double_starting_running_rounds() {
+        let (_data_dir, state) = state();
+        let local = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "Local workstation".to_owned(),
+                kind: ContractHostKind::Local,
+                machine_id_hash: "6".repeat(64),
+                ssh_target: None,
+                remote_data_dir: None,
+            },
+        )
+        .expect("create local host");
+        let remote = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "Remote workstation".to_owned(),
+                kind: ContractHostKind::Ssh,
+                machine_id_hash: "7".repeat(64),
+                ssh_target: Some("ci@example.test".to_owned()),
+                remote_data_dir: Some("/srv/opencode".to_owned()),
+            },
+        )
+        .expect("create remote host");
+
+        {
+            let mut scheduler = state.lock_scheduler().expect("lock scheduler");
+            assert!(matches!(
+                scheduler.trigger_manual(&local.host_id, 100),
+                agentlens_core::hostsource::TriggerOutcome::Started(_)
+            ));
+            assert!(matches!(
+                scheduler.trigger_manual(&remote.host_id, 200),
+                agentlens_core::hostsource::TriggerOutcome::Started(_)
+            ));
+        }
+
+        let outcomes = trigger_all_hosts(&state).expect("dispatch tray refresh");
+        assert_eq!(outcomes.len(), 2);
+        for (host_id, outcome) in outcomes {
+            let expected_started_at = if host_id == local.host_id { 100 } else { 200 };
+            assert_eq!(
+                outcome.expect("already-running is a successful command result"),
+                TriggerRefreshResult::AlreadyRunning {
+                    host_id,
+                    started_at_utc: expected_started_at,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn selftest_poll_stops_on_success_and_does_not_call_after_an_expired_deadline() {
+        let calls = std::cell::Cell::new(0_u32);
+        assert!(poll_until(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::ZERO,
+            || {
+                calls.set(calls.get() + 1);
+                calls.get() == 3
+            }
+        ));
+        assert_eq!(
+            calls.get(),
+            3,
+            "polling stops as soon as the condition is ready"
+        );
+
+        let expired_called = std::cell::Cell::new(false);
+        assert!(!poll_until(
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            || {
+                expired_called.set(true);
+                true
+            }
+        ));
+        assert!(!expired_called.get());
+    }
+
     /// The settings view renders whatever `prices_set` rejects verbatim, so each rejection must
     /// carry an actionable message and must leave `prices.json` untouched.
     #[test]
@@ -536,20 +668,46 @@ mod tests {
             },
         )
         .expect("create local host");
+        let remote = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "Remote workstation".to_owned(),
+                kind: ContractHostKind::Ssh,
+                machine_id_hash: "c".repeat(64),
+                ssh_target: Some("ci@example.test".to_owned()),
+                remote_data_dir: None,
+            },
+        )
+        .expect("create remote host");
 
         set_settings_impl(
             &state,
-            settings(&[(SETTING_KEY_LOCAL_INTERVAL_MS, "450000")]),
+            settings(&[
+                (SETTING_KEY_LOCAL_INTERVAL_MS, "450000"),
+                (SETTING_KEY_REMOTE_INTERVAL_MS, "1200000"),
+            ]),
         )
         .expect("persist local interval");
         apply_refresh_intervals(&state);
-        assert_eq!(
-            state
-                .lock_scheduler()
-                .expect("lock scheduler")
-                .interval_ms(&host.host_id),
-            Some(450_000)
-        );
+        {
+            let scheduler = state.lock_scheduler().expect("lock scheduler");
+            assert_eq!(scheduler.interval_ms(&host.host_id), Some(450_000));
+            assert_eq!(scheduler.interval_ms(&remote.host_id), Some(1_200_000));
+            assert_eq!(
+                scheduler
+                    .status(&host.host_id)
+                    .expect("local status")
+                    .trigger,
+                agentlens_core::hostsource::TriggerMode::Auto
+            );
+            assert_eq!(
+                scheduler
+                    .status(&remote.host_id)
+                    .expect("remote status")
+                    .trigger,
+                agentlens_core::hostsource::TriggerMode::Manual
+            );
+        }
 
         // A configured 60 s must not reach the scheduler even if it somehow bypassed the UI.
         set_settings_impl(
@@ -565,5 +723,98 @@ mod tests {
                 .interval_ms(&host.host_id),
             Some(MIN_REFRESH_INTERVAL_MS)
         );
+    }
+
+    #[test]
+    fn persisted_interval_read_failures_leave_existing_schedules_untouched() {
+        let (_data_dir, state) = state();
+        let host = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "Local workstation".to_owned(),
+                kind: ContractHostKind::Local,
+                machine_id_hash: "8".repeat(64),
+                ssh_target: None,
+                remote_data_dir: None,
+            },
+        )
+        .expect("create local host");
+        let before = state
+            .lock_scheduler()
+            .expect("lock scheduler")
+            .interval_ms(&host.host_id);
+        state
+            .lock_archive()
+            .expect("lock archive")
+            .connection()
+            .execute_batch("DROP TABLE app_settings")
+            .expect("remove settings table");
+
+        apply_refresh_intervals(&state);
+
+        assert_eq!(
+            state
+                .lock_scheduler()
+                .expect("lock scheduler")
+                .interval_ms(&host.host_id),
+            before,
+            "a settings read failure must not partially rewrite schedules"
+        );
+    }
+
+    #[test]
+    fn archive_location_publication_is_best_effort_when_the_settings_table_is_unavailable() {
+        let (_data_dir, state) = state();
+        state
+            .lock_archive()
+            .expect("lock archive")
+            .connection()
+            .execute_batch("DROP TABLE app_settings")
+            .expect("remove settings table");
+
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publish_archive_location(&state);
+        }));
+
+        assert!(
+            publication.is_ok(),
+            "desktop startup must survive this best-effort write"
+        );
+        assert!(
+            state.lock_archive().is_ok(),
+            "the archive remains usable afterwards"
+        );
+    }
+
+    #[test]
+    fn shell_settings_hooks_return_cleanly_when_state_locks_are_poisoned() {
+        let (_data_dir, archive_state) = state();
+        let archive_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = archive_state.archive.lock().expect("lock archive");
+            panic!("poison archive for shell hook");
+        }));
+        assert!(archive_poison.is_err());
+        let publication = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            publish_archive_location(&archive_state);
+        }));
+        assert!(publication.is_ok(), "archive publication is best-effort");
+
+        let (_data_dir, scheduler_state) = state();
+        let scheduler_poison = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = scheduler_state.scheduler.lock().expect("lock scheduler");
+            panic!("poison scheduler for shell hook");
+        }));
+        assert!(scheduler_poison.is_err());
+        let application = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            apply_refresh_intervals(&scheduler_state);
+        }));
+        assert!(
+            application.is_ok(),
+            "startup must survive a poisoned scheduler"
+        );
+
+        let refresh_error = trigger_all_hosts(&scheduler_state)
+            .expect_err("tray refresh must expose the poisoned scheduler");
+        assert_eq!(refresh_error.code, crate::contract::IpcErrorCode::Internal);
     }
 }

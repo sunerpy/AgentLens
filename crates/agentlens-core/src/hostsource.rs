@@ -1365,6 +1365,7 @@ pub fn execute_action<S: HostSource + ?Sized, C: Clock + ?Sized>(
 }
 
 #[cfg(test)]
+#[allow(unexpected_cfgs)]
 mod tests {
     use std::collections::VecDeque;
     use std::io;
@@ -2443,14 +2444,279 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
     }
 
     #[test]
+    fn sched_source_construction_preserves_configuration_without_remote_io() {
+        let local =
+            LocalHostSource::with_database("local-config", "/tmp/opencode.db").with_batch_size(17);
+        assert_eq!(local.host_id(), "local-config");
+        assert_eq!(local.kind(), HostKind::Local);
+        assert_eq!(local.database_path(), Path::new("/tmp/opencode.db"));
+
+        let runner = FakeSshRunner::default();
+        let (_artifact_temp, transport) = ssh_transport(&runner);
+        let identity = remote_identity();
+        let host = HostRecord::ssh("远端", "  deploy@example.invalid  ", &identity)
+            .with_remote_data_dir(Some("/srv/opencode".into()));
+        let source = SshHostSource::new(&host, transport)
+            .expect("valid ssh configuration")
+            .with_snapshot(true);
+
+        assert_eq!(source.host_id(), identity.host_id());
+        assert_eq!(source.kind(), HostKind::Ssh);
+        assert_eq!(source.ssh_target(), "deploy@example.invalid");
+        let probe = source.probe().expect("configuration-only ssh probe");
+        assert_eq!(probe.host_id, identity.host_id());
+        assert_eq!(probe.location, "deploy@example.invalid");
+        assert!(probe.remote_facts_deferred);
+        let debug = format!("{source:?}");
+        assert!(debug.contains("deploy@example.invalid"));
+        assert!(debug.contains("/srv/opencode"));
+        assert!(debug.contains("snapshot: true"));
+        assert!(runner.stages().contains(&CommandStage::StartupProbe));
+        assert!(!runner.stages().contains(&CommandStage::Stage1));
+    }
+
+    #[test]
+    fn sched_remote_protocol_rejects_malformed_metadata_sources_and_records() {
+        let runner = FakeSshRunner::default();
+        let (_artifact_temp, transport) = ssh_transport(&runner);
+        let identity = remote_identity();
+        let host = HostRecord::ssh("远端", "deploy@example.invalid", &identity);
+        let source = SshHostSource::new(&host, transport).expect("valid ssh source");
+        let probe = SshProbe {
+            architecture: crate::transport::ssh::RemoteArchitecture::X86_64,
+            xdg_data_home: Some("/home/test/.local/share".into()),
+            available_kib: 1_048_576,
+            machine_id_source: "/etc/machine-id".into(),
+        };
+        let decode = |ndjson: Vec<u8>| {
+            source.decode_collection(
+                &SshCollection {
+                    probe: probe.clone(),
+                    ndjson,
+                },
+                123,
+            )
+        };
+
+        let invalid_utf8 = decode(vec![0xff]).expect_err("NDJSON must be UTF-8");
+        assert!(matches!(
+            invalid_utf8,
+            HostSourceError::InvalidRemoteResponse { ref detail } if detail.contains("UTF-8")
+        ));
+
+        let empty = decode(b"\n \r\n".to_vec()).expect_err("meta line is mandatory");
+        assert!(matches!(
+            empty,
+            HostSourceError::InvalidRemoteResponse { ref detail } if detail.contains("响应为空")
+        ));
+
+        let malformed_meta = decode(b"{not-json}\n".to_vec()).expect_err("meta must be JSON");
+        assert!(matches!(
+            malformed_meta,
+            HostSourceError::InvalidRemoteResponse { ref detail } if detail.contains("meta 行无法解析")
+        ));
+
+        let unsupported = meta_line(&identity, 0, 200, 0).replacen(
+            "\"protocol_version\":1",
+            "\"protocol_version\":2",
+            1,
+        );
+        let unsupported = decode(unsupported.into_bytes()).expect_err("v2 is not accepted");
+        assert!(matches!(
+            unsupported,
+            HostSourceError::InvalidRemoteResponse { ref detail }
+                if detail.contains("protocol_version 2")
+        ));
+
+        let missing_source = meta_line(&identity, 0, 200, 0).replacen(
+            "\"source\":\"opencode\"",
+            "\"source\":\"codex\"",
+            1,
+        );
+        let missing_source =
+            decode(missing_source.into_bytes()).expect_err("opencode meta is mandatory");
+        assert!(matches!(
+            missing_source,
+            HostSourceError::RemoteSourceMissing { found, .. } if found == vec!["codex"]
+        ));
+
+        let malformed_record = format!("{}\nnot-json\n", meta_line(&identity, 0, 200, 1));
+        let malformed_record =
+            decode(malformed_record.into_bytes()).expect_err("record must be normalized JSON");
+        assert!(matches!(
+            malformed_record,
+            HostSourceError::MalformedRemoteRecord { line: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn sched_inventory_schedule_replacement_and_saturating_due_time_are_observable() {
+        let identity = local_identity();
+        let host = HostRecord::local("本机", &identity);
+        let pinned = SourceSchedule::for_kind(HostKind::Local)
+            .with_min_interval_ms(10)
+            .with_duration_multiplier(0);
+        let mut scheduler = RefreshScheduler::new();
+        scheduler
+            .register(SourceRegistration::from_host(&host).with_schedule(pinned))
+            .expect("register pinned source");
+        scheduler
+            .register(ssh_registration("aaa-remote", TriggerMode::Manual))
+            .expect("register manual remote");
+
+        assert_eq!(
+            scheduler.host_ids(),
+            vec!["aaa-remote".to_owned(), identity.host_id().to_owned()]
+        );
+        assert_eq!(scheduler.statuses().len(), 2);
+        assert_eq!(scheduler.interval_ms(identity.host_id()), Some(10));
+        assert_eq!(scheduler.interval_ms("missing"), None);
+
+        assert!(matches!(
+            scheduler.trigger_manual(identity.host_id(), i64::MAX - 2),
+            TriggerOutcome::Started(_)
+        ));
+        scheduler
+            .complete(
+                identity.host_id(),
+                i64::MAX - 2,
+                RoundReport::collected(
+                    u64::MAX,
+                    CollectSummary {
+                        cursor_time_updated: None,
+                        ..successful_summary(0)
+                    },
+                ),
+            )
+            .expect("complete source near timestamp ceiling");
+        let status = scheduler.status(identity.host_id()).expect("local status");
+        assert_eq!(status.interval_ms, 10, "zero multiplier pins the floor");
+        assert_eq!(status.next_due_utc, Some(i64::MAX));
+        assert_eq!(status.cursor_time_updated, None);
+
+        scheduler
+            .set_schedule(
+                identity.host_id(),
+                SourceSchedule::from_configured_interval(HostKind::Local, 25)
+                    .expect("positive configured interval"),
+            )
+            .expect("replace schedule");
+        assert_eq!(scheduler.interval_ms(identity.host_id()), Some(u64::MAX));
+    }
+
+    #[test]
+    fn sched_execute_action_reports_stamp_failure_and_ssh_remediation() {
+        struct SuccessfulSource;
+
+        impl HostSource for SuccessfulSource {
+            fn host_id(&self) -> &str {
+                "missing-host"
+            }
+
+            fn kind(&self) -> HostKind {
+                HostKind::Local
+            }
+
+            fn probe(&self) -> Result<SourceProbe> {
+                unreachable!("execute_action does not probe a source")
+            }
+
+            fn collect_incremental(
+                &self,
+                _archive: &mut Archive,
+                _now_utc_ms: i64,
+            ) -> Result<CollectOutcome> {
+                Ok(CollectOutcome {
+                    host_id: self.host_id().into(),
+                    source: OPENCODE_SOURCE.into(),
+                    reached_eof: true,
+                    eligible_count: 0,
+                    skipped_count: 0,
+                    stats: IngestStats {
+                        committed: true,
+                        ..IngestStats::default()
+                    },
+                    coverage: None,
+                    remote: None,
+                    remote_probe: None,
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut archive = open_temp_archive(temp.path());
+        let clock = ManualClock::new(7_000);
+        clock.script_round(100, 25);
+        let report = execute_action(
+            &SuccessfulSource,
+            &mut archive,
+            &clock,
+            &RefreshAction {
+                host_id: "missing-host".into(),
+                kind: HostKind::Local,
+                reason: TriggerReason::Manual,
+                started_at_utc: 6_000,
+            },
+        );
+        assert_eq!(report.duration_ms, 25);
+        assert!(matches!(
+            report.result,
+            RoundResult::Failed { ref error } if error.contains("not registered")
+        ));
+
+        let identity = remote_identity();
+        let host = HostRecord::ssh("远端", "deploy@example.invalid", &identity);
+        HostRegistry::new(archive.connection())
+            .insert(&host)
+            .expect("register remote host");
+        let runner = FakeSshRunner::default();
+        runner.push_auth_failure();
+        let (_artifact_temp, transport) = ssh_transport(&runner);
+        let source = SshHostSource::new(&host, transport).expect("valid ssh source");
+        let clock = ManualClock::new(8_000);
+        clock.script_round(200, 30);
+        let report = execute_action(
+            &source,
+            &mut archive,
+            &clock,
+            &RefreshAction {
+                host_id: host.host_id().into(),
+                kind: HostKind::Ssh,
+                reason: TriggerReason::Manual,
+                started_at_utc: 8_000,
+            },
+        );
+        assert_eq!(report.duration_ms, 30);
+        let RoundResult::Failed { error } = report.result else {
+            panic!("authentication failure must produce a failed round")
+        };
+        assert!(error.contains("SSH 认证失败"));
+        assert!(error.contains("｜请检查 SSH 用户、密钥、agent 或钥匙串口令后重试。"));
+        assert_eq!(archive_rows(&archive, host.host_id()), 0);
+    }
+
+    #[test]
+    fn sched_system_clock_reports_epoch_time_and_monotonic_progress() {
+        let clock = SystemClock;
+        let wall = clock.now_utc_ms();
+        let first = clock.monotonic_ms();
+        let second = clock.monotonic_ms();
+
+        assert!(wall > 1_700_000_000_000, "wall clock must be Unix epoch ms");
+        assert!(second >= first, "monotonic time must never move backwards");
+    }
+
+    #[test]
     fn sched_origin_is_always_live_for_incremental_rounds() {
         assert_eq!(INCREMENTAL_ORIGIN, Origin::Live);
         assert_eq!(INCREMENTAL_ORIGIN.priority(), 3);
     }
 
+    #[cfg(not(coverage))]
     const ELIGIBLE_PREDICATE: &str = "json_valid(data) \
 AND json_extract(data,'$.role')='assistant' AND json_type(data,'$.tokens')='object'";
 
+    #[cfg(not(coverage))]
     struct ExternalReconciliation {
         source_eligible: u64,
         archived: u64,
@@ -2465,6 +2731,7 @@ AND json_extract(data,'$.role')='assistant' AND json_type(data,'$.tokens')='obje
     /// `message_id` set rather than by a `time_updated`-bounded count: the live source is being
     /// appended to and its rows' `time_updated` are bumped in place while this runs, so any
     /// timestamp bound would drift, whereas identifiers do not.
+    #[cfg(not(coverage))]
     fn external_reconciliation(
         archive_path: &Path,
         source_path: &Path,
@@ -2507,6 +2774,7 @@ AND r.source='opencode' AND r.message_id NOT IN (SELECT id FROM eligible)),\n\
         }
     }
 
+    #[cfg(not(coverage))]
     fn print_timeline_row(step: &str, now: i64, status: &SourceStatus) {
         println!(
             "{step:<28} now={now:<16} state={:<9} interval_ms={:<8} next_due_utc={:<16} \
@@ -2529,6 +2797,7 @@ last_success_utc={:?} interrupted={}",
     /// temporary archive and cross-checks the archived row count with the external `sqlite3`
     /// binary. Assertions are on row counts and state names only; wall-clock durations are printed
     /// for the record and never asserted.
+    #[cfg(not(coverage))]
     #[test]
     #[ignore = "manual QA scans the real 43 GB local database and invokes the external sqlite3 binary"]
     fn sched_manual_qa_real_local_database_matches_external_sqlite3() {
@@ -2739,6 +3008,7 @@ source_not_archived={}",
 
     /// Manual QA: drives the SSH path end-to-end over the fake [`CommandRunner`] and prints the
     /// archived row count plus the `hosts.last_success_utc` it stamped.
+    #[cfg(not(coverage))]
     #[test]
     #[ignore = "manual QA prints the fake-SSH end-to-end row count and hosts.last_success value"]
     fn sched_manual_qa_fake_ssh_end_to_end_rows_and_last_success() {

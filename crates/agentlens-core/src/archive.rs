@@ -1192,6 +1192,102 @@ mod tests {
     }
 
     #[test]
+    fn archive_migration_plan_rejects_gaps_and_accepts_an_empty_zero_version_database() {
+        fn no_op(_transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+            Ok(())
+        }
+
+        let starts_at_two = [Migration::new(2, no_op)];
+        let error = validate_migration_plan(&starts_at_two)
+            .expect_err("a migration plan must start at version one");
+        assert!(matches!(error, ArchiveError::InvalidMigrationPlan(_)));
+        assert!(error
+            .to_string()
+            .contains("expected target version 1, found 2"));
+
+        let skips_two = [Migration::new(1, no_op), Migration::new(3, no_op)];
+        let error = validate_migration_plan(&skips_two)
+            .expect_err("a migration plan must remain contiguous");
+        assert!(error
+            .to_string()
+            .contains("expected target version 2, found 3"));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("empty-plan.db");
+        let mut connection = Connection::open(&path).expect("open zero-version database");
+        assert_eq!(
+            migrate_with(&mut connection, &path, &[]).expect("empty plan is already current"),
+            None
+        );
+        assert_eq!(archive_user_version(&connection), 0);
+        assert!(backup_files(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn archive_open_reports_directory_targets_and_blocked_parents_with_exact_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let directory_target = temp.path().join("database-is-directory");
+        fs::create_dir(&directory_target).expect("create directory target");
+        let error = Archive::open(&directory_target)
+            .err()
+            .expect("SQLite cannot open a directory as a database");
+        assert!(matches!(
+            error,
+            ArchiveError::Open { ref path, .. } if path == &directory_target
+        ));
+
+        let blocked_parent = temp.path().join("parent-is-file");
+        fs::write(&blocked_parent, b"not a directory").expect("create blocking parent file");
+        let blocked_path = blocked_parent.join("archive.db");
+        let error = Archive::open(&blocked_path)
+            .err()
+            .expect("a regular file cannot become the archive parent");
+        assert!(matches!(
+            error,
+            ArchiveError::Directory { ref path, .. } if path == &blocked_parent
+        ));
+        assert!(error
+            .to_string()
+            .contains("cannot prepare archive directory"));
+
+        assert!(matches!(
+            next_backup_path(Path::new("")),
+            Err(ArchiveError::InvalidArchivePath(path)) if path.as_os_str().is_empty()
+        ));
+    }
+
+    #[test]
+    fn archive_app_settings_errors_remain_typed_when_schema_is_absent() {
+        let mut connection = Connection::open_in_memory().expect("open schema-less database");
+        let read_error = read_app_settings(&connection)
+            .expect_err("reading settings without its table must fail");
+        assert!(matches!(read_error, ArchiveError::AppSettings(_)));
+        assert!(read_error
+            .to_string()
+            .contains("no such table: app_settings"));
+
+        let settings = BTreeMap::from([("timezone".to_string(), "UTC".to_string())]);
+        let write_error = write_app_settings(&mut connection, &settings)
+            .expect_err("writing settings without its table must fail atomically");
+        assert!(matches!(write_error, ArchiveError::AppSettings(_)));
+        assert!(write_error
+            .to_string()
+            .contains("no such table: app_settings"));
+    }
+
+    #[test]
+    fn archive_connection_configuration_rejects_backends_that_cannot_enter_wal_mode() {
+        let connection = Connection::open_in_memory().expect("open in-memory database");
+        let path = Path::new(":memory:");
+        let error = configure_connection(&connection, path)
+            .expect_err("an in-memory backend cannot satisfy the persistent WAL contract");
+        assert!(matches!(error, ArchiveError::InvalidMigrationPlan(_)));
+        assert!(error
+            .to_string()
+            .contains("SQLite returned journal_mode=memory, expected wal"));
+    }
+
+    #[test]
     #[ignore = "manual QA requires the external sqlite3 binary"]
     fn archive_manual_qa_external_sqlite3() {
         let dir = tempfile::tempdir().expect("tempdir");
