@@ -2060,8 +2060,8 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
     #[cfg(unix)]
     #[test]
     fn timed_runner_shares_one_deadline_across_processes() {
-        let runner = StdCommandRunner::with_timeout(Duration::from_millis(250));
-        let spec = local_shell_spec("sleep 0.15");
+        let runner = StdCommandRunner::with_timeout(Duration::from_secs(10));
+        let spec = local_shell_spec("sleep 6");
 
         runner
             .run(&spec)
