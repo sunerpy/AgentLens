@@ -1356,9 +1356,11 @@ mod tests {
             })
             .expect("create injected snapshot");
         let debug = format!("{snapshot:?}");
-        assert!(debug.contains("SnapshotDatabase"));
-        assert!(debug.contains(&completed.to_string_lossy().into_owned()));
         drop(snapshot);
+        assert!(debug.contains("SnapshotDatabase"));
+        // Windows 的 Path Debug 会转义反斜杠，不能用未转义的 Display 整路径做 contains。
+        let file_name = completed.file_name().expect("snapshot target file name");
+        assert!(debug.contains(&file_name.to_string_lossy().into_owned()));
         assert!(!completed.exists());
 
         let interrupted = snapshot_dir.path().join("interrupted-after-vacuum.db");
