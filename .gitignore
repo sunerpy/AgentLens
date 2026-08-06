@@ -39,3 +39,6 @@ frontend/node_modules/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# CodeGraph 索引与守护进程日志：本地工具产物，不入仓。
+.codegraph/

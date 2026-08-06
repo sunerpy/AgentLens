@@ -33,9 +33,14 @@ export function LocalHostCard({
   hostsLoaded: boolean
 }) {
   const queryClient = useQueryClient()
+  // The machine id is this machine's identity: it cannot change while the process runs, so
+  // any refetch is pure waste. Without this the query re-ran on every mount of the card,
+  // which is what made navigating back to the hosts view feel slow.
   const identityQuery = useQuery({
     queryKey: LOCAL_IDENTITY_QUERY_KEY,
     queryFn: localMachineIdentity,
+    staleTime: Infinity,
+    gcTime: Infinity,
   })
   const identity = identityQuery.data
 

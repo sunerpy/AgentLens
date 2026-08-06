@@ -349,6 +349,14 @@ pub struct SshProbeResult {
     pub available_kib: u64,
     /// Which machine-id source answered on the remote host.
     pub machine_id_source: String,
+    /// SHA-256 of the remote machine id, computed on the remote host.
+    ///
+    /// Carried verbatim from [`SshProbe::machine_id_hash`], which `parse_probe` already
+    /// constrains to 64 lowercase hex characters — re-validating here would only add a
+    /// second, divergable definition of the same rule. The hosts view feeds it straight
+    /// back into `hosts_create`, so the operator never retypes it and cannot register the
+    /// same machine twice under two hashes.
+    pub machine_id_hash: String,
 }
 
 impl SshProbeResult {
@@ -359,6 +367,7 @@ impl SshProbeResult {
             data_dir: resolve_data_dir(probe.xdg_data_home.as_deref(), remote_data_dir),
             available_kib: probe.available_kib,
             machine_id_source: probe.machine_id_source.clone(),
+            machine_id_hash: probe.machine_id_hash.clone(),
         }
     }
 }
@@ -668,6 +677,7 @@ mod tests {
             data_dir: "/srv/opencode".to_owned(),
             available_kib: 1_048_576,
             machine_id_source: "/etc/machine-id".to_owned(),
+            machine_id_hash: "a".repeat(64),
         };
 
         for encoded in [
@@ -724,6 +734,7 @@ mod tests {
             xdg_data_home: Some("/home/ci/.local/share".to_owned()),
             available_kib: 4_096,
             machine_id_source: "/var/lib/dbus/machine-id".to_owned(),
+            machine_id_hash: "b".repeat(64),
         };
         let result = SshProbeResult::from_probe(&probe, None);
 
@@ -731,6 +742,7 @@ mod tests {
         assert_eq!(result.data_dir, "/home/ci/.local/share/opencode");
         assert_eq!(result.available_kib, 4_096);
         assert_eq!(result.machine_id_source, "/var/lib/dbus/machine-id");
+        assert_eq!(result.machine_id_hash, "b".repeat(64));
     }
 
     #[test]
@@ -910,6 +922,7 @@ mod tests {
             xdg_data_home: Some("/data/home/".to_owned()),
             available_kib: 8_192,
             machine_id_source: "/etc/machine-id".to_owned(),
+            machine_id_hash: "0123456789abcdef".repeat(4),
         };
         let result = SshProbeResult::from_probe(&probe, Some("  /explicit/data  "));
 
@@ -917,6 +930,13 @@ mod tests {
         assert_eq!(result.xdg_data_home.as_deref(), Some("/data/home/"));
         assert_eq!(result.data_dir, "/explicit/data");
         assert_eq!(result.available_kib, 8_192);
+        assert_eq!(result.machine_id_hash, "0123456789abcdef".repeat(4));
+        assert!(
+            !serde_json::to_string(&result)
+                .expect("serialize probe result")
+                .contains("machine_id_hash"),
+            "the DTO must reach the webview as camelCase machineIdHash"
+        );
     }
 
     #[test]

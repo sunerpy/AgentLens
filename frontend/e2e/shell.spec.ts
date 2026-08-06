@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 
+import { zh } from '../src/i18n/zh'
 import { mockCalls, openShell, qaScreenshot } from './harness'
 
 /**
@@ -8,16 +9,20 @@ import { mockCalls, openShell, qaScreenshot } from './harness'
  * Every assertion waits on an explicit locator or an `expect.poll`, never on a fixed
  * timeout, so the spec is deterministic rather than timing-sensitive.
  */
-const NAV = [
-  { key: 'overview', label: '总览' },
-  { key: 'drilldown', label: '下钻' },
-  { key: 'detail', label: '明细' },
-  { key: 'hosts', label: '主机' },
-  { key: 'settings', label: '设置' },
-] as const
+
+/**
+ * Keys are pinned here because they are the testid/route contract; labels are read from
+ * `zh.nav` instead of retyped, because a second hand-written copy of the copy is exactly
+ * what let the 下钻 → 用量分析 rename ship with a red suite.
+ */
+const NAV_KEYS = ['overview', 'drilldown', 'detail', 'hosts', 'settings'] as const
+const NAV = NAV_KEYS.map((key) => ({ key, label: zh.nav[key] }))
 
 test('shell renders all five navigation tabs and switches views', async ({ page }) => {
   await openShell(page)
+
+  // A sixth dictionary entry must not be able to appear without a case here.
+  expect(Object.keys(zh.nav)).toEqual([...NAV_KEYS])
 
   await expect(page.getByRole('heading', { name: 'AgentLens' })).toBeVisible()
   for (const item of NAV) {

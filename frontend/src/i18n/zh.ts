@@ -22,7 +22,7 @@ export const zh = {
   /** 顶部导航标签（外壳独占）。 */
   nav: {
     overview: '总览',
-    drilldown: '下钻',
+    drilldown: '用量分析',
     detail: '明细',
     hosts: '主机',
     settings: '设置',
@@ -147,8 +147,8 @@ export const zh = {
 
   // ↓↓↓ todo 16 独占：只在本块内增删键 ↓↓↓
   drilldown: {
-    title: '工具下钻',
-    subtitle: '来源 → agent → 模型 三级下钻；区间与时区与总览共享同一状态',
+    title: '用量分析',
+    subtitle: '来源 → agent → 模型 三级展开；区间与时区与总览共享同一状态',
 
     /** 只读区间标签：区间选择器归总览（todo 15）所有，本视图只消费共享状态。 */
     rangeLabel: '区间',
@@ -175,7 +175,7 @@ export const zh = {
 
     summaryTitle: '当前筛选合计',
     tokenTotalLabel: 'Token 合计',
-    breadcrumbLabel: '下钻路径',
+    breadcrumbLabel: '分析路径',
     variantNone: '默认（无 variant）',
     variantsLabel: 'variant',
     sourcesLabel: '来源',
@@ -275,8 +275,10 @@ export const zh = {
       identityFilePlaceholder: '例如：~/.ssh/id_ed25519',
       dataDir: '远端数据目录覆盖（可选）',
       dataDirPlaceholder: '留空则按 XDG_DATA_HOME 自动发现',
-      machineIdHash: '远端机器标识（64 位十六进制）',
-      machineIdHashHint: '首次「测试连接」会读出远端 machine-id 来源；此处填入其哈希以绑定身份',
+      machineIdHash: '远端机器标识',
+      machineIdHashHint: '由「测试连接」自动读取，无需填写',
+      /** 自动填入后输入框转只读：值来自远端，手改会把这台机器的用量记到别人名下。 */
+      machineIdHashFilled: '已从远端读取，不可手改；改动上方主机或用户名后需重新测试连接',
       test: '测试连接',
       testing: '正在连接…',
       testingHint: '正在执行远端基础探测；完整连接测试最多运行 20 秒，期间可随时取消。',
@@ -286,7 +288,7 @@ export const zh = {
       submitting: '正在添加…',
       requireHost: '请先填写 ssh 别名或主机名',
       requireDisplayName: '请填写显示名称',
-      requireMachineIdHash: '请填写 64 位十六进制的远端机器标识',
+      requireMachineIdHash: '请先点「测试连接」读取远端机器标识',
       /** Windows 上 ssh-agent 不可用时的引导；无法在 Linux 上实测，故仅渲染文案。 */
       agentUnavailable:
         'Windows 上若 ssh-agent 不可用，请在上方「密钥路径」中直接选择私钥文件（例如 %USERPROFILE%\\.ssh\\id_ed25519），并把 passphrase 存入下方钥匙串。',

@@ -9,7 +9,7 @@
 **简体中文** · [English](docs/readme/README.en.md)
 
 AgentLens 是一个桌面用量看板：把本机与多台远端主机上 AI 编码工具的用量记录采集进一个本地
-SQLite 归档库，再按时区、Agent、模型与项目维度做趋势、下钻与明细分析。
+SQLite 归档库，再按时区、Agent、模型与项目维度看趋势、做用量分析、查单条明细。
 
 ## 目录
 

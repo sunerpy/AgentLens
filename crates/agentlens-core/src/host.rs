@@ -31,11 +31,17 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::str;
+use std::sync::OnceLock;
 
 use rusqlite::{params, Connection, OptionalExtension as _, Row};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+#[cfg(windows)]
+use windows_sys::Win32::System::Registry::{
+    RegGetValueW, HKEY_LOCAL_MACHINE, REG_SZ, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+    RRF_ZEROONFAILURE,
+};
 
 /// Number of hex characters kept from the SHA-256 digest to form a `host_id`.
 pub const HOST_ID_HEX_LENGTH: usize = 16;
@@ -52,6 +58,14 @@ pub const MACHINE_ID_MAX_BYTES: usize = 4096;
 
 /// Linux machine-id discovery chain, in priority order.
 pub const LINUX_MACHINE_ID_SOURCES: [&str; 2] = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
+
+#[cfg(all(test, not(windows)))]
+const REG_SZ_VALUE_TYPE: u32 = 1;
+
+#[cfg(windows)]
+const REG_SZ_VALUE_TYPE: u32 = REG_SZ;
+
+static LOCAL_MACHINE_ID: OnceLock<String> = OnceLock::new();
 
 /// Result type returned by host identity and registry operations.
 pub type Result<T> = std::result::Result<T, HostError>;
@@ -230,14 +244,16 @@ pub fn machine_id_from_sources(sources: &[&Path]) -> Result<String> {
 /// Reads this machine's id through the production discovery chain.
 #[cfg(not(windows))]
 pub fn local_machine_id() -> Result<String> {
-    let sources: Vec<&Path> = LINUX_MACHINE_ID_SOURCES.iter().map(Path::new).collect();
-    machine_id_from_sources(&sources)
+    cached_machine_id(&LOCAL_MACHINE_ID, || {
+        let sources: Vec<&Path> = LINUX_MACHINE_ID_SOURCES.iter().map(Path::new).collect();
+        machine_id_from_sources(&sources)
+    })
 }
 
 /// Reads this machine's id from the Windows registry.
 #[cfg(windows)]
 pub fn local_machine_id() -> Result<String> {
-    windows_machine_guid()
+    cached_machine_id(&LOCAL_MACHINE_ID, windows_machine_guid)
 }
 
 /// Derives this machine's stable identity through the production discovery chain.
@@ -245,47 +261,131 @@ pub fn local_machine_identity() -> Result<MachineIdentity> {
     MachineIdentity::from_machine_id(&local_machine_id()?)
 }
 
-/// Reads `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` through the bundled `reg` tool.
+fn cached_machine_id(
+    cache: &OnceLock<String>,
+    read: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    if let Some(machine_id) = cache.get() {
+        return Ok(machine_id.clone());
+    }
+
+    let machine_id = read()?;
+    Ok(cache.get_or_init(|| machine_id).clone())
+}
+
+#[cfg(any(test, windows))]
+fn parse_registry_machine_guid(
+    value_type: u32,
+    value: &[u16],
+) -> std::result::Result<String, String> {
+    if value_type != REG_SZ_VALUE_TYPE {
+        return Err(format!(
+            "MachineGuid has registry type {value_type}, expected REG_SZ ({REG_SZ_VALUE_TYPE})"
+        ));
+    }
+
+    let mut value_end = value.len();
+    while value_end > 0 && value[value_end - 1] == 0 {
+        value_end -= 1;
+    }
+    let value = &value[..value_end];
+    if value.contains(&0) {
+        return Err("MachineGuid contains an embedded NUL".to_owned());
+    }
+
+    let decoded = String::from_utf16(value)
+        .map_err(|error| format!("MachineGuid is not valid UTF-16: {error}"))?;
+    let machine_guid = decoded.trim();
+    if machine_guid.is_empty() {
+        return Err("MachineGuid is empty after trimming".to_owned());
+    }
+
+    Ok(machine_guid.to_owned())
+}
+
+/// Reads `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` through the Win32 registry API.
 ///
-/// The value is read by shelling out to `reg query` rather than adding a `winreg` dependency: this
-/// workspace is built and tested on Linux, where a Windows-only crate can be neither compiled nor
-/// exercised, so the platform branch stays dependency-free and reviewable. The parsed GUID feeds
-/// the same trim-then-hash contract as the Linux chain.
+/// `RRF_SUBKEY_WOW6464KEY` explicitly selects the 64-bit registry view, so a 32-bit build cannot
+/// be redirected to `WOW6432Node`. The parsed GUID feeds the same trim-then-hash contract as the
+/// Linux chain.
 #[cfg(windows)]
 fn windows_machine_guid() -> Result<String> {
-    use std::process::Command;
-
-    const REGISTRY_KEY: &str = r"HKLM\SOFTWARE\Microsoft\Cryptography";
+    const REGISTRY_SUBKEY: &str = r"SOFTWARE\Microsoft\Cryptography";
     const REGISTRY_VALUE: &str = "MachineGuid";
+    const REGISTRY_FLAGS: u32 = RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY | RRF_ZEROONFAILURE;
 
-    let output = Command::new("reg")
-        .args(["query", REGISTRY_KEY, "/v", REGISTRY_VALUE])
-        .output()
-        .map_err(|error| HostError::MachineGuidUnavailable {
-            detail: format!("cannot run `reg query`: {error}"),
-        })?;
-    if !output.status.success() {
+    let subkey = REGISTRY_SUBKEY
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let value_name = REGISTRY_VALUE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut value_type = 0;
+    let mut data_bytes = 0;
+
+    // SAFETY: Both strings are NUL-terminated and live through the call. The null data pointer is
+    // the documented size-query form of RegGetValueW, paired with a valid byte-count pointer.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            REGISTRY_FLAGS,
+            &mut value_type,
+            std::ptr::null_mut(),
+            &mut data_bytes,
+        )
+    };
+    ensure_registry_success("query MachineGuid size", status)?;
+    if data_bytes == 0 || data_bytes % size_of::<u16>() as u32 != 0 {
         return Err(HostError::MachineGuidUnavailable {
-            detail: format!(
-                "`reg query` exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
+            detail: format!("MachineGuid returned an invalid UTF-16 byte length: {data_bytes}"),
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let guid = stdout
-        .lines()
-        .find(|line| line.contains(REGISTRY_VALUE))
-        .and_then(|line| line.split_whitespace().next_back())
-        .map(str::trim)
-        .filter(|guid| !guid.is_empty())
-        .ok_or_else(|| HostError::MachineGuidUnavailable {
-            detail: "`reg query` output did not contain a MachineGuid value".to_owned(),
-        })?;
+    let mut value = vec![0u16; data_bytes as usize / size_of::<u16>()];
+    let buffer_bytes = data_bytes;
+    // SAFETY: `value` owns `buffer_bytes` writable bytes, its pointer is correctly aligned for the
+    // UTF-16 REG_SZ requested by `REGISTRY_FLAGS`, and all other pointers remain valid for the call.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            value_name.as_ptr(),
+            REGISTRY_FLAGS,
+            &mut value_type,
+            value.as_mut_ptr().cast(),
+            &mut data_bytes,
+        )
+    };
+    ensure_registry_success("read MachineGuid", status)?;
+    if data_bytes > buffer_bytes || data_bytes % size_of::<u16>() as u32 != 0 {
+        return Err(HostError::MachineGuidUnavailable {
+            detail: format!(
+                "MachineGuid returned an invalid UTF-16 byte length: {data_bytes} (buffer {buffer_bytes})"
+            ),
+        });
+    }
+    value.truncate(data_bytes as usize / size_of::<u16>());
 
-    Ok(guid.to_owned())
+    parse_registry_machine_guid(value_type, &value)
+        .map_err(|detail| HostError::MachineGuidUnavailable { detail })
+}
+
+#[cfg(windows)]
+fn ensure_registry_success(operation: &str, status: u32) -> Result<()> {
+    if status == 0 {
+        return Ok(());
+    }
+
+    Err(HostError::MachineGuidUnavailable {
+        detail: format!(
+            "{operation} failed with Windows error {status}: {}",
+            io::Error::from_raw_os_error(status as i32)
+        ),
+    })
 }
 
 fn read_machine_id_source(path: &Path) -> std::result::Result<String, String> {
@@ -623,6 +723,7 @@ fn map_host_row(row: &Row<'_>) -> rusqlite::Result<HostRecord> {
 #[cfg(test)]
 #[allow(unexpected_cfgs)]
 mod tests {
+    use std::cell::Cell;
     use std::fs;
     #[cfg(not(coverage))]
     use std::path::Path;
@@ -639,6 +740,69 @@ mod tests {
 
     fn identity(machine_id: &str) -> MachineIdentity {
         MachineIdentity::from_machine_id(machine_id).expect("derive identity from machine id")
+    }
+
+    #[test]
+    fn host_registry_machine_guid_parser_accepts_a_trimmed_utf16_string() {
+        let value = " \tA1B2C3D4-E5F6-47A8-90BC-DEF123456789\r\n\0"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+
+        let machine_guid = parse_registry_machine_guid(REG_SZ_VALUE_TYPE, &value)
+            .expect("parse a REG_SZ MachineGuid");
+
+        assert_eq!(machine_guid, "A1B2C3D4-E5F6-47A8-90BC-DEF123456789");
+    }
+
+    #[test]
+    fn host_registry_machine_guid_parser_rejects_invalid_registry_values() {
+        let valid = "machine-guid\0".encode_utf16().collect::<Vec<_>>();
+        let blank = " \r\n\0".encode_utf16().collect::<Vec<_>>();
+
+        assert!(parse_registry_machine_guid(REG_SZ_VALUE_TYPE + 1, &valid)
+            .expect_err("a non-REG_SZ value must be rejected")
+            .contains("REG_SZ"));
+        assert!(parse_registry_machine_guid(REG_SZ_VALUE_TYPE, &blank)
+            .expect_err("a blank value must be rejected")
+            .contains("empty"));
+        assert!(parse_registry_machine_guid(REG_SZ_VALUE_TYPE, &[0xd800, 0])
+            .expect_err("invalid UTF-16 must be rejected")
+            .contains("UTF-16"));
+        assert!(parse_registry_machine_guid(
+            REG_SZ_VALUE_TYPE,
+            &"before\0after\0".encode_utf16().collect::<Vec<_>>()
+        )
+        .expect_err("an embedded NUL must be rejected")
+        .contains("NUL"));
+    }
+
+    #[test]
+    fn host_local_machine_id_cache_retries_failures_then_caches_success() {
+        let cache = std::sync::OnceLock::new();
+        let attempts = Cell::new(0);
+
+        let first = cached_machine_id(&cache, || {
+            attempts.set(attempts.get() + 1);
+            Err(HostError::MachineIdUnavailable {
+                attempted: "transient failure".to_owned(),
+            })
+        });
+        assert!(matches!(first, Err(HostError::MachineIdUnavailable { .. })));
+        assert!(cache.get().is_none(), "a failure must not poison the cache");
+
+        let second = cached_machine_id(&cache, || {
+            attempts.set(attempts.get() + 1);
+            Ok(MACHINE_ID_A.to_owned())
+        })
+        .expect("a later successful read must recover");
+        let third = cached_machine_id(&cache, || {
+            panic!("a cached success must skip the underlying machine-id read")
+        })
+        .expect("cached success");
+
+        assert_eq!(second, MACHINE_ID_A);
+        assert_eq!(third, MACHINE_ID_A);
+        assert_eq!(attempts.get(), 2);
     }
 
     #[test]

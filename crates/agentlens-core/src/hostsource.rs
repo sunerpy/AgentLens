@@ -1386,7 +1386,8 @@ mod tests {
     const PROBE_X86_64: &str = "AGENTLENS_ARCH=x86_64\n\
 AGENTLENS_XDG_DATA_HOME=/home/test/.local/share\n\
 AGENTLENS_AVAILABLE_KIB=1048576\n\
-AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
+AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n\
+AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90\n";
     const REMOTE_RUN_DIR: &str = "/home/test/.cache/agentlens/run.A1b2C3";
     const REMOTE_MACHINE_ID: &str = "fixture-remote-machine-id";
     const LOCAL_MACHINE_ID: &str = "fixture-local-machine-id";
@@ -2487,6 +2488,8 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
             xdg_data_home: Some("/home/test/.local/share".into()),
             available_kib: 1_048_576,
             machine_id_source: "/etc/machine-id".into(),
+            machine_id_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+                .into(),
         };
         let decode = |ndjson: Vec<u8>| {
             source.decode_collection(

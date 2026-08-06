@@ -14,7 +14,7 @@ import {
 } from './aggregate'
 
 /**
- * 下钻三级的纯分组数学。这里钉住三条契约决策：
+ * 用量分析（drilldown）三级的纯分组数学。这里钉住三条契约决策：
  *
  * 1. **二级按 `agentKey` 分组，绝不按 `agentRaw`。** `agentKey` 是
  *    `agentlens_core::archive::normalize_agent_key` 产出的归一化连接键；同一个逻辑 agent
