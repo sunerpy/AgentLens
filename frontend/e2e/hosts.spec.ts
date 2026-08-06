@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import type { SshProbeResult } from '../src/generated'
+import { zh } from '../src/i18n/zh'
 import { mockCalls, openShell, qaScreenshot } from './harness'
 
 /**
@@ -21,15 +23,30 @@ import { mockCalls, openShell, qaScreenshot } from './harness'
 
 /** `local-host-000001`'s machine id in the seeded dataset, so the local card counts as registered. */
 const LOCAL_MACHINE_ID_HASH = 'a'.repeat(64)
+
+/**
+ * The machine behind `build-box.internal` — the host these specs add.
+ *
+ * {@link PROBE_SUCCESS} and {@link fillSshForm} must agree on it: the probe reads this
+ * machine's id off the remote, so a second, different constant would describe a fixture
+ * where the remote is one machine and the operator typed another's identity. Sharing it is
+ * what makes "the auto-filled hash is the one that reaches `hosts_create`" assertable.
+ */
 const NEW_MACHINE_ID_HASH = 'c'.repeat(64)
 
-const PROBE_SUCCESS = {
+/**
+ * Typed rather than `as const`: a field added to `SshProbeResult` by the ts-rs gate then
+ * fails `tsc -b` here instead of surfacing as `undefined` at Playwright runtime, which is
+ * how `machineIdHash` came to be missing from this fixture in the first place.
+ */
+const PROBE_SUCCESS: SshProbeResult = {
   architecture: 'x86_64',
   xdgDataHome: '/home/ci/.local/share',
   dataDir: '/home/ci/.local/share/opencode',
   availableKib: 8_388_608,
   machineIdSource: '/etc/machine-id',
-} as const
+  machineIdHash: NEW_MACHINE_ID_HASH,
+}
 
 /** Verbatim `SshError::AuthFailed` message + `remediation()` from `agentlens_core::transport::ssh`. */
 const AUTH_FAILED = {
@@ -180,9 +197,17 @@ function hostsCalls(page: Page, command: string): Promise<RecordedCall[]> {
   }, command)
 }
 
-async function fillSshForm(
+/**
+ * Everything except the machine id. Split out because the machine id is no longer operator
+ * input: after a successful probe the field is auto-filled and read-only, so a spec that
+ * exercises that path must not pre-seed it — otherwise the assertion cannot tell an
+ * auto-filled hash from a typed one.
+ */
+async function fillSshTarget(
   page: Page,
-  overrides: Partial<Record<'displayName' | 'target' | 'user' | 'identity' | 'dataDir' | 'machineId', string>> = {},
+  overrides: Partial<
+    Record<'displayName' | 'target' | 'user' | 'identity' | 'dataDir', string>
+  > = {},
 ) {
   await page.getByTestId('add-host-display-name').fill(overrides.displayName ?? 'build-box-2')
   await page.getByTestId('add-host-target').fill(overrides.target ?? 'build-box.internal')
@@ -193,6 +218,15 @@ async function fillSshForm(
   if (overrides.dataDir !== undefined) {
     await page.getByTestId('add-host-data-dir').fill(overrides.dataDir)
   }
+}
+
+async function fillSshForm(
+  page: Page,
+  overrides: Partial<
+    Record<'displayName' | 'target' | 'user' | 'identity' | 'dataDir' | 'machineId', string>
+  > = {},
+) {
+  await fillSshTarget(page, overrides)
   await page.getByTestId('add-host-machine-id').fill(overrides.machineId ?? NEW_MACHINE_ID_HASH)
 }
 
@@ -244,7 +278,7 @@ test('测试连接 success shows the remote architecture and the discovered data
   page,
 }) => {
   await openHosts(page, { probe: PROBE_SUCCESS })
-  await fillSshForm(page, { identity: '~/.ssh/id_ed25519', dataDir: '' })
+  await fillSshTarget(page, { identity: '~/.ssh/id_ed25519', dataDir: '' })
 
   await page.getByTestId('add-host-test').click()
 
@@ -254,6 +288,11 @@ test('测试连接 success shows the remote architecture and the discovered data
   await expect(page.getByTestId('probe-xdg')).toHaveText('/home/ci/.local/share')
   await expect(page.getByTestId('probe-machine-id-source')).toHaveText('/etc/machine-id')
   await expect(page.getByTestId('probe-error')).toBeHidden()
+
+  // The hash was never typed here: it can only have come from the probe response.
+  const machineId = page.getByTestId('add-host-machine-id')
+  await expect(machineId).toHaveValue(NEW_MACHINE_ID_HASH)
+  await expect(machineId).toHaveAttribute('readonly', '')
 
   const probes = await hostsCalls(page, 'ssh_probe')
   expect(probes).toHaveLength(1)
@@ -266,6 +305,60 @@ test('测试连接 success shows the remote architecture and the discovered data
   })
 
   await qaScreenshot(page, 'hosts.png')
+})
+
+/**
+ * The whole point of reading the hash off the remote: the operator types no identity at
+ * all, and the value that reaches `hosts_create` is the one the probe reported.
+ */
+test('the probed machine id is submitted without the operator ever typing it', async ({ page }) => {
+  await openHosts(page, { probe: PROBE_SUCCESS })
+  await fillSshTarget(page)
+
+  await page.getByTestId('add-host-test').click()
+  await expect(page.getByTestId('probe-success')).toBeVisible()
+  await page.getByTestId('add-host-submit').click()
+
+  await expect.poll(async () => (await mockCalls(page, 'hosts_create')).length).toBe(1)
+  expect(await mockCalls(page, 'hosts_create')).toMatchObject([
+    {
+      args: {
+        input: {
+          displayName: 'build-box-2',
+          kind: 'ssh',
+          machineIdHash: NEW_MACHINE_ID_HASH,
+          sshTarget: 'ci@build-box.internal',
+        },
+      },
+    },
+  ])
+})
+
+/**
+ * The double-counting guard: a hash read off machine A must never be registered against
+ * machine B, so editing the ssh target drops it and forces a fresh probe.
+ */
+test('editing the ssh target after a probe drops the hash and re-blocks the submit', async ({
+  page,
+}) => {
+  await openHosts(page, { probe: PROBE_SUCCESS })
+  await fillSshTarget(page)
+
+  await page.getByTestId('add-host-test').click()
+  const machineId = page.getByTestId('add-host-machine-id')
+  await expect(machineId).toHaveValue(NEW_MACHINE_ID_HASH)
+
+  await page.getByTestId('add-host-target').fill('other-box.internal')
+
+  await expect(machineId).toHaveValue('')
+  await expect(machineId).not.toHaveAttribute('readonly', '')
+  await expect(page.getByTestId('probe-success')).toBeHidden()
+
+  await page.getByTestId('add-host-submit').click()
+  await expect(page.getByTestId('add-host-validation')).toHaveText(
+    zh.hosts.add.requireMachineIdHash,
+  )
+  expect(await mockCalls(page, 'hosts_create')).toHaveLength(0)
 })
 
 test('测试连接 AuthFailed renders the Chinese remediation and the key-file guidance', async ({
@@ -440,13 +533,13 @@ test('a malformed host is rejected client-side before any IPC call', async ({ pa
 
   // Empty display name and empty target.
   await page.getByTestId('add-host-submit').click()
-  await expect(page.getByTestId('add-host-validation')).toHaveText('请先填写 ssh 别名或主机名')
+  await expect(page.getByTestId('add-host-validation')).toHaveText(zh.hosts.add.requireHost)
   expect(await mockCalls(page, 'hosts_create')).toHaveLength(0)
 
   // An ssh host with a target but no display name.
   await page.getByTestId('add-host-target').fill('build-box.internal')
   await page.getByTestId('add-host-submit').click()
-  await expect(page.getByTestId('add-host-validation')).toHaveText('请填写显示名称')
+  await expect(page.getByTestId('add-host-validation')).toHaveText(zh.hosts.add.requireDisplayName)
   expect(await mockCalls(page, 'hosts_create')).toHaveLength(0)
 
   // A 500-character alias and a quoted key path with spaces must not break layout or
@@ -457,7 +550,7 @@ test('a malformed host is rejected client-side before any IPC call', async ({ pa
   await page.getByTestId('add-host-machine-id').fill('not-a-hash')
   await page.getByTestId('add-host-submit').click()
   await expect(page.getByTestId('add-host-validation')).toHaveText(
-    '请填写 64 位十六进制的远端机器标识',
+    zh.hosts.add.requireMachineIdHash,
   )
   expect(await mockCalls(page, 'hosts_create')).toHaveLength(0)
   await expect(page.getByTestId('view-hosts')).toBeVisible()

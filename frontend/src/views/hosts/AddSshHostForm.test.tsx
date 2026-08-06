@@ -2,7 +2,9 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import type { SshProbeResult } from '@/generated'
 import { zh } from '@/i18n/zh'
+import { hostsCreate } from '@/lib/ipc'
 
 import { AddSshHostForm } from './AddSshHostForm'
 import { newSshProbeRequestId, sshProbe, sshProbeCancel } from './hostsIpc'
@@ -17,6 +19,18 @@ vi.mock('./hostsIpc', () => ({
   sshProbe: vi.fn(),
   sshProbeCancel: vi.fn(),
 }))
+
+/** `parse_probe` guarantees 64 lowercase hex, so the fixture must be a valid hash. */
+const REMOTE_MACHINE_ID_HASH = 'c'.repeat(64)
+
+const PROBE_SUCCESS: SshProbeResult = {
+  architecture: 'x86_64',
+  xdgDataHome: '/home/ci/.local/share',
+  dataDir: '/home/ci/.local/share/opencode',
+  availableKib: 8_388_608,
+  machineIdSource: '/etc/machine-id',
+  machineIdHash: REMOTE_MACHINE_ID_HASH,
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -124,5 +138,109 @@ describe('AddSshHostForm SSH probe', () => {
     expect(screen.getByTestId('probe-error-message').textContent).toContain('20000 毫秒硬超时')
     expect(screen.getByTestId('probe-error-remediation').textContent).toContain('已终止 SSH 进程树')
     expect(screen.queryByTestId('probe-pending')).toBeNull()
+  })
+})
+
+describe('AddSshHostForm machine-id auto-fill', () => {
+  beforeEach(() => {
+    vi.mocked(newSshProbeRequestId).mockReturnValue('probe_test_01')
+    vi.mocked(sshProbeCancel).mockResolvedValue(undefined)
+    vi.mocked(sshProbe).mockResolvedValue(PROBE_SUCCESS)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  function machineIdInput(): HTMLInputElement {
+    return screen.getByTestId('add-host-machine-id') as HTMLInputElement
+  }
+
+  it('fills the remote hash from a successful probe and locks the field', async () => {
+    renderForm()
+
+    expect(machineIdInput().readOnly).toBe(false)
+    expect(screen.getByText(zh.hosts.add.machineIdHashHint)).toBeTruthy()
+
+    enterHostAndTest()
+    await screen.findByTestId('probe-success')
+
+    expect(machineIdInput().value).toBe(REMOTE_MACHINE_ID_HASH)
+    expect(machineIdInput().readOnly).toBe(true)
+    expect(screen.getByText(zh.hosts.add.machineIdHashFilled)).toBeTruthy()
+  })
+
+  it('submits the auto-filled hash without the operator ever typing it', async () => {
+    renderForm()
+
+    fireEvent.change(screen.getByTestId('add-host-display-name'), { target: { value: '构建机' } })
+    enterHostAndTest()
+    await screen.findByTestId('probe-success')
+    fireEvent.click(screen.getByTestId('add-host-submit'))
+
+    await waitFor(() => expect(hostsCreate).toHaveBeenCalledTimes(1))
+    expect(vi.mocked(hostsCreate).mock.calls[0][0]).toEqual({
+      displayName: '构建机',
+      kind: 'ssh',
+      machineIdHash: REMOTE_MACHINE_ID_HASH,
+      sshTarget: 'build-box',
+      remoteDataDir: null,
+    })
+  })
+
+  it('blocks a submit that never probed and points at 测试连接 instead of asking for hex', async () => {
+    renderForm()
+
+    fireEvent.change(screen.getByTestId('add-host-display-name'), { target: { value: '构建机' } })
+    fireEvent.change(screen.getByTestId('add-host-target'), { target: { value: 'build-box' } })
+    fireEvent.click(screen.getByTestId('add-host-submit'))
+
+    expect(screen.getByTestId('add-host-validation').textContent).toBe(
+      zh.hosts.add.requireMachineIdHash,
+    )
+    expect(hostsCreate).not.toHaveBeenCalled()
+  })
+
+  /**
+   * The double-counting guard: a hash read from machine A must never be registered against
+   * machine B, so editing the ssh target drops it and forces a fresh probe.
+   */
+  it('drops the hash when the ssh target changes and re-blocks the submit', async () => {
+    renderForm()
+
+    fireEvent.change(screen.getByTestId('add-host-display-name'), { target: { value: '构建机' } })
+    enterHostAndTest()
+    await screen.findByTestId('probe-success')
+    expect(machineIdInput().value).toBe(REMOTE_MACHINE_ID_HASH)
+
+    fireEvent.change(screen.getByTestId('add-host-target'), { target: { value: 'other-box' } })
+
+    expect(machineIdInput().value).toBe('')
+    expect(machineIdInput().readOnly).toBe(false)
+    expect(screen.queryByTestId('probe-success')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('add-host-submit'))
+    expect(screen.getByTestId('add-host-validation').textContent).toBe(
+      zh.hosts.add.requireMachineIdHash,
+    )
+    expect(hostsCreate).not.toHaveBeenCalled()
+  })
+
+  it('keeps the hash when a field that cannot change the machine is edited', async () => {
+    renderForm()
+
+    enterHostAndTest()
+    await screen.findByTestId('probe-success')
+
+    fireEvent.change(screen.getByTestId('add-host-data-dir'), {
+      target: { value: '/srv/opencode' },
+    })
+    fireEvent.change(screen.getByTestId('add-host-identity'), {
+      target: { value: '~/.ssh/id_ed25519' },
+    })
+
+    expect(machineIdInput().value).toBe(REMOTE_MACHINE_ID_HASH)
+    expect(machineIdInput().readOnly).toBe(true)
   })
 })

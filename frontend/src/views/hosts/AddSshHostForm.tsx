@@ -4,10 +4,13 @@
  * Add-SSH-host form plus the "测试连接" probe.
  *
  * Two backend calls, deliberately separate:
- * - `ssh_probe` runs the transport's STAGE1 and reports the remote architecture and the
- *   discovered data directory. Failures come back as typed variants whose Chinese
- *   `remediation()` travels in `IpcError.fields.remediation`, which is what gets rendered
- *   — never the bare variant name, which would be useless to a user.
+ * - `ssh_probe` runs the transport's STAGE1 and reports the remote architecture, the
+ *   discovered data directory, and the SHA-256 of the remote machine id. That hash is
+ *   auto-filled into the form and the field turns read-only: it is a fact read off the
+ *   remote, not something an operator can know or should retype. Failures come back as
+ *   typed variants whose Chinese `remediation()` travels in `IpcError.fields.remediation`,
+ *   which is what gets rendered — never the bare variant name, which would be useless to a
+ *   user.
  * - `hosts_create` inserts the row. A second host on the same machine is rejected by the
  *   backend, and that rejection text is surfaced verbatim rather than re-worded here,
  *   because it explains the actual consequence (double-counted usage).
@@ -54,6 +57,7 @@ function optional(value: string): string | null {
 export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void }) {
   const queryClient = useQueryClient()
   const [form, setForm] = useState<FormState>(EMPTY_FORM)
+  const [probedTarget, setProbedTarget] = useState<string | null>(null)
   const [validation, setValidation] = useState<string | null>(null)
   const [isCancellingProbe, setIsCancellingProbe] = useState(false)
   const probeRequestId = useRef<string | null>(null)
@@ -61,6 +65,11 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
   const patch = (key: keyof FormState) => (value: string) =>
     setForm((current) => ({ ...current, [key]: value }))
 
+  /**
+   * The probe is the only writer of `machineIdHash`: the remote computes SHA-256 over its
+   * own machine id and `parse_probe` already constrains it to 64 lowercase hex, so the
+   * operator never retypes it. `probedTarget` records which ssh target it was read from.
+   */
   const probe = useMutation<SshProbeResult, unknown, void>({
     mutationFn: () => {
       const requestId = newSshProbeRequestId()
@@ -73,6 +82,11 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
         },
         requestId,
       )
+    },
+    onSuccess: (result) => {
+      setProbedTarget(composeSshTarget(form.user, form.host))
+      setForm((current) => ({ ...current, machineIdHash: result.machineIdHash }))
+      setValidation(null)
     },
     onSettled: () => {
       probeRequestId.current = null
@@ -95,6 +109,7 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
     mutationFn: hostsCreate,
     onSuccess: async (host) => {
       setForm(EMPTY_FORM)
+      setProbedTarget(null)
       probe.reset()
       await queryClient.invalidateQueries({ queryKey: HOSTS_QUERY_KEY })
       await queryClient.invalidateQueries({ queryKey: REFRESH_STATUS_QUERY_KEY })
@@ -117,6 +132,22 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
     }
     setValidation(null)
     return true
+  }
+
+  /**
+   * `host` and `user` are the only two fields that decide WHICH machine gets probed, so
+   * editing either can turn an auto-filled hash into another machine's identity — and
+   * registering that would file this host's usage under the wrong machine. Both go through
+   * here so there is exactly one path that can invalidate the hash.
+   */
+  const patchTarget = (key: 'host' | 'user') => (value: string) => {
+    const next = { ...form, [key]: value }
+    const stale = probedTarget !== null && composeSshTarget(next.user, next.host) !== probedTarget
+    setForm(stale ? { ...next, machineIdHash: '' } : next)
+    if (stale) {
+      setProbedTarget(null)
+      probe.reset()
+    }
   }
 
   return (
@@ -144,7 +175,7 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
               className={CONTROL_CLASS}
               placeholder={zh.hosts.add.hostPlaceholder}
               value={form.host}
-              onChange={(event) => patch('host')(event.target.value)}
+              onChange={(event) => patchTarget('host')(event.target.value)}
             />
           </HostField>
           <HostField id="add-host-user" label={zh.hosts.add.user}>
@@ -154,7 +185,7 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
               className={CONTROL_CLASS}
               placeholder={zh.hosts.add.userPlaceholder}
               value={form.user}
-              onChange={(event) => patch('user')(event.target.value)}
+              onChange={(event) => patchTarget('user')(event.target.value)}
             />
           </HostField>
           <HostField id="add-host-identity" label={zh.hosts.add.identityFile}>
@@ -180,13 +211,18 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
           <HostField
             id="add-host-machine-id"
             label={zh.hosts.add.machineIdHash}
-            hint={zh.hosts.add.machineIdHashHint}
+            hint={
+              probedTarget === null
+                ? zh.hosts.add.machineIdHashHint
+                : zh.hosts.add.machineIdHashFilled
+            }
           >
             <input
               id="add-host-machine-id"
               data-testid="add-host-machine-id"
-              className={`${CONTROL_CLASS} font-mono`}
+              className={`${CONTROL_CLASS} font-mono read-only:bg-muted read-only:text-muted-foreground`}
               value={form.machineIdHash}
+              readOnly={probedTarget !== null}
               onChange={(event) => patch('machineIdHash')(event.target.value)}
             />
           </HostField>
