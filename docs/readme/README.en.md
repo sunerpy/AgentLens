@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/sunerpy/AgentLens/actions/workflows/ci.yml/badge.svg)](https://github.com/sunerpy/AgentLens/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/sunerpy/AgentLens/branch/main/graph/badge.svg)](https://codecov.io/gh/sunerpy/AgentLens)
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+![version](https://img.shields.io/github/v/release/sunerpy/AgentLens?sort=semver)
 ![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -60,13 +60,11 @@ Prefer not to pipe to a shell? Download from the release page and verify by hand
 
 ```sh
 sha256sum -c sha256sums-linux.txt
-sudo apt install ./AgentLens_0.1.0_amd64.deb
+sudo apt install ./AgentLens_*_amd64.deb
 ```
 
-Package names carry the version, so substitute the actual filename from the
-release page after a version bump. Full instructions, the environment overrides,
-the installed file layout and source builds:
-[../installation.md](../installation.md).
+Full instructions, the environment overrides, the installed file layout and
+source builds: [../installation.md](../installation.md).
 
 ## Quick Start
 
@@ -163,10 +161,11 @@ More, including the `dist` targets and the AWS CodeBuild path:
 
 ## Status and Limitations
 
-- Version `0.1.0`. The single source of truth is `[workspace.package].version`
-  in the root `Cargo.toml`; every crate and `src-tauri` inherit it,
+- The single source of truth for the version is `[workspace.package].version` in
+  the root `Cargo.toml`; every crate and `src-tauri` inherit it,
   `tauri.conf.json` no longer declares a version, and `make dist-version` echoes
-  the resolved value.
+  the resolved value. For the published version, read the badge above or the
+  release page.
 - **OpenCode is the only implemented adapter.** The Codex and Claude Code
   documents describe reserved contracts, not working collection.
 - Remote hosts are Linux hosts regardless of which platform manages them, so the

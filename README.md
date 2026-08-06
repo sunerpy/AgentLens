@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/sunerpy/AgentLens/actions/workflows/ci.yml/badge.svg)](https://github.com/sunerpy/AgentLens/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/sunerpy/AgentLens/branch/main/graph/badge.svg)](https://codecov.io/gh/sunerpy/AgentLens)
-![version](https://img.shields.io/badge/version-0.1.0-blue)
+![version](https://img.shields.io/github/v/release/sunerpy/AgentLens?sort=semver)
 ![platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -52,11 +52,11 @@ irm https://raw.githubusercontent.com/sunerpy/AgentLens/main/scripts/install.ps1
 
 ```sh
 sha256sum -c sha256sums-linux.txt
-sudo apt install ./AgentLens_0.1.0_amd64.deb
+sudo apt install ./AgentLens_*_amd64.deb
 ```
 
-安装包名带版本号，升版后请按 release 页面上的实际文件名替换。完整步骤、环境变量、
-安装后的文件布局与从源码构建：[docs/installation.md](docs/installation.md)。
+完整步骤、环境变量、安装后的文件布局与从源码构建：
+[docs/installation.md](docs/installation.md)。
 
 ## 快速开始
 
@@ -145,9 +145,9 @@ make dist          # 产出 artifacts/dist/
 
 ## 现状与限制
 
-- 版本 `0.1.0`。版本号唯一事实源是根 `Cargo.toml` 的 `[workspace.package].version`：
-  各 crate 与 `src-tauri` 均继承它，`tauri.conf.json` 不再重复声明版本，
-  `make dist-version` 可回显解析结果。
+- 版本号唯一事实源是根 `Cargo.toml` 的 `[workspace.package].version`：各 crate 与
+  `src-tauri` 均继承它，`tauri.conf.json` 不再重复声明版本，`make dist-version`
+  可回显解析结果。已发布的版本以页首 badge 与 release 页面为准。
 - **只有 OpenCode 适配器已实现。** Codex 与 Claude Code 文档描述的是**预留契约**，
   不是可用的采集能力。
 - 无论从哪个平台管理，远端主机都是 Linux 主机，因此随包分发的采集器是 Linux 静态二进制。
