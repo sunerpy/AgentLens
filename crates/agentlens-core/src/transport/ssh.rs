@@ -2723,16 +2723,17 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
         }
     }
 
+    /// Fake `ssh` that exits 0 for `-V` and otherwise forks a long-lived descendant, publishes
+    /// its pid and hangs waiting on it — the shape needed to prove a timeout kills the whole
+    /// process group. Kept as a helper so the calibration below and the test under it agree on
+    /// the exact fixture, byte for byte.
     #[cfg(unix)]
-    #[test]
-    fn ssh_probe_timeout_is_typed_kills_the_process_group_and_leaves_no_stale_state() {
+    fn write_hanging_fake_ssh(dir: &Path) -> (SshTools, PathBuf) {
         use std::os::unix::fs::PermissionsExt as _;
-        use std::time::{Duration, Instant};
 
-        let temp = tempfile::tempdir().expect("fake ssh tempdir");
-        let ssh = temp.path().join("ssh");
-        let scp = temp.path().join("scp");
-        let child_pid = temp.path().join("child.pid");
+        let ssh = dir.join("ssh");
+        let scp = dir.join("scp");
+        let child_pid = dir.join("child.pid");
         let script = format!(
             "#!/bin/sh\nif [ \"${{1-}}\" = \"-V\" ]; then exit 0; fi\nsleep 60 &\nchild=$!\nprintf '%s\\n' \"$child\" > '{}'\nwait \"$child\"\n",
             child_pid.display()
@@ -2741,13 +2742,126 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
         fs::write(&scp, "#!/bin/sh\nexit 0\n").expect("write fake scp");
         fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).expect("chmod fake ssh");
         fs::set_permissions(&scp, fs::Permissions::from_mode(0o700)).expect("chmod fake scp");
-        let tools = SshTools::new(&ssh, &scp).expect("paired fake tools");
+        (
+            SshTools::new(&ssh, &scp).expect("paired fake tools"),
+            child_pid,
+        )
+    }
+
+    /// A pid file is written by `printf` in another process, so "the file exists" does not imply
+    /// "the file holds a complete number". Only a parsed pid counts as published.
+    #[cfg(unix)]
+    fn read_published_pid(path: &Path) -> Option<u32> {
+        fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+    }
+
+    /// Measure, on THIS host, the two process startups the shared probe deadline has to span: the
+    /// `ssh -V` startup probe inside [`SshTransport::new`], and the fixture reaching its pid
+    /// publication (`exec /bin/sh` + `fork` + `printf`). Measured, not guessed: the Linux CI host
+    /// does both in ~22 ms while the macOS CodeBuild fleet needs 100-300 ms, which is what made a
+    /// hard-coded 250 ms budget a coin flip there.
+    #[cfg(unix)]
+    fn measure_probe_startup_cost(
+        tools: &SshTools,
+        artifacts: &CollectorArtifacts,
+        child_pid: &Path,
+    ) -> Duration {
+        use std::thread;
+
+        let mut worst = Duration::ZERO;
+        for sample in 1..=3 {
+            let _ = fs::remove_file(child_pid);
+            let startup_probe = Instant::now();
+            SshTransport::new(
+                StdCommandRunner,
+                tools.clone(),
+                SshAuthentication::Batch {
+                    identity_file: None,
+                },
+                artifacts.clone(),
+            )
+            .expect("unbounded calibration transport");
+            let startup_probe = startup_probe.elapsed();
+
+            let publish = Instant::now();
+            let mut child = Command::new(&tools.ssh)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn calibration fixture");
+            let pid = loop {
+                if let Some(pid) = read_published_pid(child_pid) {
+                    break pid;
+                }
+                assert!(
+                    publish.elapsed() < Duration::from_secs(30),
+                    "calibration sample {sample}: the fake ssh never published a child pid even \
+                     without any deadline"
+                );
+                thread::sleep(Duration::from_millis(1));
+            };
+            worst = worst.max(startup_probe + publish.elapsed());
+            let _ = Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(child_pid);
+        }
+        worst
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_probe_timeout_is_typed_kills_the_process_group_and_leaves_no_stale_state() {
+        use std::thread;
+
+        let temp = tempfile::tempdir().expect("fake ssh tempdir");
+        let (tools, child_pid) = write_hanging_fake_ssh(temp.path());
         let (_artifact_dir, artifacts) = artifact();
 
+        // The contract under test is "the timeout is typed AND the process group it kills was
+        // real", so the fixture must have forked and published its descendant before the deadline
+        // fires. A hard-coded 250 ms budget made that a race: the budget is shared with the
+        // `ssh -V` startup probe inside `SshTransport::new` (one deadline across processes, see
+        // `timed_runner_shares_one_deadline_across_processes`), and on the macOS CI fleet that
+        // startup probe alone was measured at 89-278 ms — when it eats the whole budget the Stage1
+        // process is refused before spawn, so no pid is ever published and the process-group half
+        // of this test cannot be checked at all. The budget is therefore derived from a measured
+        // same-host cost of both startups, with a 5x margin, and floored so a fast host still
+        // leaves a wide absolute window.
+        let startup_cost = measure_probe_startup_cost(&tools, &artifacts, &child_pid);
+        let probe_budget =
+            (startup_cost * 5).clamp(Duration::from_secs(1), Duration::from_secs(10));
+        // Bounded, and still far below the fixture's 60 s hang: a deadline that failed to fire
+        // is caught, while a slow-but-working host is not.
+        let test_allowance = probe_budget + Duration::from_secs(8);
+
         for attempt in 1..=2 {
+            assert!(
+                read_published_pid(&child_pid).is_none(),
+                "attempt {attempt} started with a stale pid file"
+            );
+            // Observe the publication while the process tree is still alive instead of reading the
+            // file after the kill: a pid seen here is positive proof the deadline hit a live tree.
+            let watch_path = child_pid.clone();
+            let watcher = thread::spawn(move || {
+                let started = Instant::now();
+                while started.elapsed() < Duration::from_secs(30) {
+                    if let Some(pid) = read_published_pid(&watch_path) {
+                        return Some(pid);
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                None
+            });
+
             let started = Instant::now();
             let transport = SshTransport::new(
-                StdCommandRunner::with_timeout(Duration::from_millis(250)),
+                StdCommandRunner::with_timeout(probe_budget),
                 tools.clone(),
                 SshAuthentication::Batch {
                     identity_file: None,
@@ -2760,8 +2874,9 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
                 .expect_err("a hanging probe must hit its wall-clock deadline");
 
             assert!(
-                started.elapsed() < Duration::from_secs(2),
-                "attempt {attempt} blocked past the bounded test allowance"
+                started.elapsed() < test_allowance,
+                "attempt {attempt} blocked past the bounded test allowance of {} ms",
+                test_allowance.as_millis()
             );
             assert!(
                 matches!(
@@ -2773,11 +2888,18 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
                 ),
                 "attempt {attempt} returned the wrong typed error: {error:?}"
             );
-            let pid = fs::read_to_string(&child_pid)
-                .expect("fake ssh must publish its child pid")
-                .trim()
-                .parse::<u32>()
-                .expect("child pid must be numeric");
+            let pid = watcher
+                .join()
+                .expect("pid watcher thread")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "attempt {attempt}: fake ssh never published a child pid within the {} ms \
+                         probe budget (measured host startup cost {} us) — the process-group \
+                         contract was never exercised",
+                        probe_budget.as_millis(),
+                        startup_cost.as_micros()
+                    )
+                });
             assert_process_exits(pid, attempt);
             fs::remove_file(&child_pid).expect("remove prior attempt pid");
         }
@@ -2788,7 +2910,7 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
         use std::thread;
         use std::time::{Duration, Instant};
 
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let alive = Command::new("kill")
                 .args(["-0", &pid.to_string()])
