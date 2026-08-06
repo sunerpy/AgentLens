@@ -1,6 +1,6 @@
 # 添加远端主机
 
-[← README](README.zh.md) · [English](../remote-hosts.md)
+[← README](../../README.md) · [English](../remote-hosts.md)
 
 本机会在首次打开「主机管理」时自动注册，无需配置。远端主机按下面顺序添加。
 

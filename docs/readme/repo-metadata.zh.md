@@ -114,7 +114,7 @@ grep 仍会命中它。它从来就不是占位符。用词边界形式
 | 文件 | 位置 |
 | --- | --- |
 | `README.md` | 4 处徽章 URL、2 条安装一行式 |
-| `docs/readme/README.zh.md` | 同上，中文镜像 |
+| `docs/readme/README.en.md` | 同上，英文镜像 |
 | `scripts/install.sh` | `DEFAULT_REPO`、用法一行式、用法默认值文本 |
 | `scripts/install.ps1` | `$DefaultRepo`、用法一行式 |
 | `docs/installation.md` | 2 条安装一行式 |

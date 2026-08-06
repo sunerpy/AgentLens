@@ -704,6 +704,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
 
+    use agentlens_core::transport::ssh::CommandStage;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -740,6 +741,59 @@ mod tests {
         assert!(REGISTERED_COMMANDS.contains(&"trigger_refresh"));
         assert!(REGISTERED_COMMANDS.contains(&"prices_set"));
         assert!(REGISTERED_COMMANDS.contains(&"ssh_probe_cancel"));
+    }
+
+    #[test]
+    fn local_identity_command_returns_a_stable_hash_and_prefers_the_unix_hostname() {
+        struct HostnameGuard {
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for HostnameGuard {
+            fn drop(&mut self) {
+                if let Some(value) = &self.previous {
+                    std::env::set_var("HOSTNAME", value);
+                } else {
+                    std::env::remove_var("HOSTNAME");
+                }
+            }
+        }
+
+        static HOSTNAME_LOCK: Mutex<()> = Mutex::new(());
+        let _environment = HOSTNAME_LOCK
+            .lock()
+            .expect("serialize hostname environment mutation");
+        let guard = HostnameGuard {
+            previous: std::env::var_os("HOSTNAME"),
+        };
+        std::env::set_var("HOSTNAME", "  fixture-workstation  ");
+
+        match local_machine_identity_impl() {
+            Ok(identity) => {
+                assert_eq!(identity.host_id.len(), 16);
+                assert_eq!(identity.machine_id_hash.len(), 64);
+                assert!(identity
+                    .machine_id_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+                assert_eq!(identity.hostname.as_deref(), Some("fixture-workstation"));
+                assert_eq!(
+                    local_machine_identity().expect("public command delegates to the same source"),
+                    identity
+                );
+            }
+            Err(error) => {
+                assert_eq!(error.code, IpcErrorCode::InvalidInput);
+                assert!(!error.message.is_empty());
+                assert_eq!(
+                    local_machine_identity()
+                        .expect_err("a missing platform identity stays missing")
+                        .code,
+                    error.code
+                );
+            }
+        }
+        drop(guard);
     }
 
     #[test]
@@ -1050,5 +1104,375 @@ mod tests {
                 .code,
             IpcErrorCode::NotFound
         );
+    }
+
+    #[test]
+    fn aggregate_queries_return_contract_shapes_for_an_empty_archive() {
+        let (_data_dir, state) = state();
+        let summary = get_summary_impl(
+            &state,
+            range("2026-01-01", "2026-01-03"),
+            "UTC".to_owned(),
+            AggregateFilters::default(),
+        )
+        .expect("query empty summary");
+        assert_eq!(summary.message_count, 0);
+        assert_eq!(summary.active_session_count, 0);
+        assert_eq!(summary.tokens.total_input, 0);
+
+        let trend = get_trend_impl(
+            &state,
+            range("2026-01-01", "2026-01-03"),
+            "UTC".to_owned(),
+            Granularity::Day,
+            AggregateFilters::default(),
+        )
+        .expect("query empty trend");
+        assert_eq!(trend.len(), 2);
+        assert!(trend.iter().all(|point| {
+            point.coverage == crate::contract::CoverageStatus::None
+                && point.message_count.is_none()
+                && point.tokens.is_none()
+        }));
+
+        let breakdown = get_breakdown_impl(
+            &state,
+            range("2026-01-01", "2026-01-03"),
+            BreakdownDimensions {
+                timezone: "UTC".to_owned(),
+                filters: AggregateFilters::default(),
+                expand_variant: true,
+            },
+        )
+        .expect("query empty breakdown");
+        assert!(breakdown.is_empty());
+    }
+
+    #[test]
+    fn scalar_parsers_reject_lossy_values_and_preserve_field_names() {
+        assert_eq!(
+            parse_u32(&json!(u32::MAX), "limit").expect("u32 max"),
+            u32::MAX
+        );
+        for value in [
+            json!(-1),
+            json!(1.5),
+            json!(u64::from(u32::MAX) + 1),
+            json!("1"),
+        ] {
+            let error = parse_u32(&value, "limit").expect_err("lossy u32 must fail");
+            assert_eq!(error.code, IpcErrorCode::InvalidInput);
+            assert_eq!(error.fields.get("field").map(String::as_str), Some("limit"));
+        }
+
+        assert_eq!(
+            parse_i64(&json!(-42), "offset").expect("signed offset"),
+            -42
+        );
+        for value in [json!(1.5), json!("-42"), json!(u64::MAX)] {
+            let error = parse_i64(&value, "offset").expect_err("non-i64 must fail");
+            assert_eq!(
+                error.fields.get("field").map(String::as_str),
+                Some("offset")
+            );
+        }
+
+        assert_eq!(
+            optional_path(Some("  /tmp/key  ")),
+            Some(PathBuf::from("/tmp/key"))
+        );
+        assert_eq!(optional_path(Some("   ")), None);
+        assert_eq!(optional_path(None), None);
+
+        let bad_start = parse_range(&range("01-01-2026", "2026-01-02"), "UTC")
+            .expect_err("non-ISO start date must fail");
+        assert_eq!(
+            bad_start.fields.get("field").map(String::as_str),
+            Some("range.startDate")
+        );
+        let bad_end = parse_range(&range("2026-01-01", "tomorrow"), "UTC")
+            .expect_err("non-ISO end date must fail");
+        assert_eq!(
+            bad_end.fields.get("field").map(String::as_str),
+            Some("range.endDateExclusive")
+        );
+        let bad_timezone = parse_range(&range("2026-01-01", "2026-01-02"), "Mars/Olympus")
+            .expect_err("unknown timezone must fail");
+        assert_eq!(bad_timezone.code, IpcErrorCode::InvalidTimezone);
+    }
+
+    #[test]
+    fn host_mutations_reject_invalid_conflicting_and_missing_records() {
+        let (_data_dir, state) = state();
+        let blank = hosts_get_impl(&state, "   ").expect_err("blank host id must fail");
+        assert_eq!(blank.code, IpcErrorCode::InvalidInput);
+
+        let invalid_hash = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "Invalid identity".to_owned(),
+                kind: HostKind::Local,
+                machine_id_hash: "not-a-sha256".to_owned(),
+                ssh_target: None,
+                remote_data_dir: None,
+            },
+        )
+        .expect_err("invalid machine hash must fail");
+        assert_eq!(invalid_hash.code, IpcErrorCode::InvalidInput);
+
+        let local_with_ssh = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "Misrouted local".to_owned(),
+                kind: HostKind::Local,
+                machine_id_hash: "e".repeat(64),
+                ssh_target: Some("user@example.test".to_owned()),
+                remote_data_dir: None,
+            },
+        )
+        .expect_err("a local host cannot carry an SSH target");
+        assert_eq!(local_with_ssh.code, IpcErrorCode::InvalidInput);
+        assert_eq!(
+            local_with_ssh.fields.get("field").map(String::as_str),
+            Some("sshTarget")
+        );
+
+        let first = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "First registration".to_owned(),
+                kind: HostKind::Local,
+                machine_id_hash: "f".repeat(64),
+                ssh_target: None,
+                remote_data_dir: None,
+            },
+        )
+        .expect("create first host");
+        let duplicate = hosts_create_impl(
+            &state,
+            HostCreateInput {
+                display_name: "Duplicate registration".to_owned(),
+                kind: HostKind::Local,
+                machine_id_hash: "f".repeat(64),
+                ssh_target: None,
+                remote_data_dir: None,
+            },
+        )
+        .expect_err("duplicate physical machine must fail");
+        assert_eq!(duplicate.code, IpcErrorCode::Conflict);
+
+        let missing_update = hosts_update_impl(
+            &state,
+            HostUpdateInput {
+                host_id: "missing-host".to_owned(),
+                display_name: "Missing".to_owned(),
+                kind: HostKind::Ssh,
+                ssh_target: Some("user@example.test".to_owned()),
+                remote_data_dir: None,
+            },
+        )
+        .expect_err("updating a missing host must fail");
+        assert_eq!(missing_update.code, IpcErrorCode::NotFound);
+
+        let missing_delete = hosts_delete_impl(&state, "missing-host")
+            .expect_err("deleting a missing host must fail");
+        assert_eq!(missing_delete.code, IpcErrorCode::NotFound);
+        assert_eq!(
+            hosts_get_impl(&state, &first.host_id)
+                .expect("failed mutations leave the original host intact")
+                .display_name,
+            "First registration"
+        );
+    }
+
+    #[test]
+    fn probe_registration_rejects_duplicates_and_async_blank_probe_cleans_up() {
+        let registration = ProbeRegistration::register("probe_duplicate_test".to_owned())
+            .expect("register first probe");
+        let duplicate = match ProbeRegistration::register("probe_duplicate_test".to_owned()) {
+            Ok(_) => panic!("duplicate request id must conflict"),
+            Err(error) => error,
+        };
+        assert_eq!(duplicate.code, IpcErrorCode::Conflict);
+        assert_eq!(
+            duplicate.fields.get("requestId").map(String::as_str),
+            Some("probe_duplicate_test")
+        );
+        drop(registration);
+        ProbeRegistration::register("probe_duplicate_test".to_owned())
+            .expect("dropping a probe releases its request id");
+
+        let request_id = "probe_async_blank_test";
+        let error = tauri::async_runtime::block_on(ssh_probe(
+            SshProbeInput {
+                ssh_target: "   ".to_owned(),
+                identity_file: Some("  /tmp/id_fixture  ".to_owned()),
+                remote_data_dir: None,
+            },
+            request_id.to_owned(),
+        ))
+        .expect_err("blank target must fail in the worker");
+        assert_eq!(error.code, IpcErrorCode::InvalidInput);
+        assert!(
+            !probe_cancellations()
+                .lock()
+                .expect("lock probe registry")
+                .contains_key(request_id),
+            "the async command must release its request id after completion"
+        );
+    }
+
+    #[test]
+    fn every_ssh_failure_maps_to_a_stable_variant_and_actionable_remediation() {
+        let cases = [
+            (
+                SshError::ArchMismatch {
+                    remote_arch: "riscv64".to_owned(),
+                    available: vec!["x86_64".to_owned()],
+                },
+                "archMismatch",
+            ),
+            (
+                SshError::NoWritableCache {
+                    detail: "read-only".to_owned(),
+                },
+                "noWritableCache",
+            ),
+            (
+                SshError::TransferCorrupted {
+                    detail: "checksum".to_owned(),
+                },
+                "transferCorrupted",
+            ),
+            (
+                SshError::AuthFailed {
+                    detail: "denied".to_owned(),
+                },
+                "authFailed",
+            ),
+            (
+                SshError::NoDataDir {
+                    detail: "missing".to_owned(),
+                },
+                "noDataDir",
+            ),
+            (
+                SshError::WalUnreadable {
+                    detail: "permissions".to_owned(),
+                },
+                "walUnreadable",
+            ),
+            (SshError::ClientCancelled, "clientCancelled"),
+            (
+                SshError::SshUnavailable {
+                    detail: "not installed".to_owned(),
+                },
+                "sshUnavailable",
+            ),
+            (
+                SshError::InvalidInput {
+                    detail: "bad target".to_owned(),
+                },
+                "invalidInput",
+            ),
+            (
+                SshError::InvalidResponse {
+                    stage: CommandStage::Stage1,
+                    detail: "bad probe".to_owned(),
+                },
+                "invalidResponse",
+            ),
+            (
+                SshError::Runner {
+                    stage: CommandStage::Stage4,
+                    detail: "spawn failed".to_owned(),
+                },
+                "runner",
+            ),
+        ];
+
+        for (source, variant) in cases {
+            let error = ssh_error(source);
+            assert_eq!(error.code, IpcErrorCode::Refresh);
+            assert_eq!(
+                error.fields.get("variant").map(String::as_str),
+                Some(variant)
+            );
+            assert!(error
+                .fields
+                .get("remediation")
+                .is_some_and(
+                    |remediation| remediation.starts_with('请') || remediation.starts_with('可')
+                ));
+        }
+    }
+
+    #[test]
+    fn command_error_adapters_keep_domain_specific_codes() {
+        let date = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixture date");
+        for (source, expected) in [
+            (
+                QueryError::InvalidTimezone("bad/tz".to_owned()),
+                IpcErrorCode::InvalidTimezone,
+            ),
+            (
+                QueryError::InvalidDateRange {
+                    start_date: date,
+                    end_date_exclusive: date,
+                },
+                IpcErrorCode::InvalidRange,
+            ),
+            (QueryError::InvalidLimit, IpcErrorCode::InvalidInput),
+            (QueryError::NegativeOffset(-1), IpcErrorCode::InvalidInput),
+            (
+                QueryError::Sqlite(rusqlite::Error::InvalidQuery),
+                IpcErrorCode::Database,
+            ),
+            (
+                QueryError::InvalidTimestamp(i64::MAX),
+                IpcErrorCode::InvalidInput,
+            ),
+        ] {
+            let error = query_error(source);
+            assert_eq!(error.code, expected);
+            assert!(!error.message.is_empty());
+        }
+
+        for (source, expected) in [
+            (
+                HostError::DuplicateMachine {
+                    machine_id_hash: "a".repeat(64),
+                    existing_host_id: "host-a".to_owned(),
+                    existing_display_name: "Host A".to_owned(),
+                },
+                IpcErrorCode::Conflict,
+            ),
+            (
+                HostError::HostAlreadyExists {
+                    host_id: "host-a".to_owned(),
+                    display_name: "Host A".to_owned(),
+                },
+                IpcErrorCode::Conflict,
+            ),
+            (
+                HostError::HostNotFound {
+                    host_id: "missing".to_owned(),
+                },
+                IpcErrorCode::NotFound,
+            ),
+            (
+                HostError::Sqlite(rusqlite::Error::InvalidQuery),
+                IpcErrorCode::Database,
+            ),
+            (HostError::MachineIdBlank, IpcErrorCode::InvalidInput),
+        ] {
+            let error = host_error(source);
+            assert_eq!(error.code, expected);
+            assert!(!error.message.is_empty());
+        }
+
+        let database = database_error("fixture database failure");
+        assert_eq!(database.code, IpcErrorCode::Database);
+        assert_eq!(database.message, "fixture database failure");
     }
 }

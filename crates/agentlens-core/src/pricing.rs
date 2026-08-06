@@ -1492,6 +1492,137 @@ mod tests {
     }
 
     #[test]
+    fn pricing_data_dir_wrappers_round_trip_and_direct_estimate_preserves_partial_semantics() {
+        let dir = tempdir().expect("tempdir");
+        let table = priced_table();
+
+        table
+            .save_in_data_dir(dir.path())
+            .expect("save through data-directory wrapper");
+        let loaded =
+            PriceTable::load_in_data_dir(dir.path()).expect("load through data-directory wrapper");
+        assert_eq!(loaded, table);
+        assert_eq!(
+            loaded.estimate(
+                "kiro-auth",
+                "claude-opus-5-max",
+                TokenCounts {
+                    input: TOK_INPUT,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                }
+            ),
+            Some(3.0)
+        );
+        assert_eq!(
+            loaded.estimate(
+                "kiro-auth",
+                "missing-model",
+                TokenCounts {
+                    input: TOK_INPUT,
+                    ..TokenCounts::default()
+                }
+            ),
+            None,
+            "a missing price must remain unavailable rather than silently filling zero"
+        );
+    }
+
+    #[test]
+    fn pricing_validation_identifies_each_blank_key_and_invalid_price_bucket() {
+        let mut blank_model = priced_entry();
+        blank_model.model_id = " \t ".to_string();
+        assert!(matches!(
+            PriceTable::from_entries(vec![blank_model]).validate(),
+            Err(PricingError::BlankIdentifier {
+                index: 0,
+                field: "model_id"
+            })
+        ));
+
+        for (field, value) in [
+            ("input_per_mtok", -1.0),
+            ("output_per_mtok", f64::INFINITY),
+            ("cache_read_per_mtok", f64::NEG_INFINITY),
+            ("cache_write_per_mtok", f64::NAN),
+        ] {
+            let mut entry = priced_entry();
+            match field {
+                "input_per_mtok" => entry.input_per_mtok = value,
+                "output_per_mtok" => entry.output_per_mtok = value,
+                "cache_read_per_mtok" => entry.cache_read_per_mtok = value,
+                "cache_write_per_mtok" => entry.cache_write_per_mtok = value,
+                _ => unreachable!(),
+            }
+            let error = PriceTable::from_entries(vec![entry])
+                .validate()
+                .expect_err("invalid bucket price must fail validation");
+            assert!(
+                matches!(error, PricingError::InvalidPrice { field: actual, .. } if actual == field),
+                "unexpected validation error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn pricing_save_reports_invalid_paths_and_directory_creation_failures() {
+        let error = priced_table()
+            .save(Path::new("prices.json"))
+            .expect_err("a parentless relative path must fail");
+        assert!(matches!(
+            error,
+            PricingError::InvalidPricesPath(path) if path == Path::new("prices.json")
+        ));
+
+        let dir = tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("not-a-directory");
+        fs::write(&blocking_file, b"occupied").expect("write blocking file");
+        let target = blocking_file.join("prices.json");
+        let error = priced_table()
+            .save(&target)
+            .expect_err("a file cannot be prepared as the prices directory");
+        assert!(matches!(
+            error,
+            PricingError::Directory { path, .. } if path == blocking_file
+        ));
+        assert_eq!(
+            fs::read(&blocking_file).expect("read preserved blocker"),
+            b"occupied"
+        );
+    }
+
+    #[test]
+    fn pricing_transient_read_retry_honors_wall_clock_limit() {
+        let path = Path::new("injected-prices.json");
+        let mut attempts = 0;
+        let mut waits = 0;
+        let error = PriceTable::load_with_reader(
+            path,
+            |_| {
+                attempts += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "persistent transient failure",
+                ))
+            },
+            |_| {
+                waits += 1;
+                thread::sleep(READ_RETRY_LIMIT + Duration::from_millis(1));
+            },
+        )
+        .expect_err("elapsed retry budget must return the latest typed read error");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(waits, 1);
+        assert!(matches!(
+            error,
+            PricingError::Read { path: error_path, source }
+                if error_path == path && source.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
     #[ignore = "manual QA: set AGENTLENS_QA_PRICES_DIR, run in background, then SIGKILL mid-write"]
     fn pricing_manual_qa_write_loop() {
         let Some(data_dir) = std::env::var_os("AGENTLENS_QA_PRICES_DIR") else {

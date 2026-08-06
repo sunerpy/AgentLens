@@ -1211,6 +1211,243 @@ mod tests {
     }
 
     #[test]
+    fn opencode_schema_variants_preserve_numeric_identifiers_and_lossy_token_contract() {
+        let context = ParseContext::new("host-schema-variants", Origin::Bak);
+        let data = json!({
+            "role": "assistant",
+            "agent": "   ",
+            "path": {"cwd": 17},
+            "cost": "0.25",
+            "tokens": {
+                "input": null,
+                "output": "6.9",
+                "reasoning": 7,
+                "cache": {"read": true, "write": 4.8}
+            },
+            "providerID": 42,
+            "model": {"providerID": "nested-provider", "modelID": 73, "variant": 9},
+            "time": {"completed": 8.9}
+        });
+
+        let record = parse_message(valid_source_row_with_data(&data.to_string()), &context)
+            .expect("documented flat/nested schema variants remain eligible");
+        assert_eq!(record.origin, Origin::Bak);
+        assert_eq!(record.agent_raw, "unknown");
+        assert_eq!(record.agent_key, "unknown");
+        assert_eq!(record.provider_id, "42", "flat identifiers take precedence");
+        assert_eq!(record.model_id, "73");
+        assert_eq!(record.variant.as_deref(), Some("9"));
+        assert_eq!(record.project_dir, "");
+        assert_eq!(record.time_completed_utc, Some(8));
+        assert_eq!(
+            (
+                record.tok_input,
+                record.tok_output,
+                record.tok_reasoning,
+                record.tok_cache_read,
+                record.tok_cache_write,
+            ),
+            (0, 6, 7, 0, 4)
+        );
+        assert_eq!(record.cost, Some(0.25));
+        assert_eq!(record.cost_source, CostSource::Actual);
+        assert!(!record.is_incomplete);
+
+        assert_eq!(lossy_u64(None), 0);
+        assert_eq!(lossy_i64(Some(&json!(u64::MAX))), Some(i64::MAX));
+        assert_eq!(lossy_f64(Some(&json!("NaN"))), None);
+    }
+
+    enum QueryOnlyReply {
+        Enabled,
+        Disabled,
+        Error,
+    }
+
+    enum StreamReply {
+        Complete(Vec<SourceMessageRow>),
+        Interrupted,
+        Corrupt,
+    }
+
+    struct ContractConnection {
+        query_only: QueryOnlyReply,
+        stream: StreamReply,
+    }
+
+    impl SourceConnection for ContractConnection {
+        fn query_only(&self) -> rusqlite::Result<bool> {
+            match self.query_only {
+                QueryOnlyReply::Enabled => Ok(true),
+                QueryOnlyReply::Disabled => Ok(false),
+                QueryOnlyReply::Error => Err(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(ffi::SQLITE_CORRUPT),
+                    Some("injected query_only failure".to_string()),
+                )),
+            }
+        }
+
+        fn stream_messages(
+            &mut self,
+            _window_start: i64,
+            visitor: &mut dyn FnMut(SourceMessageRow) -> std::result::Result<(), StreamError>,
+        ) -> std::result::Result<(), StreamError> {
+            match &self.stream {
+                StreamReply::Complete(rows) => {
+                    for row in rows {
+                        visitor(row.clone())?;
+                    }
+                    Ok(())
+                }
+                StreamReply::Interrupted => {
+                    visitor(valid_source_row(0, 10))?;
+                    Err(StreamError::Interrupted("injected source stop".to_string()))
+                }
+                StreamReply::Corrupt => Err(StreamError::Sqlite(rusqlite::Error::SqliteFailure(
+                    ffi::Error::new(ffi::SQLITE_CORRUPT),
+                    Some("injected corrupt source".to_string()),
+                ))),
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_scan_rejects_invalid_batch_and_query_only_contracts_before_delivery() {
+        let mut connection = ContractConnection {
+            query_only: QueryOnlyReply::Enabled,
+            stream: StreamReply::Complete(Vec::new()),
+        };
+        let mut invalid_request = request(None);
+        invalid_request.batch_size = 0;
+        assert!(matches!(
+            scan_connection(&mut connection, &invalid_request, |_| Ok(())),
+            Err(OpenCodeError::InvalidBatchSize)
+        ));
+
+        for query_only in [QueryOnlyReply::Disabled, QueryOnlyReply::Error] {
+            let mut connection = ContractConnection {
+                query_only,
+                stream: StreamReply::Complete(Vec::new()),
+            };
+            let error = scan_connection(&mut connection, &request(None), |_| Ok(()))
+                .expect_err("an unverifiable query-only connection must be rejected");
+            match error {
+                OpenCodeError::QueryOnlyDisabled => {}
+                OpenCodeError::ScanFailed { partial, source } => {
+                    assert_eq!(partial.last_success_utc, Some(1_785_000_000_000));
+                    assert_eq!(partial.delivered_records, 0);
+                    assert!(source.to_string().contains("query_only failure"));
+                }
+                other => panic!("unexpected query-only error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn opencode_tail_sink_source_interruption_and_corruption_keep_truthful_partial_state() {
+        let mut tail = ContractConnection {
+            query_only: QueryOnlyReply::Enabled,
+            stream: StreamReply::Complete(vec![valid_source_row(0, 10)]),
+        };
+        let tail_result = scan_connection(&mut tail, &request(None), |_| {
+            Err(SinkError::new("reject final short batch"))
+        })
+        .expect("tail sink rejection is an orderly interrupted result");
+        assert_eq!(tail_result.eligible_count, 1);
+        assert_eq!(tail_result.delivered_records, 0);
+        assert_eq!(tail_result.observed_max_time_updated, None);
+        assert_eq!(
+            tail_result.skip_reason,
+            Some(ScanSkipReason::Interrupted(
+                "reject final short batch".to_string()
+            ))
+        );
+
+        let mut interrupted = ContractConnection {
+            query_only: QueryOnlyReply::Enabled,
+            stream: StreamReply::Interrupted,
+        };
+        let interrupted_result = scan_connection(&mut interrupted, &request(None), |_| Ok(()))
+            .expect("source interruption is recoverable");
+        assert_eq!(interrupted_result.eligible_count, 1);
+        assert_eq!(interrupted_result.delivered_records, 0);
+        assert_eq!(interrupted_result.observed_max_time_updated, None);
+        assert_eq!(
+            interrupted_result.skip_reason,
+            Some(ScanSkipReason::Interrupted(
+                "injected source stop".to_string()
+            ))
+        );
+
+        let mut corrupt = ContractConnection {
+            query_only: QueryOnlyReply::Enabled,
+            stream: StreamReply::Corrupt,
+        };
+        let error = scan_connection(&mut corrupt, &request(None), |_| Ok(()))
+            .expect_err("non-busy SQLite corruption must remain fatal");
+        match error {
+            OpenCodeError::ScanFailed { partial, source } => {
+                assert!(!partial.reached_eof);
+                assert_eq!(partial.observed_max_time_updated, None);
+                assert!(source.to_string().contains("corrupt source"));
+            }
+            other => panic!("unexpected source corruption error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_discovery_precedence_and_open_error_classification_are_deterministic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let explicit = temp.path().join("explicit");
+        let xdg = temp.path().join("xdg");
+        let home = temp.path().join("home");
+        let explicit_database = explicit.join(DATABASE_FILE);
+        let xdg_database = xdg.join("opencode").join(DATABASE_FILE);
+        let home_database = home
+            .join(".local")
+            .join("share")
+            .join("opencode")
+            .join(DATABASE_FILE);
+        for path in [&home_database, &xdg_database, &explicit_database] {
+            std::fs::create_dir_all(path.parent().expect("candidate parent"))
+                .expect("create discovery candidate parent");
+            std::fs::write(path, b"candidate").expect("write discovery candidate");
+        }
+        assert_eq!(
+            discover_database_path_from(Some(&explicit), Some(&xdg), Some(&home))
+                .expect("discover explicit candidate"),
+            explicit_database
+        );
+        std::fs::remove_file(&explicit_database).expect("remove explicit candidate");
+        assert_eq!(
+            discover_database_path_from(Some(&explicit), Some(&xdg), Some(&home))
+                .expect("fall back to XDG candidate"),
+            xdg_database
+        );
+
+        let source_path = temp.path().join("classification.db");
+        let wal = sidecar_path(&source_path, "-wal");
+        std::fs::write(&wal, b"wal").expect("write sidecar marker");
+        let cannot_open = rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CANTOPEN),
+            Some("cannot open sidecar".to_string()),
+        );
+        assert!(matches!(
+            map_source_open_error(&source_path, cannot_open),
+            OpenCodeError::WalUnreadable { sidecars, .. } if sidecars.contains(&wal)
+        ));
+        std::fs::remove_file(&wal).expect("remove sidecar marker");
+        let corrupt = rusqlite::Error::SqliteFailure(
+            ffi::Error::new(ffi::SQLITE_CORRUPT),
+            Some("corrupt header".to_string()),
+        );
+        assert!(matches!(
+            map_source_open_error(&source_path, corrupt),
+            OpenCodeError::Open { path, .. } if path == source_path
+        ));
+    }
+
+    #[test]
     fn opencode_missing_database_error_lists_all_probed_paths() {
         let temp = tempfile::tempdir().expect("tempdir");
         let explicit = temp.path().join("explicit");

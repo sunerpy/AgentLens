@@ -330,22 +330,24 @@ jobs:
       # ---- 门禁 5：覆盖率（仅 Linux）---------------------------------------
       # coverage-gate 会先跑 coverage 产出 artifacts/coverage/{summary.txt,lcov.info}，
       # 再直接读 lcov 的 LF/LH 判定门槛 —— 与 Codecov 消费的是同一份字节，本地数字
-      # 与面板数字不会漂移。门槛恒为 75；实测值按 runner 记：HEAD 本地 Linux 76.92%
-      # （12025/15633），CodeBuild Linux runner 79.56%（11252/14143）。
-      - name: 门禁 make coverage-gate（>= 75%）并产出 lcov.info
+      # 与面板数字不会漂移。门槛恒为 90；2026-08-06 Linux 基线与门禁复验均为 91.63%
+      #（分别 15894/17346、15895/17346），1 行命中差异约 0.006pp，远小于 1.63pp 余量。
+      - name: 门禁 make coverage-gate（>= 90%）并产出 lcov.info
         if: runner.os == 'Linux'
         run: make coverage-gate
 
       # 只有 Linux 上传：三平台都传会让同一份代码被重复计数。
       # 未配置 CODECOV_TOKEN 时跳过上传（Codecov 是报表而非门禁，真正的地板是上一步
       # 的 make coverage-gate，它已经硬失败过一次门槛校验）；配了 token 就必须传成功，
-      # fail_ci_if_error 不给静默失败留口子。lcov.info 另外作为 workflow 产物上传，
-      # 所以即使跳过 Codecov 数据也不会丢。
+      # fail_ci_if_error 不给静默失败留口子。人工启用：`gh secret set CODECOV_TOKEN`；或先在
+      # codecov.io 关联这个 public 仓库，再经确认切到 tokenless 上传。关联完成前不得删除守卫。
+      # lcov.info 另外作为 workflow 产物上传，所以即使跳过 Codecov 数据也不会丢。
       - name: 上传覆盖率到 Codecov（仅 Linux，避免重复计数）
         if: runner.os == 'Linux' && env.CODECOV_TOKEN != ''
         uses: codecov/codecov-action@v5
         with:
-          files: artifacts/coverage/lcov.info
+          files: ./artifacts/coverage/lcov.info
+          disable_search: true
           fail_ci_if_error: true
           token: ${{ env.CODECOV_TOKEN }}
 

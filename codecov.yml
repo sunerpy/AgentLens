@@ -1,38 +1,35 @@
 # Codecov 配置 —— 覆盖率状态门禁与排除集
 #
-# 地板 75%：与 Makefile 的 COVERAGE_MIN 默认值同一个数字，两侧必须一致。
-# 取值依据是实测而非理想值。地板本身才是长期成立的保证，百分比按 runner 记：
-#   本地 Linux make coverage-gate       行覆盖率 76.92%（12025/15633）
-#   CodeBuild Linux runner              行覆盖率 79.56%（11252/14143）
-# 相对地板的真实余量按 runner 分别是：本地 1.92pp、CodeBuild runner 4.56pp。所以这个
-# 地板**今天就是有意义的**（不是上任即红，也不是随手放过）。
-# 更早两轮读数各自锚在当时的构建/提交上，已被上面取代，不描述当前树：
-# CodeBuild agentlens-linux:23bd9b56（us-west-2）78.87%，HEAD 553fb8a 本地复测 79.04%。
-# 后续棘轮：覆盖率稳定上一档后（例如实测到 82%），把这里与 Makefile 的
-# COVERAGE_MIN 一起提到 78，逐档往上。注意 18 个 #[ignore] 用例（需要操作者本机
-# 约 43 GB 真实归档库或真实钥匙串 / GUI）不参与统计，天花板本就低于纸面。
+# 地板 90%：与 Makefile 的 COVERAGE_MIN 同一个数字，两侧必须一致。
+# 取值依据是 2026-08-06 Linux `cargo llvm-cov --workspace` 实测行覆盖率
+# 91.63%（基线 15894/17346；门禁复验 15895/17346），相对硬地板留 1.63pp 余量。
+# 复验分母稳定、命中仅差 1 行（约 0.006pp）；历史上 76.92%（12025/15633）与
+# 79.56%（11252/14143）的分母不同，来自代码或插桩范围不同，不是 runner 随机漂移。
+# 后续棘轮仍只在覆盖率稳定提高后，把这里与 Makefile 一起逐档上调。注意 11 个 #[ignore]
+# 用例（需要约 43 GB
+# 真实归档库、外部二进制或真实 OS secret service）不参与统计，天花板本就低于纸面。
 #
 # 数据同源：CI 只在 ubuntu job 上传 artifacts/coverage/lcov.info，正是
 # `make coverage-gate` 判定门槛时读 LF/LH 的同一份字节。三平台都传会让同一份
 # 代码被重复计数，所以 windows / macos job 不产也不传覆盖率。
 #
 # threshold 1%：吸收插桩噪声（不同 runner 上分支计数会有极小抖动），不是放水口 ——
-# 真正的硬地板是 CI 里的 make coverage-gate，它在覆盖率低于 75 时直接让 job 失败，
+# 真正的硬地板是 CI 里的 make coverage-gate，它在覆盖率低于 90 时直接让 job 失败，
 # 不依赖 Codecov 的状态检查。
 coverage:
   status:
     project:
       default:
-        target: 75%
+        target: 90%
         threshold: 1%
     patch:
       default:
-        target: 75%
+        target: 90%
         threshold: 1%
 
 # 排除集与 `make coverage` 实际统计的范围保持一致，避免本地数字与面板数字漂移。
-# 实测口径（HEAD 553fb8a，`grep '^SF:' artifacts/coverage/lcov.info`）：
-# cargo-llvm-cov --workspace 只插桩 4 个 workspace 成员的 src/ 下共 21 个 Rust 文件
+# 实测口径（2026-08-06，`grep '^SF:' artifacts/coverage/lcov.info`）：
+# cargo-llvm-cov --workspace 插桩 4 个 workspace 成员的 src/ 下 Rust 文件
 #   crates/agentlens-askpass/src/    crates/agentlens-collector/src/
 #   crates/agentlens-core/src/       src-tauri/src/
 # 因此下面列出的都是**报告里本来就没有**的路径，写出来是为了让口径显式、可核对，

@@ -1,6 +1,6 @@
 # 安装
 
-[← README](README.zh.md) · [English](../installation.md)
+[← README](../../README.md) · [English](../installation.md)
 
 ## 一行式安装
 

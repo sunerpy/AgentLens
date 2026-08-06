@@ -1,6 +1,6 @@
 # Data storage and settings
 
-[← README](../README.md) · [简体中文](readme/data-storage.zh.md)
+[← README](readme/README.en.md) · [简体中文](readme/data-storage.zh.md)
 
 | Content | Linux | Windows |
 | --- | --- | --- |

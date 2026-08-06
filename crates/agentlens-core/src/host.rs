@@ -621,9 +621,12 @@ fn map_host_row(row: &Row<'_>) -> rusqlite::Result<HostRecord> {
 }
 
 #[cfg(test)]
+#[allow(unexpected_cfgs)]
 mod tests {
     use std::fs;
+    #[cfg(not(coverage))]
     use std::path::Path;
+    #[cfg(not(coverage))]
     use std::process::Command;
 
     use super::*;
@@ -946,6 +949,163 @@ mod tests {
         assert!(registry.list().expect("list hosts").is_empty());
     }
 
+    #[test]
+    fn host_machine_hash_reconstruction_rejects_noncanonical_digests() {
+        let valid = identity(MACHINE_ID_A);
+        let reconstructed = MachineIdentity::from_machine_id_hash(valid.machine_id_hash())
+            .expect("canonical digest reconstructs its identity");
+        assert_eq!(reconstructed, valid);
+
+        for invalid in [
+            "0".repeat(MACHINE_ID_HASH_HEX_LENGTH - 1),
+            "A".repeat(MACHINE_ID_HASH_HEX_LENGTH),
+            format!("{}g", "0".repeat(MACHINE_ID_HASH_HEX_LENGTH - 1)),
+        ] {
+            let error = MachineIdentity::from_machine_id_hash(&invalid)
+                .expect_err("noncanonical digest must be rejected");
+            assert!(matches!(
+                error,
+                HostError::InvalidMachineIdHash { ref value } if value == &invalid
+            ));
+            assert!(error.to_string().contains(&invalid));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn host_production_machine_id_chain_derives_the_same_local_identity() {
+        match local_machine_id() {
+            Ok(machine_id) => {
+                let discovered =
+                    local_machine_identity().expect("derive production local identity");
+                let direct =
+                    MachineIdentity::from_machine_id(&machine_id).expect("derive direct identity");
+
+                assert_eq!(discovered, direct);
+                assert_eq!(discovered.host_id().len(), HOST_ID_HEX_LENGTH);
+                assert_eq!(
+                    discovered.machine_id_hash().len(),
+                    MACHINE_ID_HASH_HEX_LENGTH
+                );
+            }
+            Err(error) => {
+                assert!(matches!(error, HostError::MachineIdUnavailable { .. }));
+                assert!(matches!(
+                    local_machine_identity(),
+                    Err(HostError::MachineIdUnavailable { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn host_machine_id_chain_skips_non_utf8_and_unreadable_sources() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let directory_source = dir.path().join("directory-source");
+        let non_utf8 = dir.path().join("non-utf8");
+        let good = dir.path().join("good");
+        fs::create_dir(&directory_source).expect("create unreadable-as-file source");
+        fs::write(&non_utf8, [0xff, 0xfe]).expect("write non-UTF-8 source");
+        fs::write(&good, format!("\n {MACHINE_ID_C} \r\n")).expect("write good source");
+
+        let resolved = machine_id_from_sources(&[
+            directory_source.as_path(),
+            non_utf8.as_path(),
+            good.as_path(),
+        ])
+        .expect("discovery must continue after unreadable and non-UTF-8 sources");
+        assert_eq!(resolved, MACHINE_ID_C);
+
+        let error = machine_id_from_sources(&[directory_source.as_path(), non_utf8.as_path()])
+            .expect_err("only unusable sources must report every rejection");
+        let detail = error.to_string();
+        assert!(detail.contains("unreadable"));
+        assert!(detail.contains("not valid UTF-8"));
+        assert!(detail.contains(&directory_source.display().to_string()));
+        assert!(detail.contains(&non_utf8.display().to_string()));
+    }
+
+    #[test]
+    fn host_registry_reports_update_conflict_corruption_and_blank_ssh_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = Archive::open_in_data_dir(dir.path()).expect("open archive in tempdir");
+        let registry = HostRegistry::new(archive.connection());
+
+        let mut blank_target = HostRecord::ssh("远端", "user@host", &identity(MACHINE_ID_A));
+        blank_target.ssh_target = Some(" \t ".into());
+        let error = registry
+            .insert(&blank_target)
+            .expect_err("blank SSH target must be rejected like a missing target");
+        assert!(matches!(error, HostError::MissingSshTarget { .. }));
+
+        let missing = HostRecord::local("尚未注册", &identity(MACHINE_ID_B));
+        let error = registry
+            .update(&missing)
+            .expect_err("update must not silently insert a missing host");
+        assert!(matches!(
+            error,
+            HostError::HostNotFound { ref host_id } if host_id == missing.host_id()
+        ));
+
+        let original = HostRecord::local("原主机", &identity(MACHINE_ID_A));
+        registry.insert(&original).expect("insert original host");
+        let mut colliding = HostRecord::local("冲突主机", &identity(MACHINE_ID_B));
+        colliding.host_id = original.host_id().to_owned();
+        let error = registry
+            .insert(&colliding)
+            .expect_err("same host id with another digest must name the existing row");
+        assert!(matches!(
+            error,
+            HostError::HostAlreadyExists {
+                ref host_id,
+                ref display_name
+            } if host_id == original.host_id() && display_name == "原主机"
+        ));
+
+        archive
+            .connection()
+            .execute("DROP TABLE hosts", [])
+            .expect("drop registry table to inject corruption");
+        let error = registry
+            .insert(&HostRecord::local("数据库损坏", &identity(MACHINE_ID_C)))
+            .expect_err("SQLite schema failure must remain typed");
+        assert!(matches!(error, HostError::Sqlite(_)));
+    }
+
+    #[test]
+    fn host_registry_rejects_invalid_kind_stored_in_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let archive = Archive::open_in_data_dir(dir.path()).expect("open archive in tempdir");
+        let valid = identity(MACHINE_ID_A);
+        archive
+            .connection()
+            .execute(
+                "INSERT INTO hosts (
+                    host_id, display_name, kind, ssh_target,
+                    remote_data_dir, last_success_utc, machine_id_hash
+                 ) VALUES (?1, '损坏行', 'remote', NULL, NULL, NULL, ?2)",
+                params![valid.host_id(), valid.machine_id_hash()],
+            )
+            .expect("inject invalid stored kind");
+
+        let error = HostRegistry::new(archive.connection())
+            .get(valid.host_id())
+            .expect_err("invalid stored kind must not deserialize as a host");
+        let HostError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            source,
+        )) = error
+        else {
+            panic!("unexpected invalid-kind error")
+        };
+        assert_eq!(column, 2);
+        assert!(source
+            .to_string()
+            .contains("host kind \"remote\" is invalid"));
+    }
+
+    #[cfg(not(coverage))]
     #[test]
     #[ignore = "manual QA requires the external sha256sum and sqlite3 binaries"]
     fn host_manual_qa_external_sha256sum_and_sqlite3() {

@@ -479,6 +479,8 @@ impl CredentialStore for InMemoryCredentialStore {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
     use super::*;
     use crate::contract::{Host, HostKind};
 
@@ -583,6 +585,7 @@ mod tests {
             .expect("a missing entry must not be an error");
         assert_eq!(lookup, CredentialLookup::Absent);
         assert!(!lookup.is_present());
+        assert_eq!(lookup.secret(), None);
         assert!(!store.status(&password()).expect("status").present);
     }
 
@@ -728,6 +731,226 @@ mod tests {
         assert_eq!(result.data_dir, "/home/ci/.local/share/opencode");
         assert_eq!(result.available_kib, 4_096);
         assert_eq!(result.machine_id_source, "/var/lib/dbus/machine-id");
+    }
+
+    #[test]
+    fn credentials_os_store_rejects_invalid_requests_before_opening_the_keyring() {
+        let store = OsKeyringStore;
+        let blank = CredentialRef::new("   ", CredentialKind::Password);
+
+        assert!(matches!(
+            store.store(&blank, &Secret::new(SECRET)),
+            Err(CredentialError::BlankHostId)
+        ));
+        assert!(matches!(
+            store.read(&blank),
+            Err(CredentialError::BlankHostId)
+        ));
+        assert!(matches!(
+            store.delete(&blank),
+            Err(CredentialError::BlankHostId)
+        ));
+        assert!(matches!(
+            store.store(&password(), &Secret::new("")),
+            Err(CredentialError::EmptySecret)
+        ));
+    }
+
+    #[test]
+    fn credentials_os_store_can_construct_a_namespaced_entry_without_contacting_the_service() {
+        let account = password().account();
+        assert!(
+            OsKeyringStore::entry(&account).is_ok(),
+            "constructing an AgentLens entry must not require a live secret-service session"
+        );
+    }
+
+    #[test]
+    fn credentials_keyring_errors_map_to_stable_domain_variants_without_secrets() {
+        let io_error = || {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture backend failure",
+            )) as Box<dyn std::error::Error + Send + Sync>
+        };
+        let cases = [
+            (
+                keyring::Error::NoEntry,
+                CredentialError::Unavailable {
+                    detail: "account=fixture:password 条目已消失".to_owned(),
+                },
+            ),
+            (
+                keyring::Error::BadEncoding(vec![0xff]),
+                CredentialError::BadEncoding {
+                    account: "fixture:password".to_owned(),
+                },
+            ),
+            (
+                keyring::Error::Ambiguous(Vec::new()),
+                CredentialError::Ambiguous {
+                    account: "fixture:password".to_owned(),
+                },
+            ),
+            (
+                keyring::Error::TooLong("password".to_owned(), 128),
+                CredentialError::Rejected {
+                    detail: "password 超过平台上限 128".to_owned(),
+                },
+            ),
+            (
+                keyring::Error::Invalid("service".to_owned(), "blank".to_owned()),
+                CredentialError::Rejected {
+                    detail: "service: blank".to_owned(),
+                },
+            ),
+            (
+                keyring::Error::PlatformFailure(io_error()),
+                CredentialError::Unavailable {
+                    detail: "Platform secure storage failure: fixture backend failure".to_owned(),
+                },
+            ),
+        ];
+
+        for (source, expected) in cases {
+            let mapped = map_keyring_error(source, "fixture:password");
+            assert_eq!(mapped.variant(), expected.variant());
+            assert_eq!(mapped.to_string(), expected.to_string());
+            assert!(!mapped.remediation().is_empty());
+        }
+    }
+
+    #[test]
+    fn credentials_every_error_variant_has_distinct_actionable_guidance() {
+        let cases = [
+            (CredentialError::BlankHostId, "blankHostId", "主机"),
+            (CredentialError::EmptySecret, "emptySecret", "不能为空"),
+            (
+                CredentialError::Unavailable {
+                    detail: "offline".to_owned(),
+                },
+                "unavailable",
+                "libsecret",
+            ),
+            (
+                CredentialError::Rejected {
+                    detail: "too long".to_owned(),
+                },
+                "rejected",
+                "长度",
+            ),
+            (
+                CredentialError::BadEncoding {
+                    account: "fixture".to_owned(),
+                },
+                "badEncoding",
+                "重新保存",
+            ),
+            (
+                CredentialError::Ambiguous {
+                    account: "fixture".to_owned(),
+                },
+                "ambiguous",
+                "重复",
+            ),
+        ];
+
+        let mut variants = std::collections::BTreeSet::new();
+        for (error, expected_variant, remediation_fragment) in cases {
+            assert_eq!(error.variant(), expected_variant);
+            assert!(error.remediation().contains(remediation_fragment));
+            assert!(variants.insert(error.variant()), "variants must be unique");
+        }
+    }
+
+    #[test]
+    fn credentials_failing_and_poisoned_test_stores_surface_all_read_write_paths() {
+        let failing = InMemoryCredentialStore::failing("fixture secret service unavailable");
+        assert!(matches!(
+            failing.store(&password(), &Secret::new(SECRET)),
+            Err(CredentialError::Unavailable { ref detail })
+                if detail == "fixture secret service unavailable"
+        ));
+        assert!(matches!(
+            failing.read(&password()),
+            Err(CredentialError::Unavailable { ref detail })
+                if detail == "fixture secret service unavailable"
+        ));
+        assert!(matches!(
+            failing.status(&password()),
+            Err(CredentialError::Unavailable { ref detail })
+                if detail == "fixture secret service unavailable"
+        ));
+        assert!(matches!(
+            failing.delete(&password()),
+            Err(CredentialError::Unavailable { ref detail })
+                if detail == "fixture secret service unavailable"
+        ));
+
+        let poisoned = InMemoryCredentialStore::new();
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _entries = poisoned.entries.lock().expect("lock entries");
+            panic!("poison credential store lock");
+        }));
+        assert!(panic.is_err());
+        let error = poisoned
+            .read(&password())
+            .expect_err("a poisoned fake store must fail rather than panic");
+        assert!(matches!(
+            error,
+            CredentialError::Unavailable { ref detail }
+                if detail == "in-memory credential store lock poisoned"
+        ));
+    }
+
+    #[test]
+    fn credentials_probe_maps_x86_and_preserves_discovered_home() {
+        let probe = SshProbe {
+            architecture: RemoteArchitecture::X86_64,
+            xdg_data_home: Some("/data/home/".to_owned()),
+            available_kib: 8_192,
+            machine_id_source: "/etc/machine-id".to_owned(),
+        };
+        let result = SshProbeResult::from_probe(&probe, Some("  /explicit/data  "));
+
+        assert_eq!(result.architecture, "x86_64");
+        assert_eq!(result.xdg_data_home.as_deref(), Some("/data/home/"));
+        assert_eq!(result.data_dir, "/explicit/data");
+        assert_eq!(result.available_kib, 8_192);
+    }
+
+    #[test]
+    fn credentials_canary_scanner_recurses_and_detects_plaintext_without_a_keyring() {
+        let directory = tempfile::tempdir().expect("create scan directory");
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).expect("create nested directory");
+        std::fs::write(directory.path().join("root.txt"), b"safe root")
+            .expect("write root fixture");
+        std::fs::write(nested.join("nested.txt"), b"safe nested").expect("write nested fixture");
+
+        let mut searched = Vec::new();
+        assert_no_plaintext(directory.path(), SECRET, &mut searched);
+        searched.sort();
+        assert_eq!(searched.len(), 2);
+        assert!(searched.iter().all(|path| path.is_file()));
+
+        std::fs::write(nested.join("leak.txt"), format!("prefix-{SECRET}-suffix"))
+            .expect("write leak fixture");
+        let detection = catch_unwind(AssertUnwindSafe(|| {
+            assert_no_plaintext(directory.path(), SECRET, &mut Vec::new());
+        }));
+        assert!(
+            detection.is_err(),
+            "the scanner must reject a plaintext canary"
+        );
+
+        let mut absent = Vec::new();
+        assert_no_plaintext(&directory.path().join("missing"), SECRET, &mut absent);
+        assert!(absent.is_empty());
+
+        let directories = app_directories();
+        let unique: std::collections::BTreeSet<_> = directories.iter().collect();
+        assert_eq!(unique.len(), directories.len());
     }
 
     /// Executable form of the "secrets never touch the disk" claim.

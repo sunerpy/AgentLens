@@ -18,7 +18,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -47,18 +47,36 @@ enum Mode {
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
-    match classify(&args) {
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    run_with_io(
+        &args,
+        env::var_os(CHANNEL_ENV),
+        &mut stdout.lock(),
+        &mut stderr.lock(),
+    )
+}
+
+fn run_with_io(
+    args: &[OsString],
+    channel: Option<OsString>,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> ExitCode {
+    match classify(args) {
         Some(Mode::Help) => {
-            println!("{USAGE}");
+            writeln!(stdout, "{USAGE}").expect("write askpass help");
             ExitCode::SUCCESS
         }
         Some(Mode::Version) => {
-            println!("agentlens-askpass {}", env!("CARGO_PKG_VERSION"));
+            writeln!(stdout, "agentlens-askpass {}", env!("CARGO_PKG_VERSION"))
+                .expect("write askpass version");
             ExitCode::SUCCESS
         }
-        Some(Mode::Emit) => emit(),
+        Some(Mode::Emit) => emit_to(channel, stdout, stderr),
         None => {
-            eprintln!("参数错误：本助手最多接受一个提示语参数。\n{USAGE}");
+            writeln!(stderr, "参数错误：本助手最多接受一个提示语参数。\n{USAGE}")
+                .expect("write askpass usage error");
             ExitCode::from(EXIT_USAGE)
         }
     }
@@ -84,9 +102,14 @@ fn classify(args: &[OsString]) -> Option<Mode> {
     }
 }
 
-fn emit() -> ExitCode {
-    let Some(channel) = env::var_os(CHANNEL_ENV).filter(|value| !value.is_empty()) else {
-        eprintln!(
+fn emit_to(
+    channel: Option<OsString>,
+    stdout: &mut impl io::Write,
+    stderr: &mut impl io::Write,
+) -> ExitCode {
+    let Some(channel) = channel.filter(|value| !value.is_empty()) else {
+        let _ = writeln!(
+            stderr,
             "环境变量 {CHANNEL_ENV} 未设置或为空：本助手只能由 AgentLens 经 SSH_ASKPASS 调用。"
         );
         return ExitCode::from(EXIT_CHANNEL_UNAVAILABLE);
@@ -95,24 +118,25 @@ fn emit() -> ExitCode {
     let secret = match read_channel_once(&path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            eprintln!("无法读取一次性口令通道 {}：{error}", path.display());
+            let _ = writeln!(stderr, "无法读取一次性口令通道 {}：{error}", path.display());
             return ExitCode::from(EXIT_CHANNEL_UNAVAILABLE);
         }
     };
     let trimmed = trim_trailing_newline(&secret);
     if trimmed.is_empty() {
-        eprintln!(
+        let _ = writeln!(
+            stderr,
             "一次性口令通道 {} 为空，未向 ssh 输出任何内容。",
             path.display()
         );
         return ExitCode::from(EXIT_CHANNEL_EMPTY);
     }
-    match write_secret_line(trimmed) {
+    match write_secret_line(stdout, trimmed) {
         Ok(()) => ExitCode::SUCCESS,
         // ssh 提前关闭管道时按成功退出：口令已经交付，与 agentlens-collector 的 stdout 约定一致。
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("写出口令失败：{error}");
+            let _ = writeln!(stderr, "写出口令失败：{error}");
             ExitCode::from(EXIT_CHANNEL_UNAVAILABLE)
         }
     }
@@ -123,8 +147,15 @@ fn emit() -> ExitCode {
 /// 普通文件与 FIFO 都走这条路径：对 FIFO，`fs::read` 会阻塞到写端关闭。
 /// unlink 失败不影响本次交付（口令已在内存里），但会在 stderr 提示一次性保证被削弱。
 fn read_channel_once(path: &Path) -> io::Result<Vec<u8>> {
+    read_channel_once_with(path, |channel| fs::remove_file(channel))
+}
+
+fn read_channel_once_with(
+    path: &Path,
+    remove: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
-    if let Err(error) = fs::remove_file(path) {
+    if let Err(error) = remove(path) {
         eprintln!(
             "警告：一次性口令通道 {} 删除失败（{error}），请手动清理。",
             path.display()
@@ -142,12 +173,10 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
-fn write_secret_line(secret: &[u8]) -> io::Result<()> {
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_all(secret)?;
-    handle.write_all(b"\n")?;
-    handle.flush()
+fn write_secret_line(mut writer: impl io::Write, secret: &[u8]) -> io::Result<()> {
+    writer.write_all(secret)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
 }
 
 #[cfg(test)]
@@ -188,6 +217,18 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    struct FailingWriter(io::ErrorKind);
+
+    impl io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(self.0, "injected writer failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn classify_treats_no_argument_and_prompt_as_emit() {
         assert_eq!(classify(&args(&[])), Some(Mode::Emit));
@@ -211,6 +252,49 @@ mod tests {
     fn classify_rejects_unknown_flags_and_extra_arguments() {
         assert_eq!(classify(&args(&["--channel"])), None);
         assert_eq!(classify(&args(&["prompt", "extra"])), None);
+    }
+
+    #[test]
+    fn run_with_io_renders_help_version_usage_error_and_emit_results_to_the_correct_stream() {
+        let cases = [
+            (vec!["--help"], format!("{USAGE}\n")),
+            (
+                vec!["--version"],
+                format!("agentlens-askpass {}\n", env!("CARGO_PKG_VERSION")),
+            ),
+        ];
+        for (values, expected) in cases {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = run_with_io(&args(&values), None, &mut stdout, &mut stderr);
+            assert_eq!(exit, ExitCode::SUCCESS);
+            assert_eq!(stdout, expected.as_bytes());
+            assert!(stderr.is_empty());
+        }
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run_with_io(&args(&["prompt", "extra"]), None, &mut stdout, &mut stderr);
+        assert_eq!(exit, ExitCode::from(EXIT_USAGE));
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr)
+            .expect("usage diagnostic is UTF-8")
+            .contains("最多接受一个提示语参数"));
+
+        let temp = TempDir::new();
+        let channel = temp.child("run-channel");
+        fs::write(&channel, b"through-dispatch\n").expect("write run channel");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = run_with_io(
+            &args(&["Password:"]),
+            Some(channel.into_os_string()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(stdout, b"through-dispatch\n");
+        assert!(stderr.is_empty());
     }
 
     #[test]
@@ -254,5 +338,172 @@ mod tests {
             trim_trailing_newline(&bytes),
             b"  pa$(touch /tmp/never)ss `id` \"q\" "
         );
+    }
+
+    #[test]
+    fn read_channel_once_returns_the_secret_when_unlink_fails() {
+        let temp = TempDir::new();
+        let channel = temp.child("channel");
+        fs::write(&channel, b"still-delivered").expect("write channel");
+
+        let bytes = read_channel_once_with(&channel, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected unlink failure",
+            ))
+        })
+        .expect("unlink failure must not discard an already-read secret");
+
+        assert_eq!(bytes, b"still-delivered");
+        assert!(
+            channel.exists(),
+            "injected remover leaves the channel in place"
+        );
+    }
+
+    #[test]
+    fn emit_to_delivers_exactly_one_normalized_line_and_consumes_the_channel() {
+        let temp = TempDir::new();
+        let channel = temp.child("channel");
+        fs::write(&channel, b"  exact\0secret  \r\n").expect("write channel");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let exit = emit_to(
+            Some(channel.clone().into_os_string()),
+            &mut stdout,
+            &mut stderr,
+        );
+
+        assert_eq!(exit, ExitCode::SUCCESS);
+        assert_eq!(stdout, b"  exact\0secret  \n");
+        assert!(stderr.is_empty());
+        assert!(
+            !channel.exists(),
+            "successful delivery must consume channel"
+        );
+    }
+
+    #[test]
+    fn emit_to_distinguishes_missing_unreadable_and_empty_channels_without_output() {
+        let temp = TempDir::new();
+        let missing = temp.child("missing");
+
+        for channel in [None, Some(OsString::new())] {
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let exit = emit_to(channel, &mut stdout, &mut stderr);
+            assert_eq!(exit, ExitCode::from(EXIT_CHANNEL_UNAVAILABLE));
+            assert!(stdout.is_empty());
+            assert!(String::from_utf8(stderr)
+                .expect("diagnostic is UTF-8")
+                .contains(CHANNEL_ENV));
+        }
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit = emit_to(
+            Some(missing.clone().into_os_string()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, ExitCode::from(EXIT_CHANNEL_UNAVAILABLE));
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr)
+            .expect("diagnostic is UTF-8")
+            .contains(&missing.to_string_lossy().into_owned()));
+
+        let empty = temp.child("empty");
+        fs::write(&empty, b"\r\n\n").expect("write empty channel");
+        let mut stderr = Vec::new();
+        let exit = emit_to(
+            Some(empty.clone().into_os_string()),
+            &mut stdout,
+            &mut stderr,
+        );
+        assert_eq!(exit, ExitCode::from(EXIT_CHANNEL_EMPTY));
+        assert!(stdout.is_empty());
+        assert!(String::from_utf8(stderr)
+            .expect("diagnostic is UTF-8")
+            .contains("为空"));
+        assert!(!empty.exists(), "empty channel must still be consumed");
+    }
+
+    #[test]
+    fn emit_to_treats_broken_pipe_as_delivered_but_reports_other_write_failures() {
+        for (kind, expected, diagnostic) in [
+            (io::ErrorKind::BrokenPipe, ExitCode::SUCCESS, false),
+            (
+                io::ErrorKind::PermissionDenied,
+                ExitCode::from(EXIT_CHANNEL_UNAVAILABLE),
+                true,
+            ),
+        ] {
+            let temp = TempDir::new();
+            let channel = temp.child("channel");
+            fs::write(&channel, b"secret").expect("write channel");
+            let mut stdout = FailingWriter(kind);
+            let mut stderr = Vec::new();
+
+            let exit = emit_to(
+                Some(channel.clone().into_os_string()),
+                &mut stdout,
+                &mut stderr,
+            );
+
+            assert_eq!(exit, expected);
+            assert_eq!(!stderr.is_empty(), diagnostic);
+            assert!(
+                !channel.exists(),
+                "write failure occurs after channel consumption"
+            );
+        }
+    }
+
+    #[test]
+    fn write_secret_line_propagates_failures_from_secret_newline_and_flush() {
+        #[derive(Default)]
+        struct ScriptedWriter {
+            calls: usize,
+            fail_on: usize,
+            bytes: Vec<u8>,
+        }
+
+        impl io::Write for ScriptedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls == self.fail_on {
+                    return Err(io::Error::other("injected write failure"));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                self.calls += 1;
+                if self.calls == self.fail_on {
+                    Err(io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        for fail_on in 1..=3 {
+            let mut writer = ScriptedWriter {
+                fail_on,
+                ..ScriptedWriter::default()
+            };
+            let error = write_secret_line(&mut writer, b"secret")
+                .expect_err("each output stage must propagate its failure");
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+        }
+
+        let mut writer = ScriptedWriter {
+            fail_on: 4,
+            ..ScriptedWriter::default()
+        };
+        write_secret_line(&mut writer, b"secret").expect("all output stages succeed");
+        assert_eq!(writer.bytes, b"secret\n");
     }
 }

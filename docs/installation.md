@@ -1,6 +1,6 @@
 # Installation
 
-[← README](../README.md) · [简体中文](readme/installation.zh.md)
+[← README](readme/README.en.md) · [简体中文](readme/installation.zh.md)
 
 ## One-line installer
 

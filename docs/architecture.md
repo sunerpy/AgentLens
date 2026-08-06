@@ -1,6 +1,6 @@
 # Architecture
 
-[← README](../README.md) · [简体中文](readme/architecture.zh.md)
+[← README](readme/README.en.md) · [简体中文](readme/architecture.zh.md)
 
 ## Components
 

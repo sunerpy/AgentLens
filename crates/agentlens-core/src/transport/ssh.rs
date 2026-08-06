@@ -1522,18 +1522,12 @@ mod tests {
     use std::io;
     #[cfg(unix)]
     use std::io::{self, Write as _};
-    // Gate matches the consumers, not the platform family: only `install_success_stub` and
-    // `run_local_script` take a `&Path`, and both are `cfg(target_os = "linux")`. Everything
-    // else here is a `PathBuf` or a `temp.path().join(..)`. `unix` or `any(unix, windows)`
-    // leaves this unused on macOS and Windows -> `error: unused import` under `-D warnings`.
-    #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::path::PathBuf;
     #[cfg(any(unix, windows))]
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    #[cfg(unix)]
     use std::time::Duration;
 
     use base64::Engine as _;
@@ -1670,6 +1664,348 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
             .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)));
     }
 
+    #[test]
+    fn ssh_tool_pairs_artifacts_and_probe_aliases_preserve_platform_contracts() {
+        let error = SshTools::new("/opt/a/ssh", "/opt/b/scp")
+            .expect_err("ssh and scp from different directories must be rejected");
+        assert!(matches!(error, SshError::InvalidInput { .. }));
+
+        let temp = tempfile::tempdir().expect("tool tempdir");
+        let ssh_name = if cfg!(windows) { "ssh.exe" } else { "ssh" };
+        let scp_name = if cfg!(windows) { "scp.exe" } else { "scp" };
+        fs::write(temp.path().join(ssh_name), b"fixture ssh").expect("write ssh fixture");
+        fs::write(temp.path().join(scp_name), b"fixture scp").expect("write scp fixture");
+        let paired = tools_in_directory(temp.path()).expect("complete pair is discoverable");
+        assert_eq!(paired.ssh, temp.path().join(ssh_name));
+        assert_eq!(paired.scp, temp.path().join(scp_name));
+        fs::remove_file(temp.path().join(scp_name)).expect("remove scp fixture");
+        assert!(tools_in_directory(temp.path()).is_none());
+
+        let artifacts = CollectorArtifacts::default()
+            .with_x86_64("/fixtures/collector-x86_64")
+            .with_aarch64("/fixtures/collector-aarch64");
+        let probe = parse_probe(
+            b"AGENTLENS_ARCH=arm64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=42\nAGENTLENS_MACHINE_ID_SOURCE=/var/lib/dbus/machine-id\n",
+            &artifacts,
+        )
+        .expect("arm64 alias with matching artifact");
+        assert_eq!(probe.architecture, RemoteArchitecture::Aarch64);
+        assert_eq!(probe.xdg_data_home, None);
+        assert_eq!(probe.available_kib, 42);
+        assert_eq!(probe.machine_id_source, "/var/lib/dbus/machine-id");
+        assert_eq!(architecture_name(probe.architecture), "aarch64");
+        assert_eq!(architecture_name(RemoteArchitecture::X86_64), "x86_64");
+        assert_eq!(
+            artifacts.available_names(),
+            vec!["x86_64".to_owned(), "aarch64".to_owned()]
+        );
+    }
+
+    #[test]
+    fn ssh_probe_parser_rejects_each_corrupt_or_incomplete_fact() {
+        type ProbeErrorMatcher = fn(&SshError) -> bool;
+
+        let artifacts = CollectorArtifacts::default().with_x86_64("/fixtures/collector");
+        let cases: &[(&[u8], ProbeErrorMatcher)] = &[
+            (&[0xff], |error| {
+                matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("UTF-8"))
+            }),
+            (
+                b"AGENTLENS_ARCH=x86_64\0\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("控制字符")),
+            ),
+            (
+                b"AGENTLENS_ARCH=riscv64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                |error| matches!(error, SshError::ArchMismatch { remote_arch, .. } if remote_arch == "riscv64"),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=many\nAGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("不是整数")),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\nAGENTLENS_MACHINE_ID_SOURCE=\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("machine-id")),
+            ),
+            (
+                b"AGENTLENS_ARCH=x86_64\nAGENTLENS_XDG_DATA_HOME=\nAGENTLENS_AVAILABLE_KIB=1\n",
+                |error| matches!(error, SshError::InvalidResponse { detail, .. } if detail.contains("缺少 AGENTLENS_MACHINE_ID_SOURCE")),
+            ),
+        ];
+
+        for (bytes, expected) in cases {
+            let error = parse_probe(bytes, &artifacts).expect_err("invalid probe must fail");
+            assert!(expected(&error), "unexpected probe error: {error:?}");
+        }
+
+        let missing_artifact = parse_probe(PROBE_X86_64.as_bytes(), &CollectorArtifacts::default())
+            .expect_err("known architecture without artifact must fail");
+        assert!(matches!(missing_artifact, SshError::ArchMismatch { .. }));
+    }
+
+    #[test]
+    fn ssh_payload_workdir_and_ndjson_validation_rejects_malformed_bytes() {
+        let negative = encode_collect_payload(&CollectPayload {
+            since: -1,
+            data_dir: None,
+            snapshot: false,
+        })
+        .expect_err("negative cursor is invalid");
+        assert!(matches!(negative, SshError::InvalidInput { .. }));
+
+        let malformed_base64 = decode_collect_payload("A").expect_err("invalid base64 length");
+        assert!(matches!(
+            malformed_base64,
+            SshError::InvalidInput { ref detail } if detail.contains("base64url")
+        ));
+        assert_eq!(assemble_script("printf fixture"), b"printf fixture\n");
+
+        let bad_workdir = parse_workdir(&[0xff]).expect_err("workdir must be UTF-8");
+        assert!(matches!(bad_workdir, SshError::NoWritableCache { .. }));
+        let missing_artifact = sha256_file(Path::new("/definitely/absent/agentlens-collector"))
+            .expect_err("missing collector cannot be hashed");
+        assert!(matches!(missing_artifact, SshError::InvalidInput { .. }));
+
+        for (bytes, detail) in [
+            (vec![0xff], "UTF-8"),
+            (b"not-json\n".to_vec(), "meta 行不是 JSON"),
+            (b"{}\n".to_vec(), "meta 行缺少 v1"),
+            (format!("{META_LINE}not-json\n").into_bytes(), "record 行 2"),
+        ] {
+            let error = validate_ndjson(&bytes).expect_err("malformed NDJSON must fail");
+            assert!(
+                matches!(error, SshError::InvalidResponse { detail: ref actual, .. } if actual.contains(detail)),
+                "unexpected NDJSON error for {detail}: {error:?}"
+            );
+        }
+
+        let with_blank_record = format!("{META_LINE}\n{{\"messageId\":\"ok\"}}\n");
+        validate_ndjson(with_blank_record.as_bytes()).expect("blank record lines are ignored");
+    }
+
+    #[test]
+    fn ssh_startup_stage_transfer_and_gc_failures_keep_typed_stage_context() {
+        let runner = FakeRunner::default();
+        runner.push(CommandStage::StartupProbe, 9, "", "unsupported client");
+        let (_temp, artifacts) = artifact();
+        let error = match transport(&runner, artifacts) {
+            Ok(_) => panic!("non-zero ssh -V must disable the transport"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SshError::SshUnavailable { .. }));
+
+        let runner = FakeRunner::default();
+        push_startup(&runner);
+        runner.push(CommandStage::Stage1, 9, "", "probe exploded");
+        let (_temp, artifacts) = artifact();
+        let stage1_transport = transport(&runner, artifacts).expect("construct transport");
+        let error = stage1_transport
+            .collect(&request())
+            .expect_err("stage1 non-zero must fail");
+        assert!(matches!(
+            error,
+            SshError::Runner {
+                stage: CommandStage::Stage1,
+                ..
+            }
+        ));
+
+        for (stage3, expected) in [
+            (Err(io::Error::other("scp spawn failed")), "runner"),
+            (
+                Ok(CommandOutput {
+                    status: 255,
+                    stdout: Vec::new(),
+                    stderr: b"Authentication failed".to_vec(),
+                }),
+                "auth",
+            ),
+            (
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: Vec::new(),
+                    stderr: b"disk full".to_vec(),
+                }),
+                "transfer",
+            ),
+        ] {
+            let runner = FakeRunner::default();
+            push_startup(&runner);
+            runner.push(CommandStage::Stage1, 0, PROBE_X86_64, "");
+            runner.push(CommandStage::Stage2, 0, REMOTE_RUN_DIR, "");
+            runner
+                .responses
+                .lock()
+                .expect("response lock")
+                .push_back(FakeResponse {
+                    expected_stage: CommandStage::Stage3,
+                    result: stage3,
+                });
+            let (_temp, artifacts) = artifact();
+            let transport = transport(&runner, artifacts).expect("construct transport");
+            let error = transport.collect(&request()).expect_err("stage3 must fail");
+            match expected {
+                "runner" => assert!(matches!(
+                    error,
+                    SshError::Runner {
+                        stage: CommandStage::Stage3,
+                        ..
+                    }
+                )),
+                "auth" => assert!(matches!(error, SshError::AuthFailed { .. })),
+                "transfer" => assert!(matches!(error, SshError::TransferCorrupted { .. })),
+                _ => unreachable!(),
+            }
+        }
+
+        let runner = FakeRunner::default();
+        push_startup(&runner);
+        runner.push(CommandStage::Stage1, 0, PROBE_X86_64, "");
+        runner.push(CommandStage::Stage2, 0, REMOTE_RUN_DIR, "");
+        runner.push(CommandStage::Stage3, 0, "", "");
+        runner.push(CommandStage::Stage3, 0, "", "");
+        runner.push(CommandStage::Stage4, 9, "", "collector failed");
+        let (_temp, artifacts) = artifact();
+        let stage4_transport = transport(&runner, artifacts).expect("construct transport");
+        let error = stage4_transport
+            .collect(&request())
+            .expect_err("generic stage4 failure");
+        assert!(matches!(
+            error,
+            SshError::Runner {
+                stage: CommandStage::Stage4,
+                ..
+            }
+        ));
+
+        let runner = FakeRunner::default();
+        push_startup(&runner);
+        runner.push(CommandStage::Stage1, 0, PROBE_X86_64, "");
+        runner.push(CommandStage::Stage2, 0, REMOTE_RUN_DIR, "");
+        runner.push(CommandStage::Stage3, 0, "", "");
+        runner.push(CommandStage::Stage3, 0, "", "");
+        runner.push(CommandStage::Stage4, 0, META_LINE, "");
+        runner.push(CommandStage::Gc, 9, "", "find failed");
+        let (_temp, artifacts) = artifact();
+        let transport = transport(&runner, artifacts).expect("construct transport");
+        let error = transport
+            .collect(&request())
+            .expect_err("GC failure must be visible");
+        assert!(matches!(
+            error,
+            SshError::Runner {
+                stage: CommandStage::Gc,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ssh_cancellation_timeout_and_runner_errors_map_without_losing_context() {
+        let runner = FakeRunner::default();
+        let command = CommandSpec {
+            stage: CommandStage::Stage1,
+            program: PathBuf::from("unused-while-cancelled"),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            stdin: Vec::new(),
+            detached: false,
+        };
+        let error = runner
+            .run_with_cancel(&command, &|| true)
+            .expect_err("pre-start cancellation must not invoke the runner");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(runner.commands().is_empty());
+
+        let timeout = Duration::from_millis(321);
+        let timed_out = map_process_error(
+            CommandStage::Stage2,
+            io::Error::new(io::ErrorKind::TimedOut, "deadline"),
+            Some(timeout),
+        );
+        assert!(matches!(
+            timed_out,
+            SshError::TimedOut {
+                stage: CommandStage::Stage2,
+                timeout_ms: 321,
+                ..
+            }
+        ));
+        let cancelled = map_process_error(
+            CommandStage::Stage4,
+            io::Error::new(io::ErrorKind::Interrupted, "cancelled"),
+            None,
+        );
+        assert!(matches!(cancelled, SshError::ClientCancelled));
+        let runner_error =
+            map_process_error(CommandStage::Gc, io::Error::other("spawn failed"), None);
+        assert!(matches!(
+            runner_error,
+            SshError::Runner {
+                stage: CommandStage::Gc,
+                ..
+            }
+        ));
+
+        let attached = attach_timeout(
+            SshError::TimedOut {
+                stage: CommandStage::StartupProbe,
+                timeout_ms: 0,
+                detail: "shared deadline".into(),
+            },
+            timeout,
+        );
+        assert!(matches!(
+            attached,
+            SshError::TimedOut {
+                timeout_ms: 321,
+                ..
+            }
+        ));
+        let unchanged = attach_timeout(SshError::ClientCancelled, timeout);
+        assert!(matches!(unchanged, SshError::ClientCancelled));
+
+        let blank = output_detail(&CommandOutput {
+            status: 17,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+        assert_eq!(blank, "exit 17 且无输出");
+        assert!(is_auth_failure(&CommandOutput {
+            status: 255,
+            stdout: Vec::new(),
+            stderr: b"No supported authentication methods available".to_vec(),
+        }));
+        assert!(!is_auth_failure(&CommandOutput {
+            status: 1,
+            stdout: Vec::new(),
+            stderr: b"Permission denied".to_vec(),
+        }));
+
+        for error in [
+            SshError::TimedOut {
+                stage: CommandStage::Stage1,
+                timeout_ms: 1,
+                detail: "timeout".into(),
+            },
+            SshError::SshUnavailable {
+                detail: "missing".into(),
+            },
+            SshError::InvalidInput {
+                detail: "bad input".into(),
+            },
+            SshError::InvalidResponse {
+                stage: CommandStage::Stage4,
+                detail: "bad output".into(),
+            },
+            SshError::Runner {
+                stage: CommandStage::Stage3,
+                detail: "spawn".into(),
+            },
+        ] {
+            assert_chinese_remediation(&error);
+        }
+    }
+
     #[cfg(unix)]
     fn local_shell_spec(script: &str) -> CommandSpec {
         CommandSpec {
@@ -1691,6 +2027,34 @@ AGENTLENS_MACHINE_ID_SOURCE=/etc/machine-id\n";
         let error = runner.run(&spec).expect_err("stalled child must time out");
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn std_runner_without_timeout_frames_stdin_and_detaches_successfully() {
+        let mut spec = local_shell_spec("IFS= read -r line; printf 'seen:%s' \"$line\"");
+        spec.stdin = b"payload line\n".to_vec();
+        spec.detached = true;
+
+        let output = StdCommandRunner
+            .run(&spec)
+            .expect("unbounded detached command must complete");
+
+        assert_eq!(output.status, 0);
+        assert_eq!(output.stdout, b"seen:payload line");
+        assert!(output.stderr.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_runner_with_exhausted_budget_refuses_to_spawn() {
+        let runner = StdCommandRunner::with_timeout(Duration::ZERO);
+        let error = runner
+            .run(&local_shell_spec("printf should-not-run"))
+            .expect_err("zero shared budget must fail before spawn");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("before process start"));
     }
 
     #[cfg(unix)]
