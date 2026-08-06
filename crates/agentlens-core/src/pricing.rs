@@ -15,6 +15,7 @@ use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,10 @@ const TOKENS_PER_MTOK: f64 = 1_000_000.0;
 const READ_MAX_ATTEMPTS: usize = 8;
 const READ_RETRY_DELAY: Duration = Duration::from_millis(1);
 const READ_RETRY_LIMIT: Duration = Duration::from_millis(20);
+/// Serializes in-process replacements against readers so Windows never has to open the destination
+/// while another thread is moving a temporary file over it. The bounded retry below remains
+/// necessary for replacements performed by another AgentLens process.
+static PRICES_IO_LOCK: RwLock<()> = RwLock::new(());
 
 /// Document version understood by this build.
 ///
@@ -503,6 +508,9 @@ impl PriceTable {
     /// [`PriceTable::load_or_empty`] to keep running with estimation disabled instead.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        let _read_guard = PRICES_IO_LOCK
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Self::load_with_reader(path, |path| fs::read(path), thread::sleep)
     }
 
@@ -589,6 +597,9 @@ impl PriceTable {
         let mut body = serde_json::to_string_pretty(self)
             .map_err(|source| PricingError::Serialize { source })?;
         body.push('\n');
+        let _write_guard = PRICES_IO_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         write_atomically(path.as_ref(), body.as_bytes())
     }
 
