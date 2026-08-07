@@ -15,13 +15,20 @@ import { mockCalls, openShell, qaScreenshot } from './harness'
  * `zh.nav` instead of retyped, because a second hand-written copy of the copy is exactly
  * what let the 下钻 → 用量分析 rename ship with a red suite.
  */
-const NAV_KEYS = ['overview', 'drilldown', 'detail', 'hosts', 'settings'] as const
+const NAV_KEYS = [
+  'overview',
+  'drilldown',
+  'detail',
+  'hosts',
+  'settings',
+  'diagnostics',
+] as const
 const NAV = NAV_KEYS.map((key) => ({ key, label: zh.nav[key] }))
 
-test('shell renders all five navigation tabs and switches views', async ({ page }) => {
+test('shell renders every navigation tab and switches views', async ({ page }) => {
   await openShell(page)
 
-  // A sixth dictionary entry must not be able to appear without a case here.
+  // A seventh dictionary entry must not be able to appear without a case here.
   expect(Object.keys(zh.nav)).toEqual([...NAV_KEYS])
 
   await expect(page.getByRole('heading', { name: 'AgentLens' })).toBeVisible()

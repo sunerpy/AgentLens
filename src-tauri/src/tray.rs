@@ -100,7 +100,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         builder = builder.icon(icon.clone());
     }
     builder.build(app)?;
-    println!("agentlens: tray icon installed (open / refresh / quit)");
+    tracing::info!("tray icon installed (open / refresh / quit)");
     Ok(())
 }
 
@@ -112,10 +112,10 @@ pub fn handle_window_event(window: &Window, event: &WindowEvent) {
         }
         api.prevent_close();
         if let Err(error) = window.hide() {
-            eprintln!("agentlens: failed to hide the main window: {error}");
+            tracing::error!(%error, "failed to hide the main window");
             return;
         }
-        println!("agentlens: main window hidden to tray (webview kept alive)");
+        tracing::info!("main window hidden to tray (webview kept alive)");
     }
 }
 
@@ -135,10 +135,7 @@ fn refresh_all_hosts(app: &AppHandle) {
     };
     for (host_id, outcome) in outcomes {
         if let Err(error) = outcome {
-            eprintln!(
-                "agentlens: tray refresh for {host_id} failed: {}",
-                error.message
-            );
+            tracing::error!(host_id = %host_id, message = %error.message, "tray refresh failed");
         }
     }
 }
@@ -173,7 +170,7 @@ pub fn publish_archive_location(state: &AppState) {
     let mut archive = match state.lock_archive() {
         Ok(archive) => archive,
         Err(error) => {
-            eprintln!("agentlens: archive unavailable: {}", error.message);
+            tracing::error!(message = %error.message, "archive unavailable");
             return;
         }
     };
@@ -183,7 +180,7 @@ pub fn publish_archive_location(state: &AppState) {
         archive.path().display().to_string(),
     );
     if let Err(error) = write_app_settings(archive.connection_mut(), &values) {
-        eprintln!("agentlens: failed to publish the archive location: {error}");
+        tracing::error!(%error, "failed to publish the archive location");
     }
 }
 
@@ -212,7 +209,7 @@ pub fn apply_refresh_intervals(state: &AppState) {
     {
         Ok(settings) => settings,
         Err(error) => {
-            eprintln!("agentlens: unable to read persisted refresh intervals: {error}");
+            tracing::error!(%error, "unable to read persisted refresh intervals");
             return;
         }
     };
@@ -236,10 +233,7 @@ pub fn apply_refresh_intervals(state: &AppState) {
             .with_trigger(status.trigger)
             .with_min_interval_ms(interval_ms);
         if let Err(error) = scheduler.set_schedule(&status.host_id, schedule) {
-            eprintln!(
-                "agentlens: unable to apply interval to {}: {error}",
-                status.host_id
-            );
+            tracing::warn!(host_id = %status.host_id, %error, "unable to apply refresh interval");
         }
     }
 }

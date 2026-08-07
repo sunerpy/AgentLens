@@ -29,6 +29,16 @@ dirs = "6"
 thiserror = "2"
 base64 = "0.23"
 tempfile = "3"
+tracing = "0.1"
+# `ansi` 被刻意关掉：日志落文件，转义序列只会让日志查看页显示乱码。
+# `json` 让每条记录是一行自描述 JSON —— 日志查看页要按 level 过滤，靠正则切
+# 人类可读格式迟早在消息里带括号时切错。`env-filter` 提供 `RUST_LOG`。
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "json",
+  "env-filter",
+  "std",
+] }
 
 # Release profile 参照 cc-switch（github.com/farion1231/cc-switch @ 4317bd9
 # src-tauri/Cargo.toml#L108-114）。刻意保留 panic = "unwind"：

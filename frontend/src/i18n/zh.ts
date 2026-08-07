@@ -26,6 +26,7 @@ export const zh = {
     detail: '明细',
     hosts: '主机',
     settings: '设置',
+    diagnostics: '日志',
   },
 
   /**
@@ -497,5 +498,56 @@ export const zh = {
     save: '保存设置',
     saved: '设置已保存',
     dirty: '有未保存的修改',
+  },
+
+  /**
+   * 日志与反馈视图。
+   *
+   * 反馈文案刻意不提供「把日志贴进 issue」的按钮：日志正文可能带主机名、SSH 目标与绝对
+   * 路径，自动脱敏是黑名单，漏一条就永久公开在公共 issue 里。预填只带构建与平台常量，
+   * 日志片段由用户自己复制他看过的内容。
+   */
+  diagnostics: {
+    title: '日志与反馈',
+    subtitle: '桌面壳的运行日志，以及带环境信息的问题反馈入口',
+
+    logs: {
+      title: '运行日志',
+      description: '按时间倒序，最新在最上；桌面壳没有控制台，出错信息只在这里',
+      refresh: '刷新',
+      levelLabel: '级别',
+      levelAll: '全部',
+      copy: '复制当前列表',
+      copied: '已复制',
+      copyFailed: '复制失败；请手动选中日志文本后复制',
+      openDirectory: '打开日志目录',
+      directoryLabel: '日志目录',
+      retention: '单文件上限 2 MiB，最多保留 3 个文件（合计不超过 6 MiB），超出后最旧的自动删除',
+      empty: '暂无日志记录；桌面壳一旦记录内容就会出现在这里',
+      emptyFiltered: '当前级别没有记录',
+      count: '条记录',
+      /** 与 openUnsupported 的区别见 zh.settings.archive。 */
+      openUnsupported: '当前环境不是桌面壳，无法调用文件管理器；请复制目录路径后手动打开',
+      openFailed: '系统未能打开文件管理器；请复制目录路径后手动打开',
+      envHint: '需要更详细的日志时，设置 RUST_LOG=debug 后重启应用',
+    },
+
+    feedback: {
+      title: '问题反馈',
+      description: '在 GitHub 上新建 issue，预填应用版本与平台信息',
+      open: '去 GitHub 提交反馈',
+      openUnsupported: '当前环境不是桌面壳，无法调用浏览器；请复制链接后手动打开',
+      openFailed: '系统未能打开浏览器；请复制链接后手动打开',
+      copyLink: '复制反馈链接',
+      copied: '已复制',
+      environmentTitle: '将随反馈一起提交的环境信息',
+      privacyNotice:
+        '预填内容只有下面这几项，不含主机地址、用户名、机器标识哈希、归档路径或任何凭据。日志片段请自行复制你确认过的内容后粘贴。',
+      appVersion: '应用版本',
+      os: '操作系统',
+      arch: '架构',
+      webview: 'WebView 版本',
+      webviewUnknown: '未知',
+    },
   },
 } as const

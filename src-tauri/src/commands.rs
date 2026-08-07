@@ -32,6 +32,9 @@ use crate::credentials::{
     CredentialError, CredentialKind, CredentialRef, CredentialStatus, CredentialStore,
     LocalIdentity, OsKeyringStore, Secret, SshProbeInput, SshProbeResult,
 };
+use crate::logging::{
+    diagnostics_snapshot, read_recent, DiagnosticsReport, LogTail, LOG_TAIL_DEFAULT_LIMIT,
+};
 use crate::state::AppState;
 
 pub type IpcResult<T> = Result<T, IpcError>;
@@ -385,7 +388,7 @@ pub async fn trigger_refresh<R: Runtime>(
     with_state("trigger_refresh", app, move |state: &AppState| {
         state.trigger_refresh_with_events(&host_id, |event| {
             if let Err(error) = on_event.send(event) {
-                eprintln!("agentlens: unable to send refresh progress: {error}");
+                tracing::debug!(%error, "unable to send refresh progress");
             }
         })
     })
@@ -677,6 +680,36 @@ pub(crate) fn credential_delete_impl(
     store.status(&reference).map_err(credential_error)
 }
 
+/// Newest log records, for the diagnostics view.
+///
+/// Reads at most [`LOG_TAIL_MAX_LIMIT`] entries and never the whole file: a rotated
+/// generation is 2 MiB, and shipping that over IPC to render 500 visible rows would stall
+/// the webview for no benefit.
+#[tauri::command]
+pub async fn logs_tail<R: Runtime>(app: AppHandle<R>, limit: Option<u32>) -> IpcResult<LogTail> {
+    on_blocking_pool("logs_tail", move || {
+        let directory = app
+            .path()
+            .app_log_dir()
+            .map_err(|error| IpcError::new(IpcErrorCode::Internal, error.to_string()))?;
+        let limit = limit
+            .map(|value| value as usize)
+            .unwrap_or(LOG_TAIL_DEFAULT_LIMIT);
+        Ok(read_recent(&directory, limit))
+    })
+    .await
+}
+
+/// Environment facts for a bug report.
+///
+/// Deliberately carries no hostname, user name, machine-id hash, archive path or credential:
+/// its output is meant to be pasted into a public issue tracker, so identifying data must not
+/// be able to reach it. See [`crate::logging::DiagnosticsReport`].
+#[tauri::command]
+pub async fn diagnostics_report() -> IpcResult<DiagnosticsReport> {
+    on_blocking_pool("diagnostics_report", || Ok(diagnostics_snapshot())).await
+}
+
 fn optional_path(value: Option<&str>) -> Option<PathBuf> {
     value
         .map(str::trim)
@@ -827,7 +860,7 @@ fn database_error(error: impl std::fmt::Display) -> IpcError {
 }
 
 #[cfg(test)]
-pub const REGISTERED_COMMANDS: [&str; 22] = [
+pub const REGISTERED_COMMANDS: [&str; 24] = [
     "get_summary",
     "get_trend",
     "get_breakdown",
@@ -850,6 +883,8 @@ pub const REGISTERED_COMMANDS: [&str; 22] = [
     "credential_set",
     "credential_status",
     "credential_delete",
+    "logs_tail",
+    "diagnostics_report",
 ];
 
 #[cfg(test)]
@@ -908,12 +943,49 @@ mod tests {
 
     #[test]
     fn registered_command_surface_is_complete_and_stable() {
-        assert_eq!(REGISTERED_COMMANDS.len(), 22);
+        assert_eq!(REGISTERED_COMMANDS.len(), 24);
         assert!(REGISTERED_COMMANDS.contains(&"query_messages"));
         assert!(REGISTERED_COMMANDS.contains(&"trigger_refresh"));
         assert!(REGISTERED_COMMANDS.contains(&"price_catalog_get"));
         assert!(REGISTERED_COMMANDS.contains(&"prices_set"));
         assert!(REGISTERED_COMMANDS.contains(&"ssh_probe_cancel"));
+        assert!(REGISTERED_COMMANDS.contains(&"logs_tail"));
+        assert!(REGISTERED_COMMANDS.contains(&"diagnostics_report"));
+    }
+
+    #[test]
+    fn logs_tail_shell_resolves_the_tauri_log_directory() {
+        let (_data_dir, app) = mock_app();
+
+        let tail = tauri::async_runtime::block_on(logs_tail(app.clone(), Some(10)))
+            .expect("logs_tail must resolve the app log directory");
+
+        let expected = app
+            .path()
+            .app_log_dir()
+            .expect("mock runtime resolves a log directory");
+        assert_eq!(tail.directory, expected.display().to_string());
+        assert!(tail.entries.len() <= 10);
+    }
+
+    #[test]
+    fn logs_tail_without_a_limit_falls_back_to_the_default() {
+        let (_data_dir, app) = mock_app();
+
+        let tail = tauri::async_runtime::block_on(logs_tail(app, None))
+            .expect("logs_tail must accept an absent limit");
+
+        assert!(tail.entries.len() <= LOG_TAIL_DEFAULT_LIMIT);
+    }
+
+    #[test]
+    fn diagnostics_report_shell_returns_only_publishable_environment_facts() {
+        let report = tauri::async_runtime::block_on(diagnostics_report())
+            .expect("diagnostics_report has no failure path");
+
+        assert_eq!(report.app_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(report.os, std::env::consts::OS);
+        assert_eq!(report.arch, std::env::consts::ARCH);
     }
 
     #[test]
@@ -1329,13 +1401,15 @@ mod tests {
         assert_command_is_async!(credential_set, (String, CredentialKind, String));
         assert_command_is_async!(credential_status, (String, CredentialKind));
         assert_command_is_async!(credential_delete, (String, CredentialKind));
+        assert_command_is_async!(logs_tail, (AppHandle, Option<u32>));
+        assert_command_is_async!(diagnostics_report, ());
 
         // `ssh_probe_cancel` is the deliberate exception: pure in-memory, and it must not queue
         // behind the blocking-pool task it exists to cancel. This binding pins that choice, so
         // making it `async` breaks the build just as loudly as un-asyncing the rest.
         let _: fn(String) -> IpcResult<()> = ssh_probe_cancel;
 
-        assert_eq!(REGISTERED_COMMANDS.len(), 22);
+        assert_eq!(REGISTERED_COMMANDS.len(), 24);
     }
 
     #[test]

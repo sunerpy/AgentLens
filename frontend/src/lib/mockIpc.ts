@@ -55,8 +55,11 @@ import type {
   BreakdownRow,
   CostTotals,
   CoverageStatus,
+  DiagnosticsReport,
   Host,
   IpcError,
+  LogEntry,
+  LogTail,
   MessagePage,
   MessageRow,
   PriceCatalog,
@@ -110,6 +113,8 @@ export interface MockIpcDataset {
   settings: AppSettings
   priceCatalog: PriceCatalog
   prices: PriceTable
+  logs: LogTail
+  diagnostics: DiagnosticsReport
 }
 
 export interface MockIpcConfig {
@@ -504,6 +509,57 @@ const PRICE_CATALOG: PriceCatalog = {
   ],
 }
 
+/**
+ * Log seed — one record per level, newest last so `logs_tail`'s newest-first contract is
+ * assertable, plus a WARN whose message contains a colon and a brace to prove the viewer does
+ * not re-split an already-parsed record.
+ */
+const LOG_ENTRIES: LogEntry[] = [
+  {
+    timestamp: '2026-08-07T09:58:01.004+08:00',
+    level: 'trace',
+    target: 'agentlens_tauri_lib::state',
+    message: 'scheduler tick admitted 0 actions',
+  },
+  {
+    timestamp: '2026-08-07T09:58:02.117+08:00',
+    level: 'debug',
+    target: 'agentlens_tauri_lib::commands',
+    message: 'unable to send refresh progress: channel closed',
+  },
+  {
+    timestamp: '2026-08-07T09:58:03.220+08:00',
+    level: 'info',
+    target: 'agentlens_tauri_lib::tray',
+    message: 'tray icon installed (open / refresh / quit)',
+  },
+  {
+    timestamp: '2026-08-07T09:58:04.331+08:00',
+    level: 'warn',
+    target: 'agentlens_tauri_lib::tray',
+    message: 'unable to apply refresh interval: {clamped: 300000}',
+  },
+  {
+    timestamp: '2026-08-07T09:58:05.442+08:00',
+    level: 'error',
+    target: 'agentlens_tauri_lib::tray',
+    message: 'archive unavailable: database is locked',
+  },
+]
+
+const LOGS: LogTail = {
+  directory: '/home/mock/.local/share/top.onethinker.agentlens/logs',
+  entries: [...LOG_ENTRIES].reverse(),
+  empty: false,
+}
+
+const DIAGNOSTICS: DiagnosticsReport = {
+  appVersion: '0.1.0',
+  os: 'linux',
+  arch: 'x86_64',
+  webviewVersion: '2.48.1',
+}
+
 /** Deep-ish clone so a mutating consumer can never corrupt the shared seed. */
 function cloneDataset(dataset: MockIpcDataset): MockIpcDataset {
   return structuredClone(dataset)
@@ -520,6 +576,8 @@ export function mockDataset(): MockIpcDataset {
     settings: SETTINGS,
     priceCatalog: PRICE_CATALOG,
     prices: PRICES,
+    logs: LOGS,
+    diagnostics: DIAGNOSTICS,
   })
 }
 
@@ -702,6 +760,12 @@ const HANDLERS: Record<IpcCommand, (state: MockState, args: Record<string, unkno
     state.dataset.prices = args.prices as PriceTable
     return state.dataset.prices
   },
+  logs_tail: (state, args) => {
+    const limit = asNumber(args.limit, state.dataset.logs.entries.length)
+    const entries = state.dataset.logs.entries.slice(0, Math.max(1, limit))
+    return { ...state.dataset.logs, entries, empty: entries.length === 0 }
+  },
+  diagnostics_report: (state) => state.dataset.diagnostics,
 }
 
 function isIpcCommand(command: string): command is IpcCommand {

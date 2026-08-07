@@ -17,6 +17,8 @@ use crate::contract::{
 use crate::credentials::{
     CredentialKind, CredentialRef, CredentialStatus, LocalIdentity, SshProbeInput, SshProbeResult,
 };
+#[cfg(all(test, feature = "ts-export"))]
+use crate::logging::{DiagnosticsReport, LogEntry, LogLevel, LogTail};
 
 #[cfg(all(test, feature = "ts-export"))]
 pub(crate) fn export_all(output_dir: &Path) -> Result<(), ts_rs::ExportError> {
@@ -60,6 +62,10 @@ pub(crate) fn export_all(output_dir: &Path) -> Result<(), ts_rs::ExportError> {
     export::<SshProbeInput>(output_dir)?;
     export::<SshProbeResult>(output_dir)?;
     export::<LocalIdentity>(output_dir)?;
+    export::<LogLevel>(output_dir)?;
+    export::<LogEntry>(output_dir)?;
+    export::<LogTail>(output_dir)?;
+    export::<DiagnosticsReport>(output_dir)?;
     Ok(())
 }
 
@@ -76,7 +82,7 @@ mod tests {
 
     use super::*;
 
-    const TYPE_NAMES: [&str; 40] = [
+    const TYPE_NAMES: [&str; 44] = [
         "IpcErrorCode",
         "IpcError",
         "WeekStart",
@@ -117,6 +123,10 @@ mod tests {
         "SshProbeInput",
         "SshProbeResult",
         "LocalIdentity",
+        "LogLevel",
+        "LogEntry",
+        "LogTail",
+        "DiagnosticsReport",
     ];
 
     #[test]

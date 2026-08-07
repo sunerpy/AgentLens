@@ -34,6 +34,8 @@ chrono = { workspace = true }
 chrono-tz = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 ts-rs = { version = "=11.0.1", optional = true, features = ["serde-json-impl"] }
 # OS 钥匙串（口令/passphrase 唯一落地点，绝不写配置文件）。
 # 默认 feature 会退化成进程内 mock store —— 那等于"看起来通过"的假绿灯，

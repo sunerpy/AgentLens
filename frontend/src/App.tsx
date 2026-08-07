@@ -1,5 +1,5 @@
 /**
- * Application shell: header, navigation and the mount point for the five views.
+ * Application shell: header, navigation and the mount point for the views.
  *
  * Owner: W8 prep (shell/infrastructure). Todos 15-19 must NOT edit this file; each owns
  * only its own `src/views/<view>/**` directory and `zh.<view>` dictionary section.
@@ -15,6 +15,7 @@ import type { ViewKey } from '@/app/views'
 import { AppErrorBoundary } from '@/components/app-error-boundary'
 import { zh } from '@/i18n/zh'
 import { DetailView } from '@/views/detail/DetailView'
+import { DiagnosticsView } from '@/views/diagnostics/DiagnosticsView'
 import { DrilldownView } from '@/views/drilldown/DrilldownView'
 import { HostsView } from '@/views/hosts/HostsView'
 import { OverviewView } from '@/views/overview/OverviewView'
@@ -26,6 +27,7 @@ const VIEWS: Record<ViewKey, () => JSX.Element> = {
   detail: DetailView,
   hosts: HostsView,
   settings: SettingsView,
+  diagnostics: DiagnosticsView,
 }
 
 function App() {
