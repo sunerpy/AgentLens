@@ -208,24 +208,34 @@ export function AddSshHostForm({ onCreated }: { onCreated: (host: Host) => void 
               onChange={(event) => patch('dataDir')(event.target.value)}
             />
           </HostField>
-          <HostField
-            id="add-host-machine-id"
-            label={zh.hosts.add.machineIdHash}
-            hint={
-              probedTarget === null
-                ? zh.hosts.add.machineIdHashHint
-                : zh.hosts.add.machineIdHashFilled
-            }
-          >
-            <input
+          {/*
+            跨满两栏。这个字段承载 64 位十六进制摘要，在 text-sm 等宽字体下约需 550px，
+            超过两栏网格分给单列的宽度 —— 900px 视口下实测末尾字符被输入框右边缘裁掉，
+            而它的用途正是让操作者核对机器身份，看不全等于核对不了。其余字段是短输入
+            （显示名、用户名、路径），并排合适；这一个是探测结果展示，性质不同。
+            包一层 div 而不给 HostField 加 className prop：HostField 被 6 处共用，
+            为一个字段改共用组件的 API 不划算。
+          */}
+          <div className="sm:col-span-2">
+            <HostField
               id="add-host-machine-id"
-              data-testid="add-host-machine-id"
-              className={`${CONTROL_CLASS} font-mono read-only:bg-muted read-only:text-muted-foreground`}
-              value={form.machineIdHash}
-              readOnly={probedTarget !== null}
-              onChange={(event) => patch('machineIdHash')(event.target.value)}
-            />
-          </HostField>
+              label={zh.hosts.add.machineIdHash}
+              hint={
+                probedTarget === null
+                  ? zh.hosts.add.machineIdHashHint
+                  : zh.hosts.add.machineIdHashFilled
+              }
+            >
+              <input
+                id="add-host-machine-id"
+                data-testid="add-host-machine-id"
+                className={`${CONTROL_CLASS} font-mono read-only:bg-muted read-only:text-muted-foreground`}
+                value={form.machineIdHash}
+                readOnly={probedTarget !== null}
+                onChange={(event) => patch('machineIdHash')(event.target.value)}
+              />
+            </HostField>
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">

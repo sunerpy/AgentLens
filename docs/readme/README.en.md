@@ -71,8 +71,8 @@ source builds: [../installation.md](../installation.md).
 1. Install, then launch **AgentLens**.
 2. Open Host Management. The local machine self-registers on first open, with no
    configuration.
-3. Add an SSH host, run Test Connection, copy the reported machine-id hash back
-   into the form, then save.
+3. Add an SSH host and run Test Connection. The machine-id hash is filled in from
+   the probe result and turns read-only, so just save.
 4. Press refresh on the host card to collect.
 
 Step by step, including the machine-id de-duplication rule and how the collector
