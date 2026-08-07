@@ -20,12 +20,12 @@ use agentlens_core::transport::ssh::{
 };
 use chrono::NaiveDate;
 use serde_json::Value;
-use tauri::{AppHandle, Manager, Runtime};
+use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
 
 use crate::contract::{
     AggregateFilters, AppSettings, BreakdownDimensions, BreakdownRow, DateRange, DetailFilters,
     Granularity, Host, HostCreateInput, HostKind, HostUpdateInput, IpcError, IpcErrorCode,
-    MessageFilters, MessagePage, PriceTable, SeriesPoint, SourceStatus, Summary,
+    MessageFilters, MessagePage, PriceTable, RefreshEvent, SeriesPoint, SourceStatus, Summary,
     TriggerRefreshResult,
 };
 use crate::credentials::{
@@ -380,9 +380,14 @@ pub(crate) fn hosts_delete_impl(state: &AppState, host_id: &str) -> IpcResult<()
 pub async fn trigger_refresh<R: Runtime>(
     app: AppHandle<R>,
     host_id: String,
+    on_event: Channel<RefreshEvent>,
 ) -> IpcResult<TriggerRefreshResult> {
     with_state("trigger_refresh", app, move |state: &AppState| {
-        state.trigger_refresh(&host_id)
+        state.trigger_refresh_with_events(&host_id, |event| {
+            if let Err(error) = on_event.send(event) {
+                eprintln!("agentlens: unable to send refresh progress: {error}");
+            }
+        })
     })
     .await
 }
@@ -803,8 +808,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
 
+    use agentlens_core::host::HostKind as CoreHostKind;
+    use agentlens_core::hostsource::{SourceSchedule, TriggerMode};
     use agentlens_core::transport::ssh::CommandStage;
     use serde_json::json;
+    use tauri::ipc::{Channel, InvokeResponseBody};
     use tempfile::TempDir;
 
     use super::*;
@@ -1172,7 +1180,7 @@ mod tests {
         assert_command_is_async!(hosts_create, (AppHandle, HostCreateInput));
         assert_command_is_async!(hosts_update, (AppHandle, HostUpdateInput));
         assert_command_is_async!(hosts_delete, (AppHandle, String));
-        assert_command_is_async!(trigger_refresh, (AppHandle, String));
+        assert_command_is_async!(trigger_refresh, (AppHandle, String, Channel<RefreshEvent>));
         assert_command_is_async!(get_refresh_status, (AppHandle));
         assert_command_is_async!(get_settings, (AppHandle));
         assert_command_is_async!(set_settings, (AppHandle, AppSettings));
@@ -1273,9 +1281,13 @@ mod tests {
             1
         );
         assert_eq!(
-            block_on(trigger_refresh(app.clone(), "   ".to_owned()))
-                .expect_err("a blank host id must fail in the worker")
-                .code,
+            block_on(trigger_refresh(
+                app.clone(),
+                "   ".to_owned(),
+                Channel::new(|_| Ok(())),
+            ))
+            .expect_err("a blank host id must fail in the worker")
+            .code,
             IpcErrorCode::InvalidInput
         );
         block_on(hosts_delete(app.clone(), created.host_id.clone())).expect("delete host");
@@ -1354,6 +1366,58 @@ mod tests {
         assert_eq!(
             block_on(prices_get(app.clone())).expect("read prices back"),
             prices
+        );
+    }
+
+    #[test]
+    fn refresh_channel_delivers_ordered_statuses_and_finishes_the_stream() {
+        use std::sync::Arc;
+
+        use tauri::async_runtime::block_on;
+
+        let (_data_dir, app) = mock_app();
+        app.state::<AppState>()
+            .register_host(SourceRegistration {
+                host_id: "stream-host".to_owned(),
+                display_name: "Stream fixture".to_owned(),
+                kind: CoreHostKind::Local,
+                schedule: SourceSchedule::for_kind(CoreHostKind::Local)
+                    .with_trigger(TriggerMode::Manual),
+            })
+            .expect("register stream fixture");
+
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let received = Arc::clone(&events);
+        let channel = Channel::<RefreshEvent>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("refresh events must use the JSON channel body")
+            };
+            received
+                .lock()
+                .expect("lock received refresh events")
+                .push(serde_json::from_str(&json).expect("decode refresh event"));
+            Ok(())
+        });
+
+        let result = block_on(trigger_refresh(app, "stream-host".to_owned(), channel))
+            .expect("trigger refresh through the async channel command");
+        assert!(matches!(
+            result,
+            TriggerRefreshResult::Started { ref host_id, .. } if host_id == "stream-host"
+        ));
+
+        let events = events.lock().expect("lock final refresh events");
+        let event_names = events
+            .iter()
+            .map(|event| event["event"].as_str().expect("tagged refresh event"))
+            .collect::<Vec<_>>();
+        assert_eq!(event_names, ["started", "finished"]);
+        assert_eq!(events[0]["data"]["status"]["state"]["state"], "running");
+        assert_eq!(events[1]["data"]["status"]["state"]["state"], "error");
+        assert_eq!(
+            event_names.iter().position(|event| *event == "finished"),
+            Some(event_names.len() - 1),
+            "Finished must be terminal: no channel message may follow it"
         );
     }
 

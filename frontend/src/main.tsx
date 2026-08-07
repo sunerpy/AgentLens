@@ -6,6 +6,7 @@ import './index.css'
 import App from './App.tsx'
 import { subscribeArchiveCommits } from '@/lib/archiveQueries'
 import { isIpcError } from '@/lib/ipc'
+import { subscribeRefreshCompletions } from '@/lib/refreshQueries'
 
 /**
  * Desktop-tuned TanStack Query defaults.
@@ -45,6 +46,7 @@ async function bootstrap() {
   // App-level and never torn down: the automatic scheduler tick commits while no view is
   // watching, so a per-view subscription would miss it — which is what DEFECT-2 was.
   void subscribeArchiveCommits(queryClient)
+  void subscribeRefreshCompletions(queryClient)
 
   createRoot(document.getElementById('root')!).render(
     <StrictMode>

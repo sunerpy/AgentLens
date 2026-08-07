@@ -59,6 +59,7 @@ import type {
   MessagePage,
   MessageRow,
   PriceTable,
+  RefreshEvent,
   SeriesPoint,
   SourceStatus,
   Summary,
@@ -87,6 +88,7 @@ type MockEventHandler = (event: { event: string; id: number; payload: unknown })
 
 interface MockEventListener {
   event: string
+  callbackId: number
   handler: MockEventHandler
 }
 
@@ -479,6 +481,7 @@ function notFound(kind: string, id: string): IpcError {
 /** Mutable box so `set_settings` / `prices_set` can behave like real writes. */
 interface MockState {
   dataset: MockIpcDataset
+  sendChannel(channel: unknown, message: RefreshEvent): void
 }
 
 /**
@@ -501,12 +504,40 @@ const HANDLERS: Record<IpcCommand, (state: MockState, args: Record<string, unkno
   hosts_create: (state, args) => ({ ...state.dataset.hosts[0], ...(args.input as object) }),
   hosts_update: (state, args) => ({ ...state.dataset.hosts[0], ...(args.input as object) }),
   hosts_delete: () => null,
-  trigger_refresh: (_state, args) =>
-    ({
+  trigger_refresh: (state, args) => {
+    const hostId = String(args.hostId)
+    const current = state.dataset.refreshStatus.find((status) => status.hostId === hostId)
+    if (current === undefined) throw notFound('refresh source', hostId)
+
+    const started: SourceStatus = { ...current, state: { state: 'running' } }
+    state.dataset.refreshStatus = state.dataset.refreshStatus.map((status) =>
+      status.hostId === hostId ? started : status,
+    )
+    state.sendChannel(args.onEvent, { event: 'started', data: { status: started } })
+
+    const finishedAt = BASE_UTC_MS + 7 * DAY_MS
+    const finished: SourceStatus = {
+      ...started,
+      state: { state: 'idle' },
+      lastError: null,
+      lastSuccessUtc: finishedAt,
+      lastCompletedUtc: finishedAt,
+      interrupted: false,
+    }
+    state.dataset.refreshStatus = state.dataset.refreshStatus.map((status) =>
+      status.hostId === hostId ? finished : status,
+    )
+    state.sendChannel(args.onEvent, {
+      event: 'finished',
+      data: { hostId, status: finished },
+    })
+
+    return {
       outcome: 'started',
-      host_id: String(args.hostId),
-      started_at_utc: BASE_UTC_MS + 7 * DAY_MS,
-    }) satisfies TriggerRefreshResult,
+      host_id: hostId,
+      started_at_utc: finishedAt,
+    } satisfies TriggerRefreshResult
+  },
   get_refresh_status: (state) => state.dataset.refreshStatus,
   get_settings: (state) => state.dataset.settings,
   set_settings: (state, args) => {
@@ -527,7 +558,6 @@ function isIpcCommand(command: string): command is IpcCommand {
 
 export function installMockIpc(config: MockIpcConfig = {}): MockIpcController {
   const merged: MockIpcConfig = { ...window[MOCK_IPC_CONFIG_GLOBAL], ...config }
-  const state: MockState = { dataset: { ...mockDataset(), ...merged.dataset } }
   const responses = new Map<string, unknown>(Object.entries(merged.responses ?? {}))
   const errors = new Map<string, IpcError>(
     Object.entries(merged.errors ?? {}) as [string, IpcError][],
@@ -536,6 +566,58 @@ export function installMockIpc(config: MockIpcConfig = {}): MockIpcController {
 
   const listeners = new Map<number, MockEventListener>()
   let lastListenerId = 0
+  const callbacks = new Map<number, { handler: (payload: unknown) => void; once: boolean }>()
+  let lastCallbackId = 0
+  const channelIndexes = new Map<number, number>()
+
+  const transformCallback = (callback: unknown, once = false): number => {
+    lastCallbackId += 1
+    if (typeof callback === 'function') {
+      callbacks.set(lastCallbackId, {
+        handler: callback as (payload: unknown) => void,
+        once,
+      })
+    }
+    return lastCallbackId
+  }
+
+  const runCallback = (callbackId: number, payload: unknown) => {
+    const callback = callbacks.get(callbackId)
+    if (callback === undefined) return
+    callback.handler(payload)
+    if (callback.once) callbacks.delete(callbackId)
+  }
+
+  const channelId = (channel: unknown): number | null => {
+    const serialized =
+      typeof channel === 'string'
+        ? channel
+        : typeof channel === 'object' && channel !== null && 'toJSON' in channel
+          ? String((channel as { toJSON(): unknown }).toJSON())
+          : ''
+    const match = /^__CHANNEL__:(\d+)$/.exec(serialized)
+    return match === null ? null : Number(match[1])
+  }
+
+  const sendChannel = (channel: unknown, message: RefreshEvent) => {
+    const callbackId = channelId(channel)
+    if (callbackId === null) return
+    const index = channelIndexes.get(callbackId) ?? 0
+    channelIndexes.set(callbackId, index + 1)
+    runCallback(callbackId, { index, message })
+  }
+
+  const endChannel = (channel: unknown) => {
+    const callbackId = channelId(channel)
+    if (callbackId === null) return
+    runCallback(callbackId, { end: true, index: channelIndexes.get(callbackId) ?? 0 })
+    channelIndexes.delete(callbackId)
+  }
+
+  const state: MockState = {
+    dataset: { ...mockDataset(), ...merged.dataset },
+    sendChannel,
+  }
 
   /**
    * The only removal path, shared by `plugin:event|unlisten` and by the event plugin global
@@ -543,6 +625,8 @@ export function installMockIpc(config: MockIpcConfig = {}): MockIpcController {
    * mock kept two registries they could disagree about who is still subscribed.
    */
   const unregisterListener = (eventId: number) => {
+    const listener = listeners.get(eventId)
+    if (listener !== undefined) callbacks.delete(listener.callbackId)
     listeners.delete(eventId)
   }
 
@@ -552,10 +636,13 @@ export function installMockIpc(config: MockIpcConfig = {}): MockIpcController {
     // DataCloneError on a function.
     if (command === EVENT_LISTEN_COMMAND) {
       lastListenerId += 1
-      if (typeof args.handler === 'function') {
+      const callbackId = asNumber(args.handler, -1)
+      const callback = callbacks.get(callbackId)?.handler
+      if (callback !== undefined) {
         listeners.set(lastListenerId, {
           event: String(args.event),
-          handler: args.handler as MockEventHandler,
+          callbackId,
+          handler: callback as MockEventHandler,
         })
       }
       return lastListenerId
@@ -565,28 +652,33 @@ export function installMockIpc(config: MockIpcConfig = {}): MockIpcController {
       return null
     }
 
-    calls.push({ index: calls.length, command, args: structuredClone(args) })
-    const forcedError = errors.get(command)
-    if (forcedError !== undefined) {
-      throw forcedError
+    calls.push({ index: calls.length, command, args: JSON.parse(JSON.stringify(args)) })
+    try {
+      const forcedError = errors.get(command)
+      if (forcedError !== undefined) {
+        throw forcedError
+      }
+      if (responses.has(command)) {
+        return responses.get(command)
+      }
+      if (!isIpcCommand(command)) {
+        throw {
+          code: 'internal',
+          message: `mock IPC has no handler for command "${command}"`,
+          fields: { command },
+        } satisfies IpcError
+      }
+      return HANDLERS[command](state, args)
+    } finally {
+      if (command === 'trigger_refresh') endChannel(args.onEvent)
     }
-    if (responses.has(command)) {
-      return responses.get(command)
-    }
-    if (!isIpcCommand(command)) {
-      throw {
-        code: 'internal',
-        message: `mock IPC has no handler for command "${command}"`,
-        fields: { command },
-      } satisfies IpcError
-    }
-    return HANDLERS[command](state, args)
   }
 
   const internals = {
     invoke,
-    transformCallback: (callback: unknown) => callback,
-    unregisterCallback: () => undefined,
+    transformCallback,
+    runCallback,
+    unregisterCallback: (callbackId: number) => callbacks.delete(callbackId),
     convertFileSrc: (filePath: string) => filePath,
     metadata: { currentWindow: { label: 'main' }, currentWebview: { label: 'main' } },
     plugins: {},

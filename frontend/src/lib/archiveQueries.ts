@@ -21,6 +21,8 @@
 import type { QueryClient } from '@tanstack/react-query'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 
+import { invalidateRefreshStatusQueries } from './refreshQueries'
+
 /** First segment of every archive-derived query key. */
 export const ARCHIVE_QUERY_KEY_ROOT = 'archive'
 
@@ -62,6 +64,7 @@ export async function subscribeArchiveCommits(client: QueryClient): Promise<Unli
   try {
     return await listen(ARCHIVE_COMMITTED_EVENT, () => {
       void invalidateArchiveQueries(client)
+      void invalidateRefreshStatusQueries(client)
     })
   } catch {
     return null

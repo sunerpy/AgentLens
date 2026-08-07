@@ -15,7 +15,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import type { TriggerRefreshResult } from '@/generated'
+import type { RefreshEvent, TriggerRefreshResult } from '@/generated'
 import { zh } from '@/i18n/zh'
 import { invalidateArchiveQueries } from '@/lib/archiveQueries'
 import { hostsDelete, triggerRefresh } from '@/lib/ipc'
@@ -36,10 +36,12 @@ function HostRow({
   row,
   selected,
   onSelect,
+  onRefreshEvent,
 }: {
   row: HostRowModel
   selected: boolean
   onSelect: (hostId: string) => void
+  onRefreshEvent: (event: RefreshEvent) => void
 }) {
   const queryClient = useQueryClient()
   const { host, status } = row
@@ -52,13 +54,9 @@ function HostRow({
     await queryClient.invalidateQueries({ queryKey: REFRESH_STATUS_QUERY_KEY })
   }
 
-  // `started` means in flight, not committed, so this is only the optimistic half of the
-  // dashboard refresh; the authoritative one is the `archive-committed` event `main.tsx`
-  // subscribes to. Host removal stays out: it deletes the hosts row, never archived usage.
   const refresh = useMutation<TriggerRefreshResult, unknown, void>({
-    mutationFn: () => triggerRefresh(host.hostId),
+    mutationFn: () => triggerRefresh(host.hostId, onRefreshEvent),
     onSuccess: async () => {
-      await invalidate()
       await invalidateArchiveQueries(queryClient)
     },
   })
@@ -170,10 +168,12 @@ export function HostList({
   rows,
   selectedHostId,
   onSelect,
+  onRefreshEvent,
 }: {
   rows: readonly HostRowModel[]
   selectedHostId: string | null
   onSelect: (hostId: string) => void
+  onRefreshEvent: (event: RefreshEvent) => void
 }) {
   return (
     <Card data-testid="host-list">
@@ -197,6 +197,7 @@ export function HostList({
                 row={row}
                 selected={row.host.hostId === selectedHostId}
                 onSelect={onSelect}
+                onRefreshEvent={onRefreshEvent}
               />
             ))}
           </ul>

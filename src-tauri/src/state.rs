@@ -18,7 +18,7 @@ use agentlens_core::transport::ssh::{
 
 use tauri::{AppHandle, Emitter};
 
-use crate::contract::{IpcError, IpcErrorCode, TriggerRefreshResult};
+use crate::contract::{IpcError, IpcErrorCode, RefreshEvent, SourceStatus, TriggerRefreshResult};
 
 /// Emitted to the webview after a refresh round commits new rows.
 ///
@@ -30,6 +30,8 @@ use crate::contract::{IpcError, IpcErrorCode, TriggerRefreshResult};
 /// The literal is duplicated in TypeScript on purpose — an event name is a wire string, not a
 /// ts-rs DTO — so each side names the other in a comment.
 pub const EVENT_ARCHIVE_COMMITTED: &str = "agentlens://archive-committed";
+
+pub const EVENT_REFRESH_COMPLETED: &str = "agentlens://refresh-completed";
 
 /// True when a finished round actually wrote something the aggregates can see.
 ///
@@ -159,6 +161,51 @@ impl AppState {
     }
 
     pub(crate) fn trigger_refresh(&self, host_id: &str) -> Result<TriggerRefreshResult, IpcError> {
+        let outcome = self.admit_manual_refresh(host_id)?;
+        match outcome {
+            TriggerOutcome::Started(action) => {
+                let response = started_response(&action);
+                drop(self.spawn_action(action));
+                Ok(response)
+            }
+            other => TriggerRefreshResult::try_from(other),
+        }
+    }
+
+    /// Runs one manually admitted round inline and reports its lifecycle to the command channel.
+    ///
+    /// The caller is already on Tauri's blocking pool. Keeping execution here, rather than
+    /// spawning another detached thread, keeps the channel scoped to its invoke and guarantees
+    /// that dropping the command argument closes the stream only after `Finished` was sent.
+    pub(crate) fn trigger_refresh_with_events(
+        &self,
+        host_id: &str,
+        mut on_event: impl FnMut(RefreshEvent),
+    ) -> Result<TriggerRefreshResult, IpcError> {
+        let outcome = self.admit_manual_refresh(host_id)?;
+        let TriggerOutcome::Started(action) = outcome else {
+            return TriggerRefreshResult::try_from(outcome);
+        };
+
+        let response = started_response(&action);
+        let started = self.refresh_status(&action.host_id)?.ok_or_else(|| {
+            IpcError::new(
+                IpcErrorCode::Internal,
+                "refresh source disappeared immediately after admission",
+            )
+            .with_field("hostId", &action.host_id)
+        })?;
+        on_event(RefreshEvent::Started { status: started });
+
+        let host_id = action.host_id.clone();
+        self.execute_action(action);
+        let status = self.refresh_status(&host_id)?;
+        on_event(RefreshEvent::Finished { host_id, status });
+
+        Ok(response)
+    }
+
+    fn admit_manual_refresh(&self, host_id: &str) -> Result<TriggerOutcome, IpcError> {
         if host_id.trim().is_empty() {
             return Err(IpcError::invalid_input(
                 "hostId",
@@ -166,18 +213,11 @@ impl AppState {
             ));
         }
         let now = SystemClock.now_utc_ms();
-        let outcome = self.lock_scheduler()?.trigger_manual(host_id, now);
-        match outcome {
-            TriggerOutcome::Started(action) => {
-                let response = TriggerRefreshResult::Started {
-                    host_id: action.host_id.clone(),
-                    started_at_utc: action.started_at_utc,
-                };
-                drop(self.spawn_action(action));
-                Ok(response)
-            }
-            other => TriggerRefreshResult::try_from(other),
-        }
+        Ok(self.lock_scheduler()?.trigger_manual(host_id, now))
+    }
+
+    fn refresh_status(&self, host_id: &str) -> Result<Option<SourceStatus>, IpcError> {
+        Ok(self.lock_scheduler()?.status(host_id).map(Into::into))
     }
 
     pub(crate) fn register_host(&self, registration: SourceRegistration) -> Result<(), IpcError> {
@@ -207,6 +247,22 @@ impl AppState {
             Arc::clone(&self.app_handle),
             action,
         )
+    }
+
+    fn execute_action(&self, action: RefreshAction) {
+        RefreshRuntime {
+            archive_path: self.archive_path.clone(),
+            scheduler: Arc::clone(&self.scheduler),
+            app_handle: Arc::clone(&self.app_handle),
+        }
+        .execute(action);
+    }
+}
+
+fn started_response(action: &RefreshAction) -> TriggerRefreshResult {
+    TriggerRefreshResult::Started {
+        host_id: action.host_id.clone(),
+        started_at_utc: action.started_at_utc,
     }
 }
 
@@ -254,6 +310,21 @@ struct RefreshRuntime {
 
 impl RefreshRuntime {
     fn execute(self, action: RefreshAction) {
+        let app_handle = Arc::clone(&self.app_handle);
+        self.execute_with_completion_notifier(action, move |host_id| {
+            if let Some(app) = app_handle.get() {
+                if let Err(error) = app.emit(EVENT_REFRESH_COMPLETED, host_id.to_owned()) {
+                    eprintln!("agentlens: unable to announce the completed round: {error}");
+                }
+            }
+        });
+    }
+
+    fn execute_with_completion_notifier(
+        self,
+        action: RefreshAction,
+        notify_completed: impl FnOnce(&str),
+    ) {
         let clock = SystemClock;
         let report = self.execute_round(&clock, &action);
         let changed = round_changed_archive(&report);
@@ -269,6 +340,7 @@ impl RefreshRuntime {
                 }
             }
         }
+        notify_completed(&action.host_id);
     }
 
     fn execute_round(&self, clock: &SystemClock, action: &RefreshAction) -> RoundReport {
@@ -716,6 +788,37 @@ mod tests {
         let (_data_dir, state) = state();
         let missing_host = execute(state.archive_path.clone(), "missing-from-registry");
         assert_eq!(missing_host, "host disappeared before refresh started");
+    }
+
+    #[test]
+    fn refresh_runtime_announces_completion_when_a_round_changes_no_archive_rows() {
+        let directory = tempfile::tempdir().expect("create missing archive parent");
+        let scheduler = Arc::new(Mutex::new(RefreshScheduler::new()));
+        scheduler
+            .lock()
+            .expect("lock scheduler")
+            .register(manual_registration("unchanged-host"))
+            .expect("register source");
+        let action = match scheduler
+            .lock()
+            .expect("lock scheduler")
+            .trigger_manual("unchanged-host", 100)
+        {
+            TriggerOutcome::Started(action) => action,
+            outcome => panic!("unexpected trigger outcome: {outcome:?}"),
+        };
+        let mut completed_hosts = Vec::new();
+
+        RefreshRuntime {
+            archive_path: directory.path().join("missing.sqlite3"),
+            scheduler,
+            app_handle: Arc::new(OnceLock::new()),
+        }
+        .execute_with_completion_notifier(action, |host_id| {
+            completed_hosts.push(host_id.to_owned());
+        });
+
+        assert_eq!(completed_hosts, ["unchanged-host"]);
     }
 
     #[test]

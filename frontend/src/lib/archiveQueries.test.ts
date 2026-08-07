@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 
-import { QueryClient } from '@tanstack/react-query'
+import { QueryClient, QueryObserver } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 /**
@@ -29,6 +29,7 @@ const {
   invalidateArchiveQueries,
   subscribeArchiveCommits,
 } = await import('./archiveQueries')
+const { REFRESH_STATUS_QUERY_KEY } = await import('./queryKeys')
 
 /** 与 `src/lib/ipc.ts` 里四个聚合读一一对应的 key 形态。 */
 const AGGREGATE_KEYS = [
@@ -188,6 +189,28 @@ describe('archiveQueries/subscribeArchiveCommits', () => {
     await Promise.resolve()
 
     expect(invalidatedKeys(client)).toEqual(AGGREGATE_KEYS.map((key) => JSON.stringify(key)).sort())
+  })
+
+  it('归档提交后会重取已挂载的刷新状态，即使该查询永久新鲜', async () => {
+    let handler: (() => void) | undefined
+    listen.mockImplementation(async (_event: unknown, callback: () => void) => {
+      handler = callback
+      return () => undefined
+    })
+    const fetchStatus = vi.fn().mockResolvedValue([{ hostId: 'local-host-000001' }])
+    const observer = new QueryObserver(client, {
+      queryKey: REFRESH_STATUS_QUERY_KEY,
+      queryFn: fetchStatus,
+      staleTime: Infinity,
+    })
+    const unsubscribe = observer.subscribe(() => undefined)
+
+    await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(1))
+    await subscribeArchiveCommits(client)
+    handler?.()
+
+    await vi.waitFor(() => expect(fetchStatus).toHaveBeenCalledTimes(2))
+    unsubscribe()
   })
 
   it('拿不到 Tauri 事件桥时返回 null，不让纯浏览器预览启动失败', async () => {

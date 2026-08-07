@@ -480,9 +480,23 @@ test('a manual refresh renders alreadyRunning distinctly instead of silently doi
 test('a started refresh reads differently from alreadyRunning', async ({ page }) => {
   await openHosts(page)
 
-  await page.getByTestId('host-refresh-local-host-000001').click()
+  const statusReads = (await mockCalls(page, 'get_refresh_status')).length
+  await expect(page.getByTestId('host-row-ssh-host-0000002')).toHaveAttribute(
+    'data-host-state',
+    'error',
+  )
 
-  await expect(page.getByTestId('host-refresh-outcome-local-host-000001')).toHaveText('已开始刷新')
+  await page.getByTestId('host-refresh-ssh-host-0000002').click()
+
+  await expect(page.getByTestId('host-refresh-outcome-ssh-host-0000002')).toHaveText('已开始刷新')
+  await expect(page.getByTestId('host-row-ssh-host-0000002')).toHaveAttribute(
+    'data-host-state',
+    'idle',
+  )
+  expect(await mockCalls(page, 'get_refresh_status')).toHaveLength(statusReads)
+  expect(await mockCalls(page, 'trigger_refresh')).toMatchObject([
+    { args: { hostId: 'ssh-host-0000002', onEvent: expect.stringMatching(/^__CHANNEL__:/) } },
+  ])
 })
 
 test('adding a host refetches the list and deleting one removes the row', async ({ page }) => {
