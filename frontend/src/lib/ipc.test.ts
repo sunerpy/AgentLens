@@ -323,9 +323,13 @@ describe('ipc/主机与刷新的实参名', () => {
 })
 
 describe('ipc/设置与价格的实参名', () => {
-  it('get_settings / prices_get 不带载荷', async () => {
+  it('get_settings / price_catalog_get / prices_get 不带载荷', async () => {
     await ipc.getSettings()
     expect(callShape().command).toBe('get_settings')
+    invoke.mockReset()
+    invoke.mockResolvedValue(undefined)
+    await ipc.priceCatalogGet()
+    expect(callShape().command).toBe('price_catalog_get')
     invoke.mockReset()
     invoke.mockResolvedValue(undefined)
     await ipc.pricesGet()
@@ -399,9 +403,9 @@ describe('ipc/主机视图侧的五个命令（hostsIpc）', () => {
 })
 
 describe('ipc/命令清单与 Rust 注册表一致', () => {
-  it('IPC_COMMANDS 恰好是 15 个且无重复', () => {
-    expect(ipc.IPC_COMMANDS).toHaveLength(15)
-    expect(new Set(ipc.IPC_COMMANDS).size).toBe(15)
+  it('IPC_COMMANDS 恰好是 16 个且无重复', () => {
+    expect(ipc.IPC_COMMANDS).toHaveLength(16)
+    expect(new Set(ipc.IPC_COMMANDS).size).toBe(16)
   })
 
   /**

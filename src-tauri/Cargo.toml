@@ -25,6 +25,9 @@ tauri-build = { version = "2", features = [] }
 agentlens-core = { workspace = true }
 # tray-icon：托盘常驻能力（托盘行为本身由后续 todo 实现，此处仅启用 feature）
 tauri = { version = "2", features = ["tray-icon"] }
+# opener：唯一「在系统文件管理器里定位归档库」的通道。只用 reveal_item_in_dir —— 它不受
+# scope 约束（scope 只作用于 open_url / open_path），因此 capability 里不需要路径白名单。
+tauri-plugin-opener = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

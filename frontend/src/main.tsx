@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import './index.css'
 import App from './App.tsx'
 import { subscribeArchiveCommits } from '@/lib/archiveQueries'
+import { installContextMenuGuard } from '@/lib/contextMenuGuard'
 import { isIpcError } from '@/lib/ipc'
 import { subscribeRefreshCompletions } from '@/lib/refreshQueries'
 
@@ -35,6 +36,11 @@ const queryClient = new QueryClient({
 })
 
 async function bootstrap() {
+  // Installed before the first paint so Chromium's page menu ("Reload" discards the whole
+  // React tree mid-refresh) is never reachable. Editable fields keep their native menu —
+  // `@/lib/contextMenuGuard` explains why that exemption is mandatory.
+  installContextMenuGuard()
+
   // Dev-only: `?mockIpc=1` swaps in the mock IPC layer before the first render so
   // Playwright specs run against vite dev with no Tauri process. Statically dead in
   // production builds, so `mockIpc.ts` never reaches the shipped bundle.

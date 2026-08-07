@@ -8,9 +8,10 @@ use ts_rs::TS;
 use crate::contract::{
     AggregateFilters, AppSettings, BreakdownDimensions, BreakdownRow, CostTotals, CoverageStatus,
     DateRange, DetailCost, DetailFilters, Granularity, Host, HostCreateInput, HostKind,
-    HostUpdateInput, IpcError, IpcErrorCode, MessageFilters, MessagePage, MessageRow, PriceEntry,
-    PriceTable, RefreshEvent, SeriesPoint, SourceState, SourceStatus, Summary, TimeBucket,
-    TokenValues, TriggerMode, TriggerRefreshResult, WeekStart,
+    HostUpdateInput, IpcError, IpcErrorCode, MessageFilters, MessagePage, MessageRow,
+    ObservedModelPrice, PriceCatalog, PriceEntry, PriceMatchKind, PriceTable, RefreshEvent,
+    SeriesPoint, SourceState, SourceStatus, Summary, TimeBucket, TokenValues, TriggerMode,
+    TriggerRefreshResult, WeekStart,
 };
 #[cfg(all(test, feature = "ts-export"))]
 use crate::credentials::{
@@ -50,6 +51,9 @@ pub(crate) fn export_all(output_dir: &Path) -> Result<(), ts_rs::ExportError> {
     export::<AppSettings>(output_dir)?;
     export::<PriceEntry>(output_dir)?;
     export::<PriceTable>(output_dir)?;
+    export::<PriceMatchKind>(output_dir)?;
+    export::<ObservedModelPrice>(output_dir)?;
+    export::<PriceCatalog>(output_dir)?;
     export::<CredentialKind>(output_dir)?;
     export::<CredentialRef>(output_dir)?;
     export::<CredentialStatus>(output_dir)?;
@@ -72,7 +76,7 @@ mod tests {
 
     use super::*;
 
-    const TYPE_NAMES: [&str; 37] = [
+    const TYPE_NAMES: [&str; 40] = [
         "IpcErrorCode",
         "IpcError",
         "WeekStart",
@@ -104,6 +108,9 @@ mod tests {
         "AppSettings",
         "PriceEntry",
         "PriceTable",
+        "PriceMatchKind",
+        "ObservedModelPrice",
+        "PriceCatalog",
         "CredentialKind",
         "CredentialRef",
         "CredentialStatus",

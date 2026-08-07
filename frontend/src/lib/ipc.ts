@@ -31,6 +31,7 @@ import type {
   IpcErrorCode,
   MessageFilters,
   MessagePage,
+  PriceCatalog,
   PriceTable,
   RefreshEvent,
   SeriesPoint,
@@ -39,7 +40,6 @@ import type {
   TriggerRefreshResult,
 } from '@/generated'
 
-/** The 15 commands registered in `src-tauri/src/lib.rs`. */
 export const IPC_COMMANDS = [
   'get_summary',
   'get_trend',
@@ -54,6 +54,7 @@ export const IPC_COMMANDS = [
   'get_refresh_status',
   'get_settings',
   'set_settings',
+  'price_catalog_get',
   'prices_get',
   'prices_set',
 ] as const
@@ -191,6 +192,10 @@ export function getSettings(): Promise<AppSettings> {
 /** Upsert-merge: keys absent from `settings.values` are left untouched by the backend. */
 export function setSettings(settings: AppSettings): Promise<AppSettings> {
   return invoke<AppSettings>('set_settings', { settings })
+}
+
+export function priceCatalogGet(): Promise<PriceCatalog> {
+  return invoke<PriceCatalog>('price_catalog_get')
 }
 
 export function pricesGet(): Promise<PriceTable> {

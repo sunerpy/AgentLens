@@ -27,6 +27,7 @@ macro_rules! agentlens_handler {
             commands::get_refresh_status,
             commands::get_settings,
             commands::set_settings,
+            commands::price_catalog_get,
             commands::prices_get,
             commands::prices_set,
             commands::local_machine_identity,
@@ -49,6 +50,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.start_refresh_loop();
 
     let builder = tauri::Builder::default()
+        // 只为「在系统文件管理器里定位归档库」而装：设置页的路径否则只能靠手工复制。
+        .plugin(tauri_plugin_opener::init())
         .manage(state)
         .on_window_event(tray::handle_window_event)
         .setup(|app| {

@@ -9,7 +9,7 @@ use agentlens_core::host::{
     MachineIdentity,
 };
 use agentlens_core::hostsource::SourceRegistration;
-use agentlens_core::pricing::PriceTable as CorePriceTable;
+use agentlens_core::pricing::{builtin_price_catalog, PriceTable as CorePriceTable};
 use agentlens_core::query::{
     query_breakdown, query_details, query_series, query_summary, BreakdownOptions, LocalDateRange,
     QueryError,
@@ -25,8 +25,8 @@ use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
 use crate::contract::{
     AggregateFilters, AppSettings, BreakdownDimensions, BreakdownRow, DateRange, DetailFilters,
     Granularity, Host, HostCreateInput, HostKind, HostUpdateInput, IpcError, IpcErrorCode,
-    MessageFilters, MessagePage, PriceTable, RefreshEvent, SeriesPoint, SourceStatus, Summary,
-    TriggerRefreshResult,
+    MessageFilters, MessagePage, ObservedModelPrice, PriceCatalog, PriceMatchKind, PriceTable,
+    RefreshEvent, SeriesPoint, SourceStatus, Summary, TriggerRefreshResult,
 };
 use crate::credentials::{
     CredentialError, CredentialKind, CredentialRef, CredentialStatus, CredentialStore,
@@ -439,6 +439,54 @@ pub(crate) fn set_settings_impl(state: &AppState, settings: AppSettings) -> IpcR
 }
 
 #[tauri::command]
+pub async fn price_catalog_get<R: Runtime>(app: AppHandle<R>) -> IpcResult<PriceCatalog> {
+    with_state("price_catalog_get", app, price_catalog_get_impl).await
+}
+
+pub(crate) fn price_catalog_get_impl(state: &AppState) -> IpcResult<PriceCatalog> {
+    let prices = state.load_prices()?;
+    let archive = state.lock_archive()?;
+    let mut statement = archive
+        .connection()
+        .prepare(
+            "SELECT provider_id, model_id, count(*)
+             FROM usage_record
+             GROUP BY provider_id, model_id
+             ORDER BY provider_id, model_id",
+        )
+        .map_err(database_error)?;
+    let mut rows = statement.query([]).map_err(database_error)?;
+    let mut observed_models = Vec::new();
+    while let Some(row) = rows.next().map_err(database_error)? {
+        let provider_id: String = row.get(0).map_err(database_error)?;
+        let model_id: String = row.get(1).map_err(database_error)?;
+        let usage_count =
+            u64::try_from(row.get::<_, i64>(2).map_err(database_error)?).map_err(|_| {
+                IpcError::new(
+                    IpcErrorCode::Database,
+                    "usage_record returned a negative model usage count",
+                )
+            })?;
+        let (match_kind, matched_price) = match prices.lookup_match(&provider_id, &model_id) {
+            Some(matched) => (matched.kind.into(), Some(matched.entry.clone().into())),
+            None => (PriceMatchKind::Unknown, None),
+        };
+        observed_models.push(ObservedModelPrice {
+            provider_id,
+            model_id,
+            usage_count,
+            match_kind,
+            matched_price,
+        });
+    }
+
+    Ok(PriceCatalog::from_core(
+        builtin_price_catalog(),
+        observed_models,
+    ))
+}
+
+#[tauri::command]
 pub async fn prices_get<R: Runtime>(app: AppHandle<R>) -> IpcResult<PriceTable> {
     with_state("prices_get", app, prices_get_impl).await
 }
@@ -779,7 +827,7 @@ fn database_error(error: impl std::fmt::Display) -> IpcError {
 }
 
 #[cfg(test)]
-pub const REGISTERED_COMMANDS: [&str; 21] = [
+pub const REGISTERED_COMMANDS: [&str; 22] = [
     "get_summary",
     "get_trend",
     "get_breakdown",
@@ -793,6 +841,7 @@ pub const REGISTERED_COMMANDS: [&str; 21] = [
     "get_refresh_status",
     "get_settings",
     "set_settings",
+    "price_catalog_get",
     "prices_get",
     "prices_set",
     "local_machine_identity",
@@ -816,7 +865,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::contract::{PriceEntry, WeekStart};
+    use crate::contract::{PriceEntry, PriceMatchKind, WeekStart};
     use crate::credentials::InMemoryCredentialStore;
 
     fn state() -> (TempDir, AppState) {
@@ -859,11 +908,99 @@ mod tests {
 
     #[test]
     fn registered_command_surface_is_complete_and_stable() {
-        assert_eq!(REGISTERED_COMMANDS.len(), 21);
+        assert_eq!(REGISTERED_COMMANDS.len(), 22);
         assert!(REGISTERED_COMMANDS.contains(&"query_messages"));
         assert!(REGISTERED_COMMANDS.contains(&"trigger_refresh"));
+        assert!(REGISTERED_COMMANDS.contains(&"price_catalog_get"));
         assert!(REGISTERED_COMMANDS.contains(&"prices_set"));
         assert!(REGISTERED_COMMANDS.contains(&"ssh_probe_cancel"));
+    }
+
+    #[test]
+    fn price_catalog_reports_observed_exact_approximate_and_unknown_models() {
+        let (_data_dir, state) = state();
+        {
+            let archive = state.lock_archive().expect("lock archive");
+            for (index, provider_id, model_id) in [
+                (1, "anthropic", "claude-sonnet-4-5-20250929"),
+                (2, "aws", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
+                (3, "private-provider", "private-model-v7"),
+            ] {
+                archive
+                    .connection()
+                    .execute(
+                        "INSERT INTO usage_record (
+                            host_id, source, message_id, session_id,
+                            time_created_utc, time_completed_utc, source_time_updated,
+                            origin, origin_priority, agent_raw, agent_key,
+                            provider_id, model_id, variant,
+                            tok_input, tok_output, tok_reasoning, tok_cache_read, tok_cache_write,
+                            cost, cost_source, is_incomplete, project_dir
+                        ) VALUES (
+                            'host-price-test', 'opencode', ?1, 'ses-price-test',
+                            1785468844419, 1785468845419, 1785468846419,
+                            'live', 3, 'Sisyphus', 'sisyphus',
+                            ?2, ?3, NULL,
+                            10, 20, 0, 0, 0,
+                            NULL, 'unavailable', 0, '/tmp/price-test'
+                        )",
+                        rusqlite::params![format!("msg-price-{index}"), provider_id, model_id],
+                    )
+                    .expect("seed observed model");
+            }
+        }
+
+        let catalog = price_catalog_get_impl(&state).expect("load price catalog");
+
+        assert_eq!(catalog.schema_version, 1);
+        assert!(!catalog.catalog_version.is_empty());
+        assert!(!catalog.updated_at.is_empty());
+        assert_eq!(catalog.currency, "USD");
+        assert!(catalog
+            .entries
+            .iter()
+            .any(|entry| entry.provider_id == "amazon-bedrock"));
+
+        let exact = catalog
+            .observed_models
+            .iter()
+            .find(|model| model.provider_id == "anthropic")
+            .expect("exact observed model");
+        assert_eq!(exact.match_kind, PriceMatchKind::Exact);
+        assert_eq!(exact.usage_count, 1);
+
+        let approximate = catalog
+            .observed_models
+            .iter()
+            .find(|model| model.provider_id == "aws")
+            .expect("approximate observed model");
+        assert_eq!(approximate.match_kind, PriceMatchKind::Normalized);
+        assert_eq!(
+            approximate
+                .matched_price
+                .as_ref()
+                .map(|entry| entry.provider_id.as_str()),
+            Some("amazon-bedrock")
+        );
+
+        let unknown = catalog
+            .observed_models
+            .iter()
+            .find(|model| model.provider_id == "private-provider")
+            .expect("unknown observed model");
+        assert_eq!(unknown.match_kind, PriceMatchKind::Unknown);
+        assert!(unknown.matched_price.is_none());
+    }
+
+    #[test]
+    fn price_catalog_shell_resolves_state_on_the_blocking_pool() {
+        let (_data_dir, app) = mock_app();
+
+        let catalog = tauri::async_runtime::block_on(price_catalog_get(app))
+            .expect("catalog command must resolve managed state");
+
+        assert_eq!(catalog.currency, "USD");
+        assert!(catalog.observed_models.is_empty());
     }
 
     #[test]
@@ -1184,6 +1321,7 @@ mod tests {
         assert_command_is_async!(get_refresh_status, (AppHandle));
         assert_command_is_async!(get_settings, (AppHandle));
         assert_command_is_async!(set_settings, (AppHandle, AppSettings));
+        assert_command_is_async!(price_catalog_get, (AppHandle));
         assert_command_is_async!(prices_get, (AppHandle));
         assert_command_is_async!(prices_set, (AppHandle, Value));
         assert_command_is_async!(local_machine_identity, ());
@@ -1197,7 +1335,7 @@ mod tests {
         // making it `async` breaks the build just as loudly as un-asyncing the rest.
         let _: fn(String) -> IpcResult<()> = ssh_probe_cancel;
 
-        assert_eq!(REGISTERED_COMMANDS.len(), 21);
+        assert_eq!(REGISTERED_COMMANDS.len(), 22);
     }
 
     #[test]

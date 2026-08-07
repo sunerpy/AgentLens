@@ -69,3 +69,42 @@ test('a structured IpcError renders the error state instead of a blank screen', 
   await expect(page.getByTestId('error-message')).toHaveText('archive database is locked')
   await expect(page.getByTestId('view-overview')).toHaveCount(0)
 })
+
+test('the page context menu is suppressed everywhere except editable fields', async ({ page }) => {
+  await openShell(page)
+  await expect(page.getByTestId('view-overview')).toBeVisible()
+
+  /**
+   * Records whether the real `contextmenu` event that a right-click produces was cancelled.
+   * A capture-phase listener on `window` runs after the document-level guard has had its
+   * turn, so `defaultPrevented` reflects the guard's decision.
+   */
+  const observe = () =>
+    page.evaluate(() => {
+      const seen: boolean[] = []
+      const record = (event: Event) => seen.push(event.defaultPrevented)
+      window.addEventListener('contextmenu', record)
+      ;(window as unknown as Record<string, unknown>).__ctxSeen = seen
+      ;(window as unknown as Record<string, unknown>).__ctxStop = () =>
+        window.removeEventListener('contextmenu', record)
+    })
+  const cancellations = () =>
+    page.evaluate(() => (window as unknown as { __ctxSeen: boolean[] }).__ctxSeen)
+
+  await observe()
+
+  // Page chrome and content: Chromium's "Reload"/"Inspect"/"Back" menu must never appear,
+  // because a reload discards the whole React tree mid-refresh.
+  await page.getByTestId('titlebar-title').click({ button: 'right' })
+  await page.getByRole('heading', { name: 'AgentLens' }).click({ button: 'right' })
+  await expect.poll(cancellations).toEqual([true, true])
+
+  // An input keeps its native cut/copy/paste block: it is the only pointer-driven way to
+  // paste an SSH address or a key path, so suppressing it would be a usability regression.
+  await page.getByTestId('nav-hosts').click()
+  await expect(page.getByTestId('view-hosts')).toBeVisible()
+  const target = page.getByTestId('add-host-target')
+  await expect(target).toBeVisible()
+  await target.click({ button: 'right' })
+  await expect.poll(cancellations).toEqual([true, true, false])
+})
