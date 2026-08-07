@@ -21,6 +21,27 @@
   --color-chart-3: var(--chart-3);
   --color-chart-2: var(--chart-2);
   --color-chart-1: var(--chart-1);
+  /*
+   * Categorical series palette, separate from `--chart-*` on purpose. `--chart-1` already has a
+   * fixed semantic job (the partial-coverage hatch), so reusing that ramp for grouped trend
+   * lines would make a legend colour and a coverage colour collide.
+   *
+   * Hue order per theme is `base + [0, 120, 240, 60, 180, 300]`, never ascending: groups are
+   * assigned `--series-1` upward and most windows hold two or three, so `1..3` must be a
+   * maximally separated triad and the fill-ins still leave every adjacent pair ≥ 90° apart.
+   * Sorting these by hue or by lightness instead would hand the two commonest lines neighbouring
+   * hues. `theme.spec.ts` asserts the separation so a re-sort cannot land unnoticed.
+   *
+   * `--series-7` is off-scheme by design: near-zero chroma, reserved for the 其他 aggregate so it
+   * never competes with a named group.
+   */
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --color-series-5: var(--series-5);
+  --color-series-6: var(--series-6);
+  --color-series-7: var(--series-7);
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
@@ -82,6 +103,13 @@
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
+  --series-1: oklch(0.5 0.16 258);
+  --series-2: oklch(0.53 0.19 18);
+  --series-3: oklch(0.5 0.13 138);
+  --series-4: oklch(0.5 0.17 318);
+  --series-5: oklch(0.58 0.14 78);
+  --series-6: oklch(0.52 0.11 198);
+  --series-7: oklch(0.48 0.03 280);
   --radius: 0.625rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
@@ -141,11 +169,28 @@
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
   --ring: oklch(0.556 0 0);
-  --chart-1: oklch(0.87 0 0);
-  --chart-2: oklch(0.556 0 0);
-  --chart-3: oklch(0.439 0 0);
-  --chart-4: oklch(0.371 0 0);
-  --chart-5: oklch(0.269 0 0);
+  /*
+   * Inverted relative to `:root`, unlike the rest of this block which was inherited verbatim
+   * from the shadcn preset. The preset ships the SAME chart ramp in light and dark, which was
+   * harmless while nothing ever added the `dark` class — the theme picker is the first thing
+   * that does, and it exposed `--chart-5` at L 0.269 drawing the primary trend line onto an
+   * L 0.145 background, i.e. an invisible chart. On a dark surface the series must be lighter
+   * than the background, so the ramp reads 2 < 4 < 5 in lightness with `--chart-5` (Token 合计)
+   * brightest. `--chart-1` keeps the warm-light tone every other dark theme below uses, so the
+   * partial-coverage hatch can never be mistaken for a neutral series line.
+   */
+  --chart-1: oklch(0.85 0.07 85);
+  --chart-2: oklch(0.72 0 0);
+  --chart-3: oklch(0.62 0 0);
+  --chart-4: oklch(0.84 0 0);
+  --chart-5: oklch(0.95 0 0);
+  --series-1: oklch(0.72 0.14 258);
+  --series-2: oklch(0.7 0.16 18);
+  --series-3: oklch(0.76 0.14 138);
+  --series-4: oklch(0.74 0.15 318);
+  --series-5: oklch(0.82 0.14 78);
+  --series-6: oklch(0.76 0.11 198);
+  --series-7: oklch(0.68 0.03 280);
   --sidebar: oklch(0.205 0 0);
   --sidebar-foreground: oklch(0.985 0 0);
   --sidebar-primary: oklch(0.488 0.243 264.376);
@@ -164,6 +209,215 @@
 
   --elevation-panel: 0 1px 2px 0 oklch(0 0 0 / 0.4);
   --elevation-raised: 0 8px 24px -4px oklch(0 0 0 / 0.6), 0 2px 6px -2px oklch(0 0 0 / 0.4);
+}
+
+/*
+ * Colour themes.
+ *
+ * Two mechanisms, deliberately kept separate:
+ * - `data-theme` on <html> selects the palette. Every block below is a *partial* override; the
+ *   tokens it omits fall through to `:root` (light themes) or `.dark` (dark themes).
+ * - the `dark` class is applied in addition, for the dark-mode themes only, because
+ *   `@custom-variant dark (&:is(.dark *))` is what any `dark:` utility keys off. A dark theme
+ *   therefore carries BOTH `class="dark"` and its own `data-theme`.
+ *
+ * Ordering matters and is load-bearing: `[data-theme='…']` and `.dark` have identical
+ * specificity (0,1,0), so these blocks must stay *after* `.dark` to win the cascade.
+ *
+ * `--sidebar-*` is intentionally not re-declared: the shell is five top tabs with no sidebar,
+ * so those shadcn tokens have no consumer and re-stating them four times would be dead weight.
+ *
+ * Invariant carried into every block: `--chart-1` stays a warm light tone reserved for the
+ * partial-coverage hatch, so it can never be mistaken for one of the `--series-*` legend
+ * colours; `--chart-2` / `--chart-4` / `--chart-5` are the stroked ungrouped lines and must run
+ * AWAY from `--background` in lightness — ascending on a dark surface, descending on a light one,
+ * with `--chart-5` (Token 合计) furthest — because a line at the surface's own lightness is
+ * invisible rather than merely off-palette; and `--titlebar` stays a shade off `--background` so
+ * an undecorated window still reads as OS chrome. `e2e/theme.spec.ts` asserts the first two.
+ */
+
+/* Light · cool green. */
+[data-theme='forest'] {
+  --background: oklch(0.99 0.006 152);
+  --foreground: oklch(0.2 0.022 155);
+  --card: oklch(1 0.002 152);
+  --card-foreground: oklch(0.2 0.022 155);
+  --popover: oklch(1 0.002 152);
+  --popover-foreground: oklch(0.2 0.022 155);
+  --primary: oklch(0.44 0.09 157);
+  --primary-foreground: oklch(0.99 0.01 152);
+  --secondary: oklch(0.955 0.014 152);
+  --secondary-foreground: oklch(0.27 0.035 155);
+  --muted: oklch(0.957 0.012 152);
+  --muted-foreground: oklch(0.48 0.022 155);
+  --accent: oklch(0.935 0.028 152);
+  --accent-foreground: oklch(0.29 0.05 157);
+  --destructive: oklch(0.55 0.2 25);
+  --border: oklch(0.9 0.014 152);
+  --input: oklch(0.9 0.014 152);
+  --ring: oklch(0.58 0.09 157);
+  --chart-1: oklch(0.86 0.06 82);
+  --chart-2: oklch(0.62 0.08 200);
+  --chart-3: oklch(0.5 0.09 157);
+  --chart-4: oklch(0.4 0.07 165);
+  --chart-5: oklch(0.31 0.06 160);
+
+  --titlebar: oklch(0.965 0.012 152);
+  --titlebar-foreground: oklch(0.43 0.02 155);
+  --titlebar-border: oklch(0.89 0.016 152);
+  --titlebar-hover: oklch(0.925 0.02 152);
+  --titlebar-danger: oklch(0.55 0.2 25);
+  --titlebar-danger-foreground: oklch(0.99 0 0);
+
+  --elevation-panel: 0 1px 2px 0 oklch(0.2 0.03 155 / 0.06);
+  --elevation-raised:
+    0 4px 12px -2px oklch(0.2 0.03 155 / 0.12), 0 2px 4px -2px oklch(0.2 0.03 155 / 0.08);
+
+  --series-1: oklch(0.47 0.11 157);
+  --series-2: oklch(0.5 0.16 277);
+  --series-3: oklch(0.55 0.15 37);
+  --series-4: oklch(0.52 0.12 217);
+  --series-5: oklch(0.57 0.14 97);
+  --series-6: oklch(0.52 0.18 337);
+  --series-7: oklch(0.47 0.03 200);
+}
+
+/* Dark · deep blue. */
+[data-theme='ocean'] {
+  --background: oklch(0.17 0.024 250);
+  --foreground: oklch(0.95 0.012 240);
+  --card: oklch(0.225 0.028 252);
+  --card-foreground: oklch(0.95 0.012 240);
+  --popover: oklch(0.225 0.028 252);
+  --popover-foreground: oklch(0.95 0.012 240);
+  --primary: oklch(0.74 0.13 225);
+  --primary-foreground: oklch(0.17 0.03 250);
+  --secondary: oklch(0.29 0.03 252);
+  --secondary-foreground: oklch(0.95 0.012 240);
+  --muted: oklch(0.28 0.028 252);
+  --muted-foreground: oklch(0.72 0.026 240);
+  --accent: oklch(0.32 0.045 245);
+  --accent-foreground: oklch(0.96 0.015 240);
+  --destructive: oklch(0.68 0.18 22);
+  --border: oklch(0.82 0.06 240 / 16%);
+  --input: oklch(0.82 0.06 240 / 22%);
+  --ring: oklch(0.68 0.11 228);
+  --chart-1: oklch(0.8 0.1 84);
+  --chart-2: oklch(0.66 0.11 205);
+  --chart-3: oklch(0.72 0.1 232);
+  --chart-4: oklch(0.79 0.09 228);
+  --chart-5: oklch(0.93 0.035 232);
+
+  --titlebar: oklch(0.205 0.026 251);
+  --titlebar-foreground: oklch(0.75 0.026 240);
+  --titlebar-border: oklch(0.82 0.06 240 / 14%);
+  --titlebar-hover: oklch(0.82 0.06 240 / 16%);
+  --titlebar-danger: oklch(0.56 0.19 24);
+  --titlebar-danger-foreground: oklch(0.97 0.01 240);
+
+  --elevation-panel: 0 1px 2px 0 oklch(0.08 0.03 250 / 0.5);
+  --elevation-raised:
+    0 8px 24px -4px oklch(0.08 0.03 250 / 0.65), 0 2px 6px -2px oklch(0.08 0.03 250 / 0.45);
+
+  --series-1: oklch(0.78 0.13 222);
+  --series-2: oklch(0.75 0.15 342);
+  --series-3: oklch(0.83 0.14 102);
+  --series-4: oklch(0.76 0.15 282);
+  --series-5: oklch(0.78 0.14 42);
+  --series-6: oklch(0.8 0.12 162);
+  --series-7: oklch(0.72 0.03 240);
+}
+
+/* Dark · warm amber. */
+[data-theme='amber'] {
+  --background: oklch(0.185 0.014 62);
+  --foreground: oklch(0.955 0.012 82);
+  --card: oklch(0.24 0.018 64);
+  --card-foreground: oklch(0.955 0.012 82);
+  --popover: oklch(0.24 0.018 64);
+  --popover-foreground: oklch(0.955 0.012 82);
+  --primary: oklch(0.79 0.14 76);
+  --primary-foreground: oklch(0.2 0.03 62);
+  --secondary: oklch(0.3 0.022 64);
+  --secondary-foreground: oklch(0.955 0.012 82);
+  --muted: oklch(0.295 0.02 64);
+  --muted-foreground: oklch(0.74 0.022 80);
+  --accent: oklch(0.34 0.036 68);
+  --accent-foreground: oklch(0.96 0.015 82);
+  --destructive: oklch(0.66 0.19 22);
+  --border: oklch(0.86 0.05 82 / 16%);
+  --input: oklch(0.86 0.05 82 / 22%);
+  --ring: oklch(0.72 0.12 76);
+  --chart-1: oklch(0.82 0.1 96);
+  --chart-2: oklch(0.66 0.12 56);
+  --chart-3: oklch(0.72 0.1 62);
+  --chart-4: oklch(0.79 0.09 68);
+  --chart-5: oklch(0.94 0.03 80);
+
+  --titlebar: oklch(0.215 0.016 63);
+  --titlebar-foreground: oklch(0.76 0.022 80);
+  --titlebar-border: oklch(0.86 0.05 82 / 14%);
+  --titlebar-hover: oklch(0.86 0.05 82 / 16%);
+  --titlebar-danger: oklch(0.55 0.19 24);
+  --titlebar-danger-foreground: oklch(0.97 0.01 82);
+
+  --elevation-panel: 0 1px 2px 0 oklch(0.1 0.02 60 / 0.5);
+  --elevation-raised:
+    0 8px 24px -4px oklch(0.1 0.02 60 / 0.65), 0 2px 6px -2px oklch(0.1 0.02 60 / 0.45);
+
+  --series-1: oklch(0.82 0.14 78);
+  --series-2: oklch(0.78 0.12 198);
+  --series-3: oklch(0.76 0.15 318);
+  --series-4: oklch(0.81 0.14 138);
+  --series-5: oklch(0.74 0.14 258);
+  --series-6: oklch(0.75 0.16 18);
+  --series-7: oklch(0.73 0.025 80);
+}
+
+/* Dark · violet. */
+[data-theme='violet'] {
+  --background: oklch(0.165 0.026 300);
+  --foreground: oklch(0.95 0.014 300);
+  --card: oklch(0.222 0.032 302);
+  --card-foreground: oklch(0.95 0.014 300);
+  --popover: oklch(0.222 0.032 302);
+  --popover-foreground: oklch(0.95 0.014 300);
+  --primary: oklch(0.74 0.15 302);
+  --primary-foreground: oklch(0.17 0.035 300);
+  --secondary: oklch(0.29 0.034 302);
+  --secondary-foreground: oklch(0.95 0.014 300);
+  --muted: oklch(0.28 0.03 302);
+  --muted-foreground: oklch(0.73 0.028 300);
+  --accent: oklch(0.32 0.05 302);
+  --accent-foreground: oklch(0.96 0.018 300);
+  --destructive: oklch(0.68 0.19 20);
+  --border: oklch(0.84 0.06 300 / 16%);
+  --input: oklch(0.84 0.06 300 / 22%);
+  --ring: oklch(0.68 0.13 302);
+  --chart-1: oklch(0.82 0.09 92);
+  --chart-2: oklch(0.66 0.13 288);
+  --chart-3: oklch(0.72 0.12 298);
+  --chart-4: oklch(0.79 0.1 302);
+  --chart-5: oklch(0.93 0.03 302);
+
+  --titlebar: oklch(0.2 0.03 301);
+  --titlebar-foreground: oklch(0.76 0.028 300);
+  --titlebar-border: oklch(0.84 0.06 300 / 14%);
+  --titlebar-hover: oklch(0.84 0.06 300 / 16%);
+  --titlebar-danger: oklch(0.56 0.19 22);
+  --titlebar-danger-foreground: oklch(0.97 0.012 300);
+
+  --elevation-panel: 0 1px 2px 0 oklch(0.08 0.03 300 / 0.5);
+  --elevation-raised:
+    0 8px 24px -4px oklch(0.08 0.03 300 / 0.65), 0 2px 6px -2px oklch(0.08 0.03 300 / 0.45);
+
+  --series-1: oklch(0.78 0.15 300);
+  --series-2: oklch(0.83 0.14 60);
+  --series-3: oklch(0.79 0.12 180);
+  --series-4: oklch(0.75 0.16 0);
+  --series-5: oklch(0.82 0.15 120);
+  --series-6: oklch(0.74 0.14 240);
+  --series-7: oklch(0.72 0.03 300);
 }
 
 @layer base {

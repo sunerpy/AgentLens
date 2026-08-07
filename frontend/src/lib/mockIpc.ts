@@ -50,6 +50,7 @@
  * remediation string mirroring `agentlens_core::transport::ssh` error text.
  */
 import type {
+  AggregateFilters,
   AppSettings,
   BreakdownRow,
   CostTotals,
@@ -530,6 +531,83 @@ function asNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
+/**
+ * Filter-aware `get_trend`.
+ *
+ * The grouped trend chart issues one `get_trend` per dimension value, so a mock that ignored
+ * `filters` would hand every group the unfiltered total — the grouped view would show N
+ * identical lines and the "其他" remainder would always clamp to 0, making the whole feature
+ * untestable. Instead the seeded series is scaled by the filtered slice's share of
+ * `breakdown`'s token weight. The shares of a full partition therefore sum to exactly 1, which
+ * is what lets a spec assert grouped values against the total.
+ *
+ * `hostId` is not honoured: `BreakdownRow` carries no host, so there is nothing here to scale
+ * by. That mirrors the real backend split, where the host filter is applied inside SQL.
+ */
+function tokenWeight(tokens: TokenValues): number {
+  return (
+    tokens.tokInput +
+    tokens.tokOutput +
+    tokens.tokReasoning +
+    tokens.tokCacheRead +
+    tokens.tokCacheWrite
+  )
+}
+
+function matchesFilters(row: BreakdownRow, filters: AggregateFilters): boolean {
+  return (
+    (filters.source === null || row.source === filters.source) &&
+    (filters.agentKey === null || row.agentKey === filters.agentKey) &&
+    (filters.providerId === null || row.providerId === filters.providerId) &&
+    (filters.modelId === null || row.modelId === filters.modelId)
+  )
+}
+
+function filterShare(rows: BreakdownRow[], filters: unknown): number {
+  if (filters === null || typeof filters !== 'object') return 1
+  const narrowed = filters as AggregateFilters
+  if (
+    narrowed.source === null &&
+    narrowed.agentKey === null &&
+    narrowed.providerId === null &&
+    narrowed.modelId === null
+  ) {
+    return 1
+  }
+  const total = rows.reduce((sum, row) => sum + tokenWeight(row.tokens), 0)
+  if (total <= 0) return 0
+  const matched = rows
+    .filter((row) => matchesFilters(row, narrowed))
+    .reduce((sum, row) => sum + tokenWeight(row.tokens), 0)
+  return matched / total
+}
+
+function scaleSeries(points: SeriesPoint[], share: number): SeriesPoint[] {
+  if (share === 1) return points
+  return points.map((point) => ({
+    ...point,
+    tokens:
+      point.tokens === null
+        ? null
+        : tokens(
+            Math.round(point.tokens.tokInput * share),
+            Math.round(point.tokens.tokOutput * share),
+            Math.round(point.tokens.tokReasoning * share),
+            Math.round(point.tokens.tokCacheRead * share),
+            Math.round(point.tokens.tokCacheWrite * share),
+          ),
+    cost:
+      point.cost === null
+        ? null
+        : cost(
+            point.cost.actualSum * share,
+            point.cost.estimatedSum * share,
+            Math.round(point.cost.unavailableCount * share),
+          ),
+    messageCount: point.messageCount === null ? null : Math.round(point.messageCount * share),
+  }))
+}
+
 function paginate(rows: MessageRow[], limit: number, offset: number): MessagePage {
   const clampedLimit = Math.min(Math.max(limit, 0), 200)
   const clampedOffset = Math.max(offset, 0)
@@ -563,7 +641,8 @@ interface MockState {
  */
 const HANDLERS: Record<IpcCommand, (state: MockState, args: Record<string, unknown>) => unknown> = {
   get_summary: (state) => state.dataset.summary,
-  get_trend: (state) => state.dataset.trend,
+  get_trend: (state, args) =>
+    scaleSeries(state.dataset.trend, filterShare(state.dataset.breakdown, args.filters ?? null)),
   get_breakdown: (state) => state.dataset.breakdown,
   query_messages: (state, args) =>
     paginate(state.dataset.messages, asNumber(args.limit, 50), asNumber(args.offset, 0)),

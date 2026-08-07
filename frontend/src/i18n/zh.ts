@@ -28,6 +28,30 @@ export const zh = {
     settings: '设置',
   },
 
+  /**
+   * 颜色主题（外壳独占）。键名与 `src/app/theme/themes.ts` 的 `THEME_KEYS` 必须一一对应，
+   * 新增主题时三处同改：`index.css` 的 token 块、`themes.ts` 的注册表、这里的名称。
+   */
+  theme: {
+    label: '颜色主题',
+    names: {
+      light: '石墨浅色',
+      dark: '石墨深色',
+      forest: '苔原绿',
+      ocean: '深海蓝',
+      amber: '暖砂琥珀',
+      violet: '夜紫',
+    },
+    modes: {
+      light: '浅色 · 中性',
+      dark: '深色 · 中性',
+      forest: '浅色 · 冷绿',
+      ocean: '深色 · 蓝青',
+      amber: '深色 · 暖橙',
+      violet: '深色 · 紫',
+    },
+  },
+
   /** 跨视图共用文案（外壳独占；需要新增共用词时请与外壳约定，避免与视图 section 重复）。 */
   common: {
     loading: '加载中…',
@@ -142,6 +166,28 @@ export const zh = {
       allGap: '该区间全部时间桶都没有数据覆盖',
       tooltipNoCoverage: '该时间桶没有归档覆盖，因此不画点（不是 0）',
       tooltipZeroUsage: '覆盖完整但无用量，真实为 0',
+
+      /**
+       * 分组维度。`tool`（工具）对应归档里的 source 字段：opencode / codex 这些是采集来源，
+       * 用户口语里叫「工具」，因此界面用「工具」而内部标识符仍是 source。
+       */
+      groupLabel: '分组维度',
+      groupNone: '不分组',
+      groupModel: '按模型',
+      groupAgent: '按 agent',
+      groupTool: '按工具',
+      groupNoneHint: '合计一条曲线，成本按实际 / 估算分列',
+      groupModelHint: '按 (provider, model) 分列；同一模型的 variant 合并',
+      groupAgentHint: '按 agent_key 分列，与用量分析二级一致',
+      groupToolHint: '按采集来源分列（opencode / codex 等）',
+      groupCostSeriesHint: '分组视图只画实际成本曲线；估算与缺失见悬浮提示',
+      groupOther: '其他',
+      groupOtherHint: (kept: number, total: number) =>
+        `曲线过多会读不出趋势，因此只画 token 合计最高的 ${kept} 项，其余 ${total - kept} 项合并为「其他」`,
+      groupTopHint: (total: number) => `该区间共 ${total} 项，全部单独成线`,
+      groupEmpty: '该区间没有可分组的维度值',
+      groupLoading: '正在按分组维度取数…',
+      groupOtherNote: '「其他」= 合计 − 已列出各项，负值按 0 处理（区间边界上可能出现舍入差）',
     },
   },
 
@@ -360,6 +406,13 @@ export const zh = {
   settings: {
     title: '设置',
     subtitle: '所有设置持久化到归档库的 app_settings 表，没有第二处存储',
+
+    /** 外观：主题名称本身在 `zh.theme`（外壳独占），此处只放本卡片的说明文案。 */
+    appearance: {
+      title: '外观',
+      description: '切换颜色主题；选择即时生效，无需点保存',
+      persistHint: '主题与其他设置一样存在 app_settings 表，重启后仍生效',
+    },
 
     /** 报表时区与周起日：桶边界由 Rust 查询层按这两个值计算。 */
     report: {
