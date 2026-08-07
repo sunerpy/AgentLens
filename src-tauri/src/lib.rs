@@ -27,6 +27,7 @@ macro_rules! agentlens_handler {
             commands::get_refresh_status,
             commands::get_settings,
             commands::set_settings,
+            commands::price_catalog_get,
             commands::prices_get,
             commands::prices_set,
             commands::local_machine_identity,

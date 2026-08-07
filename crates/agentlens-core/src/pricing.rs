@@ -8,14 +8,15 @@
 //! 不回写归档库的原始 `cost` 列；未命中则保持 `unavailable`。
 //! `estimated` 与 `actual` 分开返回，绝不混加。
 //!
-//! 结构上预留将来由 models.dev 拉取填充同一文件，本期不联网。
+//! 官方公开单价以随二进制编译的版本化 JSON 目录作为离线回退；`prices.json` 仍只保存用户覆盖。
+//! 未来显式的 models.dev 导入器可以更新同一目录形状，但应用启动与查询路径绝不联网。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,9 @@ static PRICES_IO_LOCK: RwLock<()> = RwLock::new(());
 /// The field exists so a future models.dev importer can rewrite the same file with a richer layout
 /// while older builds still fail loudly instead of silently mis-reading it.
 pub const PRICES_SCHEMA_VERSION: u32 = 1;
+/// Document version understood by the bundled provider catalog parser.
+pub const PRICE_CATALOG_SCHEMA_VERSION: u32 = 1;
+const BUILTIN_PRICE_CATALOG_JSON: &str = include_str!("pricing_catalog.json");
 
 fn is_transient_read_error(source: &io::Error) -> bool {
     let transient = source.kind() == io::ErrorKind::PermissionDenied;
@@ -220,6 +224,235 @@ pub struct PriceEntry {
     /// Forward-compatibility passthrough for unknown entry-level fields.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Versioned, offline snapshot of official public provider prices bundled with the application.
+///
+/// `catalog_version` is an update identifier while `updated_at` tells the user how old the price
+/// snapshot is. Entries deliberately reuse [`PriceEntry`] so a future explicit importer can emit
+/// the same price shape as the manual override file without introducing a second pricing schema.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PriceCatalog {
+    /// Catalog document schema, independent from the price snapshot version.
+    pub schema_version: u32,
+    /// Monotonic snapshot identifier chosen by the catalog producer.
+    pub catalog_version: String,
+    /// ISO-8601 date on which the public provider pages were reviewed.
+    pub updated_at: String,
+    /// Currency shared by every entry in this snapshot.
+    pub currency: String,
+    /// Canonical provider/model prices.
+    pub entries: Vec<PriceEntry>,
+}
+
+/// How a provider/model pair reached a catalog or override entry.
+///
+/// Only [`PriceMatchKind::Exact`] is fully authoritative for the observed identifiers.
+/// `Normalized` and `Family` are intentionally separate so UI and future importers can explain
+/// why a price is approximate instead of collapsing every successful lookup into silent certainty.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PriceMatchKind {
+    /// Provider and model identifiers are byte-for-byte identical.
+    Exact,
+    /// Case, provider alias, platform prefix, or Bedrock version suffix was normalized.
+    Normalized,
+    /// No normalized exact match existed; the nearest dated model in the same family was used.
+    Family,
+}
+
+impl PriceMatchKind {
+    /// Whether consumers must present this result as an approximation.
+    pub const fn is_approximate(self) -> bool {
+        !matches!(self, Self::Exact)
+    }
+}
+
+/// One successful pure provider/model match.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PriceMatch<'a> {
+    /// Matched price entry.
+    pub entry: &'a PriceEntry,
+    /// Matching layer that selected the entry.
+    pub kind: PriceMatchKind,
+}
+
+#[derive(Debug)]
+struct ModelIdentity {
+    normalized: String,
+    family: String,
+    version: Option<u32>,
+}
+
+/// Returns the immutable offline catalog compiled into this build.
+///
+/// Parsing is process-global and lazy. The JSON is a build-owned resource, so a malformed bundle is
+/// a programming error; the catalog tests validate it before release rather than turning every
+/// pricing query into a fallible file operation.
+pub fn builtin_price_catalog() -> &'static PriceCatalog {
+    static CATALOG: OnceLock<PriceCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let catalog: PriceCatalog = serde_json::from_str(BUILTIN_PRICE_CATALOG_JSON)
+            .expect("bundled pricing_catalog.json must be valid JSON");
+        assert_eq!(
+            catalog.schema_version, PRICE_CATALOG_SCHEMA_VERSION,
+            "bundled pricing_catalog.json has an unsupported schema_version"
+        );
+        assert!(
+            !catalog.catalog_version.trim().is_empty()
+                && !catalog.updated_at.trim().is_empty()
+                && catalog.currency == "USD",
+            "bundled pricing_catalog.json metadata is invalid"
+        );
+        PriceTable::from_entries(catalog.entries.clone())
+            .validate()
+            .expect("bundled pricing_catalog.json entries must be valid and unique");
+        catalog
+    })
+}
+
+/// Matches a provider/model pair without consulting files, global state, time, or the network.
+///
+/// Layers are deterministic and conservative: literal tuple, normalized tuple, nearest dated entry
+/// in the same model family, then no match. Provider families never cross (for example Anthropic
+/// direct pricing is not substituted for Bedrock pricing), and an unknown family returns `None`
+/// rather than inventing a price.
+pub fn match_price<'a>(
+    entries: &'a [PriceEntry],
+    provider_id: &str,
+    model_id: &str,
+) -> Option<PriceMatch<'a>> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.provider_id == provider_id && entry.model_id == model_id)
+    {
+        return Some(PriceMatch {
+            entry,
+            kind: PriceMatchKind::Exact,
+        });
+    }
+
+    let provider = normalize_provider(provider_id);
+    let model = model_identity(model_id);
+    if let Some(entry) = entries.iter().find(|entry| {
+        normalize_provider(&entry.provider_id) == provider
+            && model_identity(&entry.model_id).normalized == model.normalized
+    }) {
+        return Some(PriceMatch {
+            entry,
+            kind: PriceMatchKind::Normalized,
+        });
+    }
+
+    let mut family = entries
+        .iter()
+        .filter_map(|entry| {
+            if normalize_provider(&entry.provider_id) != provider {
+                return None;
+            }
+            let candidate = model_identity(&entry.model_id);
+            (candidate.family == model.family).then_some((entry, candidate.version))
+        })
+        .collect::<Vec<_>>();
+    if family.is_empty() {
+        return None;
+    }
+
+    family.sort_by(|(left_entry, left_version), (right_entry, right_version)| {
+        family_distance(model.version, *left_version)
+            .cmp(&family_distance(model.version, *right_version))
+            // On equal distance, prefer the newer dated entry, then a stable lexical key.
+            .then_with(|| right_version.cmp(left_version))
+            .then_with(|| left_entry.model_id.cmp(&right_entry.model_id))
+    });
+    Some(PriceMatch {
+        entry: family[0].0,
+        kind: PriceMatchKind::Family,
+    })
+}
+
+fn normalize_provider(provider_id: &str) -> String {
+    let normalized = normalize_identifier(provider_id);
+    match normalized.as_str() {
+        "aws" | "aws-bedrock" | "bedrock" | "amazon-bedrock-runtime" => "amazon-bedrock".to_owned(),
+        "google-ai" | "google-generative-ai" | "gemini" | "vertex-ai" | "vertexai" => {
+            "google".to_owned()
+        }
+        value => value.to_owned(),
+    }
+}
+
+fn model_identity(model_id: &str) -> ModelIdentity {
+    let mut platform_free = model_id.trim().to_ascii_lowercase().replace('_', "-");
+    for prefix in ["us.", "eu.", "apac.", "global."] {
+        if platform_free.starts_with(prefix) {
+            platform_free = platform_free[prefix.len()..].to_owned();
+            break;
+        }
+    }
+    for prefix in ["anthropic.", "openai.", "google."] {
+        if platform_free.starts_with(prefix) {
+            platform_free = platform_free[prefix.len()..].to_owned();
+            break;
+        }
+    }
+    if let Some((base, suffix)) = platform_free.rsplit_once("-v") {
+        if is_bedrock_version_suffix(suffix) {
+            platform_free = base.to_owned();
+        }
+    }
+
+    let normalized = normalize_identifier(&platform_free);
+    let (family, version) = match normalized.rsplit_once('-') {
+        Some((family, version)) if is_date_version(version) => {
+            (family.to_owned(), version.parse::<u32>().ok())
+        }
+        _ => (normalized.clone(), None),
+    };
+    ModelIdentity {
+        normalized,
+        family,
+        version,
+    }
+}
+
+fn normalize_identifier(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator = false;
+    for character in value.trim().chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push(character);
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    normalized
+}
+
+fn is_bedrock_version_suffix(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(major, minor)| {
+        !major.is_empty()
+            && major.bytes().all(|byte| byte.is_ascii_digit())
+            && !minor.is_empty()
+            && minor.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn is_date_version(value: &str) -> bool {
+    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn family_distance(requested: Option<u32>, candidate: Option<u32>) -> u32 {
+    match (requested, candidate) {
+        (Some(requested), Some(candidate)) => requested.abs_diff(candidate),
+        (None, Some(candidate)) => u32::MAX - candidate,
+        (Some(_), None) => u32::MAX - 1,
+        (None, None) => 0,
+    }
 }
 
 impl PriceEntry {
@@ -449,14 +682,22 @@ impl PriceTable {
         Ok(())
     }
 
-    /// Finds the entry for `(provider_id, model_id)`, ignoring any model variant.
+    /// Finds the best override or bundled-catalog entry, including its matching layer.
+    ///
+    /// Manual entries always run through all matching layers before the bundled fallback, so a user
+    /// override remains authoritative even when its platform spelling differs from the archive.
+    pub fn lookup_match(&self, provider_id: &str, model_id: &str) -> Option<PriceMatch<'_>> {
+        match_price(&self.entries, provider_id, model_id)
+            .or_else(|| match_price(&builtin_price_catalog().entries, provider_id, model_id))
+    }
+
+    /// Finds the best entry for `(provider_id, model_id)`, ignoring any model variant.
     ///
     /// The scan is linear because a hand-maintained table holds a handful of models; callers that
     /// resolve millions of rows may hoist their own map if profiling ever demands it.
     pub fn lookup(&self, provider_id: &str, model_id: &str) -> Option<&PriceEntry> {
-        self.entries
-            .iter()
-            .find(|entry| entry.provider_id == provider_id && entry.model_id == model_id)
+        self.lookup_match(provider_id, model_id)
+            .map(|matched| matched.entry)
     }
 
     /// Estimates a cost for `(provider_id, model_id)`, or `None` when the model is not priced.
@@ -714,6 +955,161 @@ mod tests {
 
     fn priced_table() -> PriceTable {
         PriceTable::from_entries(vec![priced_entry()])
+    }
+
+    #[test]
+    fn bundled_catalog_has_freshness_metadata_and_required_providers() {
+        let catalog = builtin_price_catalog();
+
+        assert_eq!(catalog.schema_version, 1);
+        assert!(!catalog.catalog_version.trim().is_empty());
+        assert!(!catalog.updated_at.trim().is_empty());
+        assert_eq!(catalog.currency, "USD");
+
+        let providers = catalog
+            .entries
+            .iter()
+            .map(|entry| entry.provider_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for required in ["anthropic", "openai", "google", "amazon-bedrock"] {
+            assert!(providers.contains(required), "missing provider {required}");
+        }
+    }
+
+    #[test]
+    fn price_match_reports_literal_tuple_as_exact() {
+        let entries = vec![PriceEntry::new(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            3.0,
+            15.0,
+            0.3,
+            3.75,
+        )];
+
+        let matched = match_price(
+            &entries,
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        )
+        .expect("literal tuple must match");
+
+        assert_eq!(matched.kind, PriceMatchKind::Exact);
+        assert_eq!(
+            matched.entry.model_id,
+            "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+    }
+
+    #[test]
+    fn price_match_normalizes_bedrock_prefix_region_suffix_and_case() {
+        let entries = vec![PriceEntry::new(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            3.0,
+            15.0,
+            0.3,
+            3.75,
+        )];
+
+        for (provider, model) in [
+            ("aws", "claude-sonnet-4-5-20250929"),
+            ("BEDROCK", "US.ANTHROPIC.CLAUDE-SONNET-4-5-20250929-V1:0"),
+            (
+                "amazon_bedrock",
+                "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+        ] {
+            let matched = match_price(&entries, provider, model).expect("normalized Bedrock match");
+            assert_eq!(
+                matched.kind,
+                PriceMatchKind::Normalized,
+                "{provider}/{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn price_match_selects_nearest_version_only_within_the_same_family() {
+        let entries = vec![
+            PriceEntry::new(
+                "anthropic",
+                "claude-sonnet-4-5-20250929",
+                3.0,
+                15.0,
+                0.3,
+                3.75,
+            ),
+            PriceEntry::new(
+                "anthropic",
+                "claude-sonnet-4-5-20251101",
+                4.0,
+                20.0,
+                0.4,
+                5.0,
+            ),
+            PriceEntry::new(
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                1.0,
+                5.0,
+                0.1,
+                1.25,
+            ),
+        ];
+
+        let matched = match_price(&entries, "anthropic", "claude-sonnet-4-5-20251001")
+            .expect("same-family dated model must match");
+
+        assert_eq!(matched.kind, PriceMatchKind::Family);
+        assert_eq!(matched.entry.model_id, "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn price_match_refuses_unknown_provider_or_model_family() {
+        let entries = vec![PriceEntry::new(
+            "anthropic",
+            "claude-sonnet-4-5-20250929",
+            3.0,
+            15.0,
+            0.3,
+            3.75,
+        )];
+
+        assert!(match_price(&entries, "openai", "claude-sonnet-4-5-20250929").is_none());
+        assert!(match_price(&entries, "anthropic", "claude-opus-4-5-20250929").is_none());
+        assert!(match_price(&entries, "anthropic", "private-model").is_none());
+    }
+
+    #[test]
+    fn manual_override_wins_before_bundled_catalog_fallback() {
+        let manual = PriceEntry::new(
+            "anthropic",
+            "claude-sonnet-4-5-20250929",
+            99.0,
+            199.0,
+            9.0,
+            19.0,
+        );
+        let table = PriceTable::from_entries(vec![manual]);
+
+        let matched = table
+            .lookup_match("anthropic", "claude-sonnet-4-5-20250929")
+            .expect("manual override must match");
+
+        assert_eq!(matched.kind, PriceMatchKind::Exact);
+        assert_eq!(matched.entry.input_per_mtok, 99.0);
+    }
+
+    #[test]
+    fn empty_override_table_falls_back_to_bundled_catalog_with_match_kind() {
+        let table = PriceTable::new();
+        let matched = table
+            .lookup_match("aws", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .expect("bundled Bedrock price must be available without overrides");
+
+        assert_eq!(matched.kind, PriceMatchKind::Normalized);
+        assert_eq!(matched.entry.provider_id, "amazon-bedrock");
     }
 
     /// Unavailable-cost record on the priced model, carrying all four billable buckets plus a large

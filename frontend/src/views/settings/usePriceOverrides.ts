@@ -12,10 +12,11 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useState } from 'react'
 
-import type { PriceEntry, PriceTable } from '@/generated'
-import { pricesGet, pricesSet } from '@/lib/ipc'
+import type { ObservedModelPrice, PriceEntry, PriceTable } from '@/generated'
+import { priceCatalogGet, pricesGet, pricesSet } from '@/lib/ipc'
 
 export const PRICES_QUERY_KEY = ['settings', 'prices'] as const
+export const PRICE_CATALOG_QUERY_KEY = ['settings', 'price-catalog'] as const
 
 const NUMERIC_FIELDS = [
   'inputPerMtok',
@@ -89,6 +90,7 @@ function toTable(rows: PriceRowDraft[], loaded: PriceTable): PriceTable {
 export function usePriceOverrides() {
   const queryClient = useQueryClient()
   const prices = useQuery({ queryKey: PRICES_QUERY_KEY, queryFn: pricesGet })
+  const catalog = useQuery({ queryKey: PRICE_CATALOG_QUERY_KEY, queryFn: priceCatalogGet })
   const [draft, setDraft] = useState<PriceRowDraft[] | null>(null)
   const [nextRowId, setNextRowId] = useState(0)
   const [saved, setSaved] = useState(false)
@@ -108,6 +110,7 @@ export function usePriceOverrides() {
     },
     onSuccess: (result) => {
       queryClient.setQueryData(PRICES_QUERY_KEY, result)
+      void queryClient.invalidateQueries({ queryKey: PRICE_CATALOG_QUERY_KEY })
       setDraft(null)
       setSaved(true)
     },
@@ -115,31 +118,39 @@ export function usePriceOverrides() {
 
   const issues = priceIssues(rows)
 
+  const addDraft = (entry?: ObservedModelPrice) => {
+    const matched = entry?.matchedPrice
+    mutate([
+      ...rows,
+      {
+        rowId: `new-${nextRowId}`,
+        providerId: entry?.providerId ?? '',
+        modelId: entry?.modelId ?? '',
+        inputPerMtok: String(matched?.inputPerMtok ?? 0),
+        outputPerMtok: String(matched?.outputPerMtok ?? 0),
+        cacheReadPerMtok: String(matched?.cacheReadPerMtok ?? 0),
+        cacheWritePerMtok: String(matched?.cacheWritePerMtok ?? 0),
+        extra: {},
+      },
+    ])
+    setNextRowId((current) => current + 1)
+  }
+
   return {
     rows,
+    catalog: catalog.data,
     issues,
     dirty: draft !== null,
     saved: saved && draft === null,
-    isPending: prices.isPending,
+    isPending: prices.isPending || catalog.isPending,
     isSaving: save.isPending,
-    error: prices.error ?? save.error ?? null,
-    refetch: () => void prices.refetch(),
-    addRow: () => {
-      mutate([
-        ...rows,
-        {
-          rowId: `new-${nextRowId}`,
-          providerId: '',
-          modelId: '',
-          inputPerMtok: '0',
-          outputPerMtok: '0',
-          cacheReadPerMtok: '0',
-          cacheWritePerMtok: '0',
-          extra: {},
-        },
-      ])
-      setNextRowId((current) => current + 1)
+    error: prices.error ?? catalog.error ?? save.error ?? null,
+    refetch: () => {
+      void prices.refetch()
+      void catalog.refetch()
     },
+    addRow: () => addDraft(),
+    addObservedModel: addDraft,
     deleteRow: (rowId: string) => mutate(rows.filter((row) => row.rowId !== rowId)),
     editRow: (rowId: string, patch: Partial<Omit<PriceRowDraft, 'rowId' | 'extra'>>) =>
       mutate(rows.map((row) => (row.rowId === rowId ? { ...row, ...patch } : row))),

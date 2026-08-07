@@ -149,12 +149,14 @@ test('price rows can be added, edited and deleted through prices_set', async ({ 
   await openSettings(page)
 
   await expect(page.getByTestId('price-row-0')).toBeVisible()
-  await expect(page.getByTestId('price-provider-0')).toHaveValue('kiro-auth')
+  expect(await page.getByTestId('price-provider-0').evaluate((node) => node.tagName)).toBe('SELECT')
+  await expect(page.getByTestId('price-provider-0')).toHaveValue('__custom__')
+  await expect(page.getByTestId('price-provider-custom-0')).toHaveValue('kiro-auth')
   await expect(page.getByTestId('price-row-2')).toHaveCount(0)
 
   await page.getByTestId('price-add').click()
-  await page.getByTestId('price-provider-2').fill('anthropic')
-  await page.getByTestId('price-model-2').fill('claude-sonnet-5')
+  await page.getByTestId('price-provider-2').selectOption('anthropic')
+  await page.getByTestId('price-model-2').selectOption('claude-sonnet-4-5-20250929')
   await page.getByTestId('price-inputPerMtok-2').fill('2.5')
   await page.getByTestId('price-outputPerMtok-2').fill('12')
   await page.getByTestId('price-cacheReadPerMtok-2').fill('0.25')
@@ -172,7 +174,7 @@ test('price rows can be added, edited and deleted through prices_set', async ({ 
   expect(table.entries[0]).toMatchObject({ providerId: 'kiro-auth', inputPerMtok: 4 })
   expect(table.entries[2]).toMatchObject({
     providerId: 'anthropic',
-    modelId: 'claude-sonnet-5',
+    modelId: 'claude-sonnet-4-5-20250929',
     inputPerMtok: 2.5,
     outputPerMtok: 12,
     cacheReadPerMtok: 0.25,
@@ -202,8 +204,8 @@ test('malformed price rows block the save with a readable reason', async ({ page
   await expect(page.getByTestId('price-issue-blank')).toBeVisible()
   await expect(page.getByTestId('price-save')).toBeDisabled()
 
-  await page.getByTestId('price-provider-2').fill('anthropic')
-  await page.getByTestId('price-model-2').fill('claude-sonnet-5')
+  await page.getByTestId('price-provider-2').selectOption('anthropic')
+  await page.getByTestId('price-model-2').selectOption('claude-sonnet-4-5-20250929')
   await expect(page.getByTestId('price-issue-blank')).toHaveCount(0)
 
   await page.getByTestId('price-inputPerMtok-2').fill('-1')
@@ -211,12 +213,76 @@ test('malformed price rows block the save with a readable reason', async ({ page
   await expect(page.getByTestId('price-save')).toBeDisabled()
 
   await page.getByTestId('price-inputPerMtok-2').fill('1')
-  await page.getByTestId('price-provider-2').fill('kiro-auth')
-  await page.getByTestId('price-model-2').fill('claude-opus-5-max')
+  await page.getByTestId('price-provider-2').selectOption('__custom__')
+  await page.getByTestId('price-provider-custom-2').fill('kiro-auth')
+  await page.getByTestId('price-model-custom-2').fill('claude-opus-5-max')
   await expect(page.getByTestId('price-issue-duplicate')).toBeVisible()
   await expect(page.getByTestId('price-save')).toBeDisabled()
 
   expect(await mockCalls(page, 'prices_set')).toHaveLength(0)
+})
+
+test('provider and model dropdowns are linked and selecting a catalog model fills prices', async ({
+  page,
+}) => {
+  await openSettings(page)
+
+  await expect(page.getByTestId('price-catalog-version')).toContainText('2026-08-07.1')
+  await page.getByTestId('price-add').click()
+
+  const provider = page.getByTestId('price-provider-2')
+  await expect(provider.locator('option')).toHaveText([
+    '请选择 provider',
+    'Amazon Bedrock',
+    'Anthropic',
+    'Google',
+    'OpenAI',
+    '手动输入…',
+  ])
+  await provider.selectOption('amazon-bedrock')
+
+  const model = page.getByTestId('price-model-2')
+  const modelOptions = await model.locator('option').allTextContents()
+  expect(modelOptions).toContain('anthropic.claude-sonnet-4-5-20250929-v1:0')
+  expect(modelOptions).not.toContain('gpt-5')
+
+  await model.selectOption('anthropic.claude-sonnet-4-5-20250929-v1:0')
+  await expect(page.getByTestId('price-inputPerMtok-2')).toHaveValue('3')
+  await expect(page.getByTestId('price-outputPerMtok-2')).toHaveValue('15')
+  await expect(page.getByTestId('price-cacheReadPerMtok-2')).toHaveValue('0.3')
+  await expect(page.getByTestId('price-cacheWritePerMtok-2')).toHaveValue('3.75')
+})
+
+test('catalog gaps stay honest and can be copied into a manual override row', async ({ page }) => {
+  await openSettings(page)
+
+  const approximate = page.getByTestId('price-observed-approximate-0')
+  await expect(approximate).toContainText('近似匹配')
+  await expect(approximate).toContainText(
+    'aws / us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+  )
+
+  const unknown = page.getByTestId('price-observed-unknown-0')
+  await expect(unknown).toContainText('价格未知')
+  await expect(unknown).toContainText('private-provider / private-model-v7')
+  await page.getByTestId('price-observed-add-unknown-0').click()
+
+  await expect(page.getByTestId('price-provider-2')).toHaveValue('__custom__')
+  await expect(page.getByTestId('price-provider-custom-2')).toHaveValue('private-provider')
+  await expect(page.getByTestId('price-model-custom-2')).toHaveValue('private-model-v7')
+  await page.getByTestId('price-inputPerMtok-2').fill('0.8')
+  await page.getByTestId('price-outputPerMtok-2').fill('3.2')
+  await page.getByTestId('price-save').click()
+
+  const calls = await mockCalls(page, 'prices_set')
+  expect(calls).toHaveLength(1)
+  const table = (calls[0].args as { prices: { entries: unknown[] } }).prices
+  expect(table.entries[2]).toMatchObject({
+    providerId: 'private-provider',
+    modelId: 'private-model-v7',
+    inputPerMtok: 0.8,
+    outputPerMtok: 3.2,
+  })
 })
 
 test('a prices IPC failure renders the shared error state instead of an empty table', async ({

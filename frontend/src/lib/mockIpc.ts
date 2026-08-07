@@ -58,6 +58,7 @@ import type {
   IpcError,
   MessagePage,
   MessageRow,
+  PriceCatalog,
   PriceTable,
   RefreshEvent,
   SeriesPoint,
@@ -106,6 +107,7 @@ export interface MockIpcDataset {
   hosts: Host[]
   refreshStatus: SourceStatus[]
   settings: AppSettings
+  priceCatalog: PriceCatalog
   prices: PriceTable
 }
 
@@ -432,6 +434,75 @@ const PRICES: PriceTable = {
   extra: {},
 }
 
+const PRICE_CATALOG: PriceCatalog = {
+  schemaVersion: 1,
+  catalogVersion: '2026-08-07.1',
+  updatedAt: '2026-08-07',
+  currency: 'USD',
+  entries: [
+    {
+      providerId: 'anthropic',
+      modelId: 'claude-sonnet-4-5-20250929',
+      inputPerMtok: 3,
+      outputPerMtok: 15,
+      cacheReadPerMtok: 0.3,
+      cacheWritePerMtok: 3.75,
+      extra: {},
+    },
+    {
+      providerId: 'openai',
+      modelId: 'gpt-5',
+      inputPerMtok: 1.25,
+      outputPerMtok: 10,
+      cacheReadPerMtok: 0.125,
+      cacheWritePerMtok: 1.25,
+      extra: {},
+    },
+    {
+      providerId: 'google',
+      modelId: 'gemini-2.5-pro',
+      inputPerMtok: 1.25,
+      outputPerMtok: 10,
+      cacheReadPerMtok: 0.125,
+      cacheWritePerMtok: 1.25,
+      extra: {},
+    },
+    {
+      providerId: 'amazon-bedrock',
+      modelId: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+      inputPerMtok: 3,
+      outputPerMtok: 15,
+      cacheReadPerMtok: 0.3,
+      cacheWritePerMtok: 3.75,
+      extra: {},
+    },
+  ],
+  observedModels: [
+    {
+      providerId: 'aws',
+      modelId: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+      usageCount: 12,
+      matchKind: 'normalized',
+      matchedPrice: {
+        providerId: 'amazon-bedrock',
+        modelId: 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+        inputPerMtok: 3,
+        outputPerMtok: 15,
+        cacheReadPerMtok: 0.3,
+        cacheWritePerMtok: 3.75,
+        extra: {},
+      },
+    },
+    {
+      providerId: 'private-provider',
+      modelId: 'private-model-v7',
+      usageCount: 3,
+      matchKind: 'unknown',
+      matchedPrice: null,
+    },
+  ],
+}
+
 /** Deep-ish clone so a mutating consumer can never corrupt the shared seed. */
 function cloneDataset(dataset: MockIpcDataset): MockIpcDataset {
   return structuredClone(dataset)
@@ -446,6 +517,7 @@ export function mockDataset(): MockIpcDataset {
     hosts: HOSTS,
     refreshStatus: REFRESH_STATUS,
     settings: SETTINGS,
+    priceCatalog: PRICE_CATALOG,
     prices: PRICES,
   })
 }
@@ -545,6 +617,7 @@ const HANDLERS: Record<IpcCommand, (state: MockState, args: Record<string, unkno
     state.dataset.settings = { values: { ...state.dataset.settings.values, ...incoming } }
     return state.dataset.settings
   },
+  price_catalog_get: (state) => state.dataset.priceCatalog,
   prices_get: (state) => state.dataset.prices,
   prices_set: (state, args) => {
     state.dataset.prices = args.prices as PriceTable

@@ -6,7 +6,8 @@ use agentlens_core::hostsource::{
     TriggerMode as CoreTriggerMode, TriggerOutcome as CoreTriggerOutcome,
 };
 use agentlens_core::pricing::{
-    CostTotals as CoreCostTotals, PriceEntry as CorePriceEntry, PriceTable as CorePriceTable,
+    CostTotals as CoreCostTotals, PriceCatalog as CorePriceCatalog, PriceEntry as CorePriceEntry,
+    PriceMatchKind as CorePriceMatchKind, PriceTable as CorePriceTable,
 };
 use agentlens_core::query::{
     BreakdownRow as CoreBreakdownRow, CoverageStatus as CoreCoverageStatus,
@@ -743,6 +744,66 @@ impl From<PriceTable> for CorePriceTable {
             schema_version: value.schema_version,
             entries: value.entries.into_iter().map(Into::into).collect(),
             extra: value.extra,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub enum PriceMatchKind {
+    Exact,
+    Normalized,
+    Family,
+    Unknown,
+}
+
+impl From<CorePriceMatchKind> for PriceMatchKind {
+    fn from(value: CorePriceMatchKind) -> Self {
+        match value {
+            CorePriceMatchKind::Exact => Self::Exact,
+            CorePriceMatchKind::Normalized => Self::Normalized,
+            CorePriceMatchKind::Family => Self::Family,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedModelPrice {
+    pub provider_id: String,
+    pub model_id: String,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+    pub usage_count: u64,
+    pub match_kind: PriceMatchKind,
+    pub matched_price: Option<PriceEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct PriceCatalog {
+    pub schema_version: u32,
+    pub catalog_version: String,
+    pub updated_at: String,
+    pub currency: String,
+    pub entries: Vec<PriceEntry>,
+    pub observed_models: Vec<ObservedModelPrice>,
+}
+
+impl PriceCatalog {
+    pub(crate) fn from_core(
+        catalog: &CorePriceCatalog,
+        observed_models: Vec<ObservedModelPrice>,
+    ) -> Self {
+        Self {
+            schema_version: catalog.schema_version,
+            catalog_version: catalog.catalog_version.clone(),
+            updated_at: catalog.updated_at.clone(),
+            currency: catalog.currency.clone(),
+            entries: catalog.entries.iter().cloned().map(Into::into).collect(),
+            observed_models,
         }
     }
 }
