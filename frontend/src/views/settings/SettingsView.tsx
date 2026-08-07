@@ -11,6 +11,7 @@
 import { ErrorState, LoadingState } from '@/components/app-state'
 import { zh } from '@/i18n/zh'
 
+import { AppearanceCard } from './AppearanceCard'
 import { ArchiveLocationCard } from './ArchiveLocationCard'
 import { PriceOverrideEditor } from './PriceOverrideEditor'
 import { ReportSettingsCard } from './ReportSettingsCard'
@@ -27,6 +28,8 @@ export function SettingsView() {
         <h2 className="text-2xl font-semibold tracking-tight">{zh.settings.title}</h2>
         <p className="text-sm text-muted-foreground">{zh.settings.subtitle}</p>
       </div>
+
+      <AppearanceCard />
 
       {form.error !== null ? (
         <ErrorState error={form.error} onRetry={form.refetch} />

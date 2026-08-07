@@ -314,7 +314,7 @@ impl RefreshRuntime {
         self.execute_with_completion_notifier(action, move |host_id| {
             if let Some(app) = app_handle.get() {
                 if let Err(error) = app.emit(EVENT_REFRESH_COMPLETED, host_id.to_owned()) {
-                    eprintln!("agentlens: unable to announce the completed round: {error}");
+                    tracing::warn!(%error, "unable to announce the completed round");
                 }
             }
         });
@@ -336,7 +336,7 @@ impl RefreshRuntime {
         if changed {
             if let Some(app) = self.app_handle.get() {
                 if let Err(error) = app.emit(EVENT_ARCHIVE_COMMITTED, action.host_id.clone()) {
-                    eprintln!("agentlens: unable to announce the committed round: {error}");
+                    tracing::warn!(%error, "unable to announce the committed round");
                 }
             }
         }

@@ -403,9 +403,9 @@ describe('ipc/主机视图侧的五个命令（hostsIpc）', () => {
 })
 
 describe('ipc/命令清单与 Rust 注册表一致', () => {
-  it('IPC_COMMANDS 恰好是 16 个且无重复', () => {
-    expect(ipc.IPC_COMMANDS).toHaveLength(16)
-    expect(new Set(ipc.IPC_COMMANDS).size).toBe(16)
+  it('IPC_COMMANDS 恰好是 18 个且无重复', () => {
+    expect(ipc.IPC_COMMANDS).toHaveLength(18)
+    expect(new Set(ipc.IPC_COMMANDS).size).toBe(18)
   })
 
   /**

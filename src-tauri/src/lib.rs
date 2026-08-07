@@ -1,10 +1,13 @@
 mod commands;
 pub mod contract;
 pub mod credentials;
+pub mod logging;
 mod state;
 mod tray;
 
 mod bindings;
+
+use tauri::Manager;
 
 /// Expands to the full invoke handler, plus any extra command paths passed in.
 ///
@@ -36,6 +39,8 @@ macro_rules! agentlens_handler {
             commands::credential_set,
             commands::credential_status,
             commands::credential_delete,
+            commands::logs_tail,
+            commands::diagnostics_report,
             $($debug_command),*
         ]
     };
@@ -43,18 +48,34 @@ macro_rules! agentlens_handler {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = state::AppState::open_default()?;
-    // `app_settings` is the only settings store; the shell applies what it holds before the
-    // first refresh round can fire, and publishes the archive location for the settings view.
-    tray::publish_archive_location(&state);
-    tray::apply_refresh_intervals(&state);
-    state.start_refresh_loop();
 
     let builder = tauri::Builder::default()
-        // 只为「在系统文件管理器里定位归档库」而装：设置页的路径否则只能靠手工复制。
+        // 「在系统文件管理器里定位归档库」与「在默认浏览器里打开反馈页」的唯一通道。
         .plugin(tauri_plugin_opener::init())
         .manage(state)
         .on_window_event(tray::handle_window_event)
         .setup(|app| {
+            // Logging comes first so that everything below it is diagnosable. The log
+            // directory is resolved by Tauri (`app_log_dir`) rather than hand-assembled,
+            // because the three platforms disagree on where logs belong.
+            if let Ok(directory) = app.path().app_log_dir() {
+                logging::init(directory);
+            }
+            tracing::info!(
+                version = env!("CARGO_PKG_VERSION"),
+                os = std::env::consts::OS,
+                arch = std::env::consts::ARCH,
+                "AgentLens starting"
+            );
+
+            // `app_settings` is the only settings store; the shell applies what it holds
+            // before the first refresh round can fire, and publishes the archive location
+            // for the settings view. Both steps report failures, so they run after logging.
+            let state = app.state::<state::AppState>();
+            tray::publish_archive_location(&state);
+            tray::apply_refresh_intervals(&state);
+            state.start_refresh_loop();
+
             tray::install(app.handle())?;
             #[cfg(debug_assertions)]
             tray::spawn_selftest_driver(app.handle());

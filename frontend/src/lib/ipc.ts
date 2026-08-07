@@ -23,12 +23,14 @@ import type {
   BreakdownDimensions,
   BreakdownRow,
   DateRange,
+  DiagnosticsReport,
   Granularity,
   Host,
   HostCreateInput,
   HostUpdateInput,
   IpcError,
   IpcErrorCode,
+  LogTail,
   MessageFilters,
   MessagePage,
   PriceCatalog,
@@ -57,6 +59,8 @@ export const IPC_COMMANDS = [
   'price_catalog_get',
   'prices_get',
   'prices_set',
+  'logs_tail',
+  'diagnostics_report',
 ] as const
 
 export type IpcCommand = (typeof IPC_COMMANDS)[number]
@@ -205,4 +209,26 @@ export function pricesGet(): Promise<PriceTable> {
 /** Writes `prices.json` atomically on the Rust side; returns the reloaded table. */
 export function pricesSet(prices: PriceTable): Promise<PriceTable> {
   return invoke<PriceTable>('prices_set', { prices })
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+// ---------------------------------------------------------------------------
+
+/**
+ * Newest log records, newest first. `limit` is clamped to 2000 by the Rust layer, which never
+ * ships a whole rotated 2 MiB generation over IPC.
+ */
+export function logsTail(limit?: number): Promise<LogTail> {
+  return invoke<LogTail>('logs_tail', { limit })
+}
+
+/**
+ * Environment facts intended for a public bug report.
+ *
+ * Carries no hostname, user name, machine-id hash, archive path or credential — see
+ * `DiagnosticsReport` in the Rust `logging` module for why that is a hard constraint.
+ */
+export function diagnosticsReport(): Promise<DiagnosticsReport> {
+  return invoke<DiagnosticsReport>('diagnostics_report')
 }

@@ -50,12 +50,16 @@
  * remediation string mirroring `agentlens_core::transport::ssh` error text.
  */
 import type {
+  AggregateFilters,
   AppSettings,
   BreakdownRow,
   CostTotals,
   CoverageStatus,
+  DiagnosticsReport,
   Host,
   IpcError,
+  LogEntry,
+  LogTail,
   MessagePage,
   MessageRow,
   PriceCatalog,
@@ -109,6 +113,8 @@ export interface MockIpcDataset {
   settings: AppSettings
   priceCatalog: PriceCatalog
   prices: PriceTable
+  logs: LogTail
+  diagnostics: DiagnosticsReport
 }
 
 export interface MockIpcConfig {
@@ -503,6 +509,57 @@ const PRICE_CATALOG: PriceCatalog = {
   ],
 }
 
+/**
+ * Log seed — one record per level, newest last so `logs_tail`'s newest-first contract is
+ * assertable, plus a WARN whose message contains a colon and a brace to prove the viewer does
+ * not re-split an already-parsed record.
+ */
+const LOG_ENTRIES: LogEntry[] = [
+  {
+    timestamp: '2026-08-07T09:58:01.004+08:00',
+    level: 'trace',
+    target: 'agentlens_tauri_lib::state',
+    message: 'scheduler tick admitted 0 actions',
+  },
+  {
+    timestamp: '2026-08-07T09:58:02.117+08:00',
+    level: 'debug',
+    target: 'agentlens_tauri_lib::commands',
+    message: 'unable to send refresh progress: channel closed',
+  },
+  {
+    timestamp: '2026-08-07T09:58:03.220+08:00',
+    level: 'info',
+    target: 'agentlens_tauri_lib::tray',
+    message: 'tray icon installed (open / refresh / quit)',
+  },
+  {
+    timestamp: '2026-08-07T09:58:04.331+08:00',
+    level: 'warn',
+    target: 'agentlens_tauri_lib::tray',
+    message: 'unable to apply refresh interval: {clamped: 300000}',
+  },
+  {
+    timestamp: '2026-08-07T09:58:05.442+08:00',
+    level: 'error',
+    target: 'agentlens_tauri_lib::tray',
+    message: 'archive unavailable: database is locked',
+  },
+]
+
+const LOGS: LogTail = {
+  directory: '/home/mock/.local/share/top.onethinker.agentlens/logs',
+  entries: [...LOG_ENTRIES].reverse(),
+  empty: false,
+}
+
+const DIAGNOSTICS: DiagnosticsReport = {
+  appVersion: '0.1.0',
+  os: 'linux',
+  arch: 'x86_64',
+  webviewVersion: '2.48.1',
+}
+
 /** Deep-ish clone so a mutating consumer can never corrupt the shared seed. */
 function cloneDataset(dataset: MockIpcDataset): MockIpcDataset {
   return structuredClone(dataset)
@@ -519,6 +576,8 @@ export function mockDataset(): MockIpcDataset {
     settings: SETTINGS,
     priceCatalog: PRICE_CATALOG,
     prices: PRICES,
+    logs: LOGS,
+    diagnostics: DIAGNOSTICS,
   })
 }
 
@@ -528,6 +587,83 @@ export function mockDataset(): MockIpcDataset {
 
 function asNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
+}
+
+/**
+ * Filter-aware `get_trend`.
+ *
+ * The grouped trend chart issues one `get_trend` per dimension value, so a mock that ignored
+ * `filters` would hand every group the unfiltered total — the grouped view would show N
+ * identical lines and the "其他" remainder would always clamp to 0, making the whole feature
+ * untestable. Instead the seeded series is scaled by the filtered slice's share of
+ * `breakdown`'s token weight. The shares of a full partition therefore sum to exactly 1, which
+ * is what lets a spec assert grouped values against the total.
+ *
+ * `hostId` is not honoured: `BreakdownRow` carries no host, so there is nothing here to scale
+ * by. That mirrors the real backend split, where the host filter is applied inside SQL.
+ */
+function tokenWeight(tokens: TokenValues): number {
+  return (
+    tokens.tokInput +
+    tokens.tokOutput +
+    tokens.tokReasoning +
+    tokens.tokCacheRead +
+    tokens.tokCacheWrite
+  )
+}
+
+function matchesFilters(row: BreakdownRow, filters: AggregateFilters): boolean {
+  return (
+    (filters.source === null || row.source === filters.source) &&
+    (filters.agentKey === null || row.agentKey === filters.agentKey) &&
+    (filters.providerId === null || row.providerId === filters.providerId) &&
+    (filters.modelId === null || row.modelId === filters.modelId)
+  )
+}
+
+function filterShare(rows: BreakdownRow[], filters: unknown): number {
+  if (filters === null || typeof filters !== 'object') return 1
+  const narrowed = filters as AggregateFilters
+  if (
+    narrowed.source === null &&
+    narrowed.agentKey === null &&
+    narrowed.providerId === null &&
+    narrowed.modelId === null
+  ) {
+    return 1
+  }
+  const total = rows.reduce((sum, row) => sum + tokenWeight(row.tokens), 0)
+  if (total <= 0) return 0
+  const matched = rows
+    .filter((row) => matchesFilters(row, narrowed))
+    .reduce((sum, row) => sum + tokenWeight(row.tokens), 0)
+  return matched / total
+}
+
+function scaleSeries(points: SeriesPoint[], share: number): SeriesPoint[] {
+  if (share === 1) return points
+  return points.map((point) => ({
+    ...point,
+    tokens:
+      point.tokens === null
+        ? null
+        : tokens(
+            Math.round(point.tokens.tokInput * share),
+            Math.round(point.tokens.tokOutput * share),
+            Math.round(point.tokens.tokReasoning * share),
+            Math.round(point.tokens.tokCacheRead * share),
+            Math.round(point.tokens.tokCacheWrite * share),
+          ),
+    cost:
+      point.cost === null
+        ? null
+        : cost(
+            point.cost.actualSum * share,
+            point.cost.estimatedSum * share,
+            Math.round(point.cost.unavailableCount * share),
+          ),
+    messageCount: point.messageCount === null ? null : Math.round(point.messageCount * share),
+  }))
 }
 
 function paginate(rows: MessageRow[], limit: number, offset: number): MessagePage {
@@ -563,7 +699,8 @@ interface MockState {
  */
 const HANDLERS: Record<IpcCommand, (state: MockState, args: Record<string, unknown>) => unknown> = {
   get_summary: (state) => state.dataset.summary,
-  get_trend: (state) => state.dataset.trend,
+  get_trend: (state, args) =>
+    scaleSeries(state.dataset.trend, filterShare(state.dataset.breakdown, args.filters ?? null)),
   get_breakdown: (state) => state.dataset.breakdown,
   query_messages: (state, args) =>
     paginate(state.dataset.messages, asNumber(args.limit, 50), asNumber(args.offset, 0)),
@@ -623,6 +760,12 @@ const HANDLERS: Record<IpcCommand, (state: MockState, args: Record<string, unkno
     state.dataset.prices = args.prices as PriceTable
     return state.dataset.prices
   },
+  logs_tail: (state, args) => {
+    const limit = asNumber(args.limit, state.dataset.logs.entries.length)
+    const entries = state.dataset.logs.entries.slice(0, Math.max(1, limit))
+    return { ...state.dataset.logs, entries, empty: entries.length === 0 }
+  },
+  diagnostics_report: (state) => state.dataset.diagnostics,
 }
 
 function isIpcCommand(command: string): command is IpcCommand {

@@ -26,6 +26,31 @@ export const zh = {
     detail: '明细',
     hosts: '主机',
     settings: '设置',
+    diagnostics: '日志',
+  },
+
+  /**
+   * 颜色主题（外壳独占）。键名与 `src/app/theme/themes.ts` 的 `THEME_KEYS` 必须一一对应，
+   * 新增主题时三处同改：`index.css` 的 token 块、`themes.ts` 的注册表、这里的名称。
+   */
+  theme: {
+    label: '颜色主题',
+    names: {
+      light: '石墨浅色',
+      dark: '石墨深色',
+      forest: '苔原绿',
+      ocean: '深海蓝',
+      amber: '暖砂琥珀',
+      violet: '夜紫',
+    },
+    modes: {
+      light: '浅色 · 中性',
+      dark: '深色 · 中性',
+      forest: '浅色 · 冷绿',
+      ocean: '深色 · 蓝青',
+      amber: '深色 · 暖橙',
+      violet: '深色 · 紫',
+    },
   },
 
   /** 跨视图共用文案（外壳独占；需要新增共用词时请与外壳约定，避免与视图 section 重复）。 */
@@ -142,6 +167,28 @@ export const zh = {
       allGap: '该区间全部时间桶都没有数据覆盖',
       tooltipNoCoverage: '该时间桶没有归档覆盖，因此不画点（不是 0）',
       tooltipZeroUsage: '覆盖完整但无用量，真实为 0',
+
+      /**
+       * 分组维度。`tool`（工具）对应归档里的 source 字段：opencode / codex 这些是采集来源，
+       * 用户口语里叫「工具」，因此界面用「工具」而内部标识符仍是 source。
+       */
+      groupLabel: '分组维度',
+      groupNone: '不分组',
+      groupModel: '按模型',
+      groupAgent: '按 agent',
+      groupTool: '按工具',
+      groupNoneHint: '合计一条曲线，成本按实际 / 估算分列',
+      groupModelHint: '按 (provider, model) 分列；同一模型的 variant 合并',
+      groupAgentHint: '按 agent_key 分列，与用量分析二级一致',
+      groupToolHint: '按采集来源分列（opencode / codex 等）',
+      groupCostSeriesHint: '分组视图只画实际成本曲线；估算与缺失见悬浮提示',
+      groupOther: '其他',
+      groupOtherHint: (kept: number, total: number) =>
+        `曲线过多会读不出趋势，因此只画 token 合计最高的 ${kept} 项，其余 ${total - kept} 项合并为「其他」`,
+      groupTopHint: (total: number) => `该区间共 ${total} 项，全部单独成线`,
+      groupEmpty: '该区间没有可分组的维度值',
+      groupLoading: '正在按分组维度取数…',
+      groupOtherNote: '「其他」= 合计 − 已列出各项，负值按 0 处理（区间边界上可能出现舍入差）',
     },
   },
 
@@ -361,6 +408,13 @@ export const zh = {
     title: '设置',
     subtitle: '所有设置持久化到归档库的 app_settings 表，没有第二处存储',
 
+    /** 外观：主题名称本身在 `zh.theme`（外壳独占），此处只放本卡片的说明文案。 */
+    appearance: {
+      title: '外观',
+      description: '切换颜色主题；选择即时生效，无需点保存',
+      persistHint: '主题与其他设置一样存在 app_settings 表，重启后仍生效',
+    },
+
     /** 报表时区与周起日：桶边界由 Rust 查询层按这两个值计算。 */
     report: {
       title: '报表设置',
@@ -444,5 +498,56 @@ export const zh = {
     save: '保存设置',
     saved: '设置已保存',
     dirty: '有未保存的修改',
+  },
+
+  /**
+   * 日志与反馈视图。
+   *
+   * 反馈文案刻意不提供「把日志贴进 issue」的按钮：日志正文可能带主机名、SSH 目标与绝对
+   * 路径，自动脱敏是黑名单，漏一条就永久公开在公共 issue 里。预填只带构建与平台常量，
+   * 日志片段由用户自己复制他看过的内容。
+   */
+  diagnostics: {
+    title: '日志与反馈',
+    subtitle: '桌面壳的运行日志，以及带环境信息的问题反馈入口',
+
+    logs: {
+      title: '运行日志',
+      description: '按时间倒序，最新在最上；桌面壳没有控制台，出错信息只在这里',
+      refresh: '刷新',
+      levelLabel: '级别',
+      levelAll: '全部',
+      copy: '复制当前列表',
+      copied: '已复制',
+      copyFailed: '复制失败；请手动选中日志文本后复制',
+      openDirectory: '打开日志目录',
+      directoryLabel: '日志目录',
+      retention: '单文件上限 2 MiB，最多保留 3 个文件（合计不超过 6 MiB），超出后最旧的自动删除',
+      empty: '暂无日志记录；桌面壳一旦记录内容就会出现在这里',
+      emptyFiltered: '当前级别没有记录',
+      count: '条记录',
+      /** 与 openUnsupported 的区别见 zh.settings.archive。 */
+      openUnsupported: '当前环境不是桌面壳，无法调用文件管理器；请复制目录路径后手动打开',
+      openFailed: '系统未能打开文件管理器；请复制目录路径后手动打开',
+      envHint: '需要更详细的日志时，设置 RUST_LOG=debug 后重启应用',
+    },
+
+    feedback: {
+      title: '问题反馈',
+      description: '在 GitHub 上新建 issue，预填应用版本与平台信息',
+      open: '去 GitHub 提交反馈',
+      openUnsupported: '当前环境不是桌面壳，无法调用浏览器；请复制链接后手动打开',
+      openFailed: '系统未能打开浏览器；请复制链接后手动打开',
+      copyLink: '复制反馈链接',
+      copied: '已复制',
+      environmentTitle: '将随反馈一起提交的环境信息',
+      privacyNotice:
+        '预填内容只有下面这几项，不含主机地址、用户名、机器标识哈希、归档路径或任何凭据。日志片段请自行复制你确认过的内容后粘贴。',
+      appVersion: '应用版本',
+      os: '操作系统',
+      arch: '架构',
+      webview: 'WebView 版本',
+      webviewUnknown: '未知',
+    },
   },
 } as const

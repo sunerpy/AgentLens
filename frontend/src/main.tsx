@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import './index.css'
 import App from './App.tsx'
+import { applyCachedTheme } from '@/app/theme/applyTheme'
 import { subscribeArchiveCommits } from '@/lib/archiveQueries'
 import { installContextMenuGuard } from '@/lib/contextMenuGuard'
 import { isIpcError } from '@/lib/ipc'
@@ -40,6 +41,11 @@ async function bootstrap() {
   // React tree mid-refresh) is never reachable. Editable fields keep their native menu —
   // `@/lib/contextMenuGuard` explains why that exemption is mandatory.
   installContextMenuGuard()
+
+  // Before the first paint, so a dark theme does not flash the light palette while
+  // `get_settings` is in flight. `app_settings` stays authoritative — ThemeProvider
+  // overwrites both the DOM and this cache as soon as the real value arrives.
+  applyCachedTheme()
 
   // Dev-only: `?mockIpc=1` swaps in the mock IPC layer before the first render so
   // Playwright specs run against vite dev with no Tauri process. Statically dead in
