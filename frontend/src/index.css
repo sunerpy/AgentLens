@@ -176,4 +176,23 @@
   html {
     @apply font-sans;
   }
+
+  /*
+   * Selection policy — deny-list on chrome, NOT the usual `body { user-select: none }` plus
+   * an allow-list. This app exists to show data the user copies out: the 64-hex machine-id
+   * hash, archive paths, model ids, and the `code`/`fields` of an IPC error. An allow-list
+   * makes every new data surface opt in and fails silently when one forgets; this fails the
+   * harmless way, leaving a caption selectable.
+   *
+   * Only pure affordance is listed: control labels (`button` covers nav tabs, titlebar
+   * controls and action buttons), field captions (`label`), and the caption half of a
+   * definition list (`dt` — `dd` stays selectable, which is what keeps the host id and
+   * machine-id hash drag-copyable).
+   */
+  button,
+  label,
+  dt {
+    user-select: none;
+    -webkit-user-select: none;
+  }
 }

@@ -416,8 +416,10 @@ export const zh = {
       unavailable: '归档库位置暂不可用',
       copy: '复制路径',
       copied: '已复制',
-      openUnavailable:
-        '当前桌面壳未安装 opener/shell 插件，无法直接打开所在目录；请复制路径后在文件管理器中打开',
+      open: '打开所在目录',
+      openUnsupported: '当前环境不是桌面壳，无法调用文件管理器；请复制路径后手动打开',
+      /** 与 openUnsupported 的区别：壳存在但系统拒绝了，Linux 上多为缺文件管理器的 D-Bus 服务。 */
+      openFailed: '系统未能打开文件管理器；请复制路径后手动打开',
     },
 
     save: '保存设置',

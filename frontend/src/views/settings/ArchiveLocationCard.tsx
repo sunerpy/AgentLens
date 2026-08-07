@@ -3,19 +3,27 @@
  *
  * Archive location, read out of the `archive.path` key the Rust shell publishes at boot.
  *
- * "Open the containing folder" is not offered: this Tauri 2 setup has neither the opener nor the
- * shell plugin installed, and adding one would require editing `frontend/package.json` plus
- * `frontend/src/lib/ipc.ts`, both of which are outside this worker's file boundary. The path is
- * therefore rendered selectable with a copy button, and the reason is stated in the UI.
+ * Both a reveal action and a copy action are offered, because neither covers every
+ * environment: revealing needs a desktop shell with a reachable file manager, and outside one
+ * (a `vite dev` tab, the Playwright QA run, or a Linux box with no `org.freedesktop.FileManager1`
+ * on the session bus) copying is the only thing that works. A reveal that cannot happen
+ * therefore says which of the two cases it hit instead of throwing.
  */
 import { useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { zh } from '@/i18n/zh'
+import { revealPath, type RevealOutcome } from '@/lib/revealPath'
+
+const REVEAL_NOTICE: Record<Exclude<RevealOutcome, 'revealed'>, string> = {
+  unsupported: zh.settings.archive.openUnsupported,
+  failed: zh.settings.archive.openFailed,
+}
 
 export function ArchiveLocationCard({ path }: { path: string }) {
   const [copied, setCopied] = useState(false)
+  const [revealNotice, setRevealNotice] = useState<string | null>(null)
 
   return (
     <Card data-testid="settings-archive">
@@ -30,7 +38,22 @@ export function ArchiveLocationCard({ path }: { path: string }) {
         >
           {path === '' ? zh.settings.archive.unavailable : path}
         </code>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            data-testid="settings-archive-open"
+            disabled={path === ''}
+            onClick={() => {
+              setRevealNotice(null)
+              void revealPath(path).then((outcome) => {
+                setRevealNotice(outcome === 'revealed' ? null : REVEAL_NOTICE[outcome])
+              })
+            }}
+          >
+            {zh.settings.archive.open}
+          </Button>
           <Button
             type="button"
             size="sm"
@@ -52,12 +75,14 @@ export function ArchiveLocationCard({ path }: { path: string }) {
             </span>
           ) : null}
         </div>
-        <span
-          data-testid="settings-archive-open-unavailable"
-          className="text-xs text-muted-foreground"
-        >
-          {zh.settings.archive.openUnavailable}
-        </span>
+        {revealNotice === null ? null : (
+          <span
+            data-testid="settings-archive-open-notice"
+            className="text-xs text-muted-foreground"
+          >
+            {revealNotice}
+          </span>
+        )}
       </CardContent>
     </Card>
   )

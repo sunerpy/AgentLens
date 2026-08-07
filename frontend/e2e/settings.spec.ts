@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 
+import { zh } from '../src/i18n/zh'
 import { mockCalls, openShell, qaScreenshot } from './harness'
 
 /**
@@ -256,17 +257,39 @@ test('a failing set_settings surfaces the structured error', async ({ page }) =>
   await expect(page.getByTestId('error-message').first()).toHaveText('archive database is locked')
 })
 
-test('the archive location is shown with a copy action and a stated open limitation', async ({
+test('the archive location offers a reveal action that degrades to a notice, never a crash', async ({
   page,
   context,
 }) => {
+  const crashes: string[] = []
+  page.on('pageerror', (error) => crashes.push(error.message))
+
   await context.grantPermissions(['clipboard-write'])
   await openSettings(page)
 
   await expect(page.getByTestId('settings-archive-path')).toHaveText(ARCHIVE_PATH)
-  await expect(page.getByTestId('settings-archive-open-unavailable')).toBeVisible()
+
+  // The mock installs `__TAURI_INTERNALS__` but registers no opener command, so this run
+  // exercises the "shell present, reveal refused" branch — the same shape a Linux box with
+  // no `org.freedesktop.FileManager1` on the bus produces. It must degrade to a notice and
+  // leave the view intact; an unhandled rejection here is the regression being prevented.
+  // (The no-bridge branch has no reachable settings view to assert against and is covered by
+  // `src/lib/revealPath.test.ts`.)
+  await expect(page.getByTestId('settings-archive-open-notice')).toHaveCount(0)
+  await page.getByTestId('settings-archive-open').click()
+  await expect(page.getByTestId('settings-archive-open-notice')).toHaveText(
+    zh.settings.archive.openFailed,
+  )
+  await expect(page.getByTestId('settings-archive-path')).toHaveText(ARCHIVE_PATH)
+
+  // The wire contract: one reveal for exactly the displayed path, as an array.
+  const reveals = await mockCalls(page, 'plugin:opener|reveal_item_in_dir')
+  expect(reveals).toHaveLength(1)
+  expect(reveals[0].args).toEqual({ paths: [ARCHIVE_PATH] })
+
   await page.getByTestId('settings-archive-copy').click()
   await expect(page.getByTestId('settings-archive-copied')).toBeVisible()
+  expect(crashes).toEqual([])
 
   await qaScreenshot(page, 'settings.png')
 })

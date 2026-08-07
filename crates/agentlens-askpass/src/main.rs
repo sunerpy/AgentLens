@@ -14,6 +14,31 @@
 //! 4. 退出。OpenSSH 传入的提示语一律忽略，绝不回显到任何流；口令也绝不写 stderr。
 //!
 //! 刻意零依赖（`[dependencies]` 为空）：这个进程短暂持有明文口令，依赖面越小越好。
+//!
+//! # Windows GUI 子系统：为什么必须改，以及为什么口令仍然送得到
+//!
+//! 拉起本二进制的是 **ssh 自己**，不是我们的代码。`transport::ssh` 给 ssh 进程传的
+//! `CREATE_NO_WINDOW` 只作用于那一次 `CreateProcess`，不传给孙进程；而 Win32-OpenSSH 的
+//! `spawn_child_internal()` 按 exe 文件名硬编码白名单决定加不加该标志（只有
+//! `ssh-pkcs11-helper.exe`、`ssh-sk-helper.exe`）。askpass 不在名单里，于是 console 子系统的
+//! 本二进制被新分配一个控制台窗口 —— 用户看到的「刷新远端主机时弹 cmd 窗口」。改 PE 子系统是
+//! 外部唯一可控的手段。
+//!
+//! 口令照旧能交付：ssh 用 `STARTF_USESTDHANDLES` + `bInheritHandles=TRUE` 把管道写端放进
+//! `STARTUPINFO.hStdOutput`，这三个句柄「copied unchanged to the child process without
+//! validation」，内核不看子系统标志。子系统只决定 loader 是否**自动补**控制台（`GetStdHandle`
+//! 文档：CONSOLE 才自动填充，且仅「if the parent didn't already fill the standard handle table
+//! by inheritance」）。`AttachConsole` 文档写明了这条例外：「The exception to this is if the
+//! application is launched with handle inheritance by its parent process」。
+//!
+//! 代价：真的没有控制台时 `GetStdHandle` 返回 NULL，Rust 转成 `ERROR_INVALID_HANDLE` 的 `Err`。
+//! 所以本文件**禁用** `println!` / `eprintln!` / 对输出流 `.expect()` —— 它们写失败即 panic，
+//! 会把「闪个窗口」升级成「进程崩溃、口令永远送不到」。所有输出走 `write_all` + `flush` 并处理
+//! `Err`（`write_secret_line`、`report`），由 `never_panics_when_every_output_stream_is_broken`
+//! 守住。
+//!
+//! debug 下保持 console 子系统：否则终端里跑 `--help` 既不等待也看不到输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
 use std::ffi::OsString;
@@ -65,21 +90,33 @@ fn run_with_io(
 ) -> ExitCode {
     match classify(args) {
         Some(Mode::Help) => {
-            writeln!(stdout, "{USAGE}").expect("write askpass help");
+            report(stdout, format_args!("{USAGE}"));
             ExitCode::SUCCESS
         }
         Some(Mode::Version) => {
-            writeln!(stdout, "agentlens-askpass {}", env!("CARGO_PKG_VERSION"))
-                .expect("write askpass version");
+            report(
+                stdout,
+                format_args!("agentlens-askpass {}", env!("CARGO_PKG_VERSION")),
+            );
             ExitCode::SUCCESS
         }
         Some(Mode::Emit) => emit_to(channel, stdout, stderr),
         None => {
-            writeln!(stderr, "参数错误：本助手最多接受一个提示语参数。\n{USAGE}")
-                .expect("write askpass usage error");
+            report(
+                stderr,
+                format_args!("参数错误：本助手最多接受一个提示语参数。\n{USAGE}"),
+            );
             ExitCode::from(EXIT_USAGE)
         }
     }
+}
+
+/// 写一行诊断文本，失败即丢弃。
+///
+/// 存在的唯一理由是替掉 `println!` / `.expect()`：GUI 子系统下没有控制台时标准句柄是 NULL，
+/// 那两种写法会 panic，而诊断文本的重要性远不足以让进程崩掉（口令路径尤其不能崩）。
+fn report(writer: &mut impl io::Write, message: std::fmt::Arguments<'_>) {
+    let _ = writeln!(writer, "{message}");
 }
 
 /// 归类参数。`None` 表示参数错误。
@@ -156,9 +193,14 @@ fn read_channel_once_with(
 ) -> io::Result<Vec<u8>> {
     let bytes = fs::read(path)?;
     if let Err(error) = remove(path) {
-        eprintln!(
-            "警告：一次性口令通道 {} 删除失败（{error}），请手动清理。",
-            path.display()
+        // 不用 `eprintln!`：没有控制台时它会 panic（见模块文档），而口令此刻已在内存里，
+        // 为一句警告丢掉整次交付远不值得。
+        report(
+            &mut io::stderr(),
+            format_args!(
+                "警告：一次性口令通道 {} 删除失败（{error}），请手动清理。",
+                path.display()
+            ),
         );
     }
     Ok(bytes)
@@ -295,6 +337,46 @@ mod tests {
         assert_eq!(exit, ExitCode::SUCCESS);
         assert_eq!(stdout, b"through-dispatch\n");
         assert!(stderr.is_empty());
+    }
+
+    /// GUI 子系统（release 下的 Windows）没有控制台时 `GetStdHandle` 返回 NULL，Rust 把它转成
+    /// `ERROR_INVALID_HANDLE` 的 `Err`。这里用同形失败的 writer 冒充那个句柄，覆盖**每一条**
+    /// 分支，确认没有任何一条会 panic —— 一旦有人把 `report` 退回 `println!` 或给输出流补上
+    /// `.expect()`，本用例立刻变红。
+    #[test]
+    fn never_panics_when_every_output_stream_is_broken() {
+        let temp = TempDir::new();
+        let channel = temp.child("broken-stream-channel");
+        fs::write(&channel, b"secret").expect("write channel");
+
+        let cases: [(Vec<&str>, Option<OsString>, ExitCode); 5] = [
+            // 诊断写不出去不改变退出码：调用方读的是退出码，不是文本。
+            (vec!["--help"], None, ExitCode::SUCCESS),
+            (vec!["--version"], None, ExitCode::SUCCESS),
+            (vec!["prompt", "extra"], None, ExitCode::from(EXIT_USAGE)),
+            (
+                vec!["Password:"],
+                None,
+                ExitCode::from(EXIT_CHANNEL_UNAVAILABLE),
+            ),
+            // 唯一真正重要的一条：口令读到了但 stdout 写不出去，必须以可诊断的非零码退出，
+            // 让 ssh 当成「用户取消」，而不是 panic。
+            (
+                vec!["Password:"],
+                Some(channel.clone().into_os_string()),
+                ExitCode::from(EXIT_CHANNEL_UNAVAILABLE),
+            ),
+        ];
+
+        for (values, channel, expected) in cases {
+            let mut stdout = FailingWriter(io::ErrorKind::PermissionDenied);
+            let mut stderr = FailingWriter(io::ErrorKind::PermissionDenied);
+            let exit = run_with_io(&args(&values), channel, &mut stdout, &mut stderr);
+            assert_eq!(
+                exit, expected,
+                "args {values:?} must survive a broken stdio"
+            );
+        }
     }
 
     #[test]
