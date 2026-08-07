@@ -50,8 +50,10 @@ readonly STATE_FILE="${SCRATCH}/h7-instance.json"
 # is LAZY -- 'help' and 'collect' must not need STS. See resolve_bucket.
 BUCKET="${AGENTLENS_QA_BUCKET:-}"
 AWS_ACCOUNT_ID="${AGENTLENS_QA_ACCOUNT:-}"
-# The real CodeBuild Windows artifact: a zip whose root holds
-# AgentLens_0.1.0_x64-setup.exe.
+# The real CodeBuild Windows artifact: a zip whose root holds the AgentLens x64
+# NSIS setup. Its file name carries the workspace version and therefore changes
+# with every release, so it is derived rather than spelled out; the in-guest
+# script resolves it from AGENTLENS_QA_VERSION.
 INSTALLER_KEY="${AGENTLENS_QA_KEY:-artifacts/39f89617-585d-443c-a7fb-031a1d9f60ee/agentlens-windows}"
 EXPECTED_SHA256="${AGENTLENS_QA_SHA256:-ad6accacfb9b69b9fd05545e89ecad8dd122d460191134d0749cb9e6220d360d}"
 OUT_PREFIX="${AGENTLENS_INSTALLPS1_OUT_PREFIX:-qa/installps1}"

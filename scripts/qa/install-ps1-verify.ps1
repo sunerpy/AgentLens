@@ -62,9 +62,17 @@ $script:TaskName = 'AgentLensInstallPs1Verify'
 $script:InstallPs1 = Join-Path $script:WorkDir 'install.ps1'
 $script:ServerPs1 = Join-Path $script:WorkDir 'mirror-server.ps1'
 $script:Port = 18080
-$script:SetupName = 'AgentLens_0.1.0_x64-setup.exe'
+# SINGLE SOURCE for the version. Everything version-bearing below is DERIVED
+# from it, so a release-please version bump does not leave this harness pointing
+# at an artifact that no longer exists. The default is the version currently in
+# the root Cargo.toml [workspace.package]; unlike AGENTLENS_QA_BUCKET this is an
+# honest default rather than a guess, so it is optional and not a hard throw.
+$script:Version = if ($env:AGENTLENS_QA_VERSION) { $env:AGENTLENS_QA_VERSION } else { '0.1.0' }
+$script:SetupName = "AgentLens_$($script:Version)_x64-setup.exe"
+# The NSIS setup process name is the file name without its extension, which is
+# how Get-Process reports it. Derived, never spelled out again.
+$script:SetupProcessName = [IO.Path]::GetFileNameWithoutExtension($script:SetupName)
 $script:SumsName = 'sha256sums-windows.txt'
-$script:Version = '0.1.0'
 $script:InstallDir = ''
 
 $script:Bucket = ''
@@ -750,7 +758,7 @@ function Invoke-InstallPs1 {
         # The timeline is what makes a hang diagnosable instead of just slow: it
         # records, second by second, whether the setup process and the installed
         # app are alive while install.ps1 is still running.
-        $setupAlive = @(Get-Process -Name 'AgentLens_0.1.0_x64-setup' -ErrorAction SilentlyContinue).Count
+        $setupAlive = @(Get-Process -Name $script:SetupProcessName -ErrorAction SilentlyContinue).Count
         $appAlive = @(Get-Process -Name 'agentlens-tauri' -ErrorAction SilentlyContinue).Count
         $state = "setup=$setupAlive app=$appAlive installps1=running"
         if ($state -ne $lastState) {
@@ -765,7 +773,7 @@ function Invoke-InstallPs1 {
     $timedOut = $false
     if (-not $p.HasExited) {
         $timedOut = $true
-        $setupAlive = @(Get-Process -Name 'AgentLens_0.1.0_x64-setup' -ErrorAction SilentlyContinue).Count
+        $setupAlive = @(Get-Process -Name $script:SetupProcessName -ErrorAction SilentlyContinue).Count
         $appAlive = @(Get-Process -Name 'agentlens-tauri' -ErrorAction SilentlyContinue).Count
         $timeline += "t=${TimeoutSeconds}s TIMEOUT setup=$setupAlive app=$appAlive installps1=STILL RUNNING"
         Write-Note "  TIMEOUT after ${TimeoutSeconds}s: install.ps1 is STILL RUNNING (setup processes=$setupAlive, app processes=$appAlive); killing install.ps1"
