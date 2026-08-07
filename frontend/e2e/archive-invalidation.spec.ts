@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import type { SourceStatus } from '../src/generated'
 import { mockCalls, mockEmitEvent, mockSetDataset, openShell } from './harness'
 
 /**
@@ -16,6 +17,7 @@ import { mockCalls, mockEmitEvent, mockSetDataset, openShell } from './harness'
  * these specs go red.
  */
 const ARCHIVE_COMMITTED_EVENT = 'agentlens://archive-committed'
+const REFRESH_COMPLETED_EVENT = 'agentlens://refresh-completed'
 
 const SEEDED_MESSAGE_COUNT = '109'
 const COLLECTED_MESSAGE_COUNT = '155,498'
@@ -96,6 +98,44 @@ test('立即刷新 invalidates the aggregates as well as the host rows', async (
 
   await page.getByTestId('nav-overview').click()
   await expect(page.getByTestId('summary-message-count')).toHaveText(COLLECTED_MESSAGE_COUNT)
+})
+
+test('a completed refresh with no archive changes refetches the permanently fresh host status', async ({
+  page,
+}) => {
+  await openShell(page)
+  await page.getByTestId('nav-hosts').click()
+  await expect(page.getByTestId('view-hosts')).toBeVisible()
+  const statusCallsBefore = (await mockCalls(page, 'get_refresh_status')).length
+  const completedAt = Date.UTC(2026, 0, 8)
+  const completedStatus: SourceStatus = {
+    hostId: 'local-host-000001',
+    displayName: 'workstation',
+    kind: 'local',
+    state: { state: 'idle' },
+    trigger: 'auto',
+    lastError: null,
+    lastSuccessUtc: completedAt,
+    lastCompletedUtc: completedAt,
+    lastDurationMs: 811,
+    intervalMs: 300_000,
+    nextDueUtc: completedAt + 300_000,
+    interrupted: false,
+    cursorTimeUpdated: completedAt,
+  }
+
+  await mockSetDataset(page, { refreshStatus: [completedStatus] })
+  await expect(page.getByTestId('host-last-success-local-host-000001')).toHaveText(
+    '2026-01-07 00:00:00',
+  )
+  await expect
+    .poll(() => mockEmitEvent(page, REFRESH_COMPLETED_EVENT, 'local-host-000001'))
+    .toBeGreaterThan(0)
+
+  await expect(page.getByTestId('host-last-success-local-host-000001')).toHaveText(
+    '2026-01-08 00:00:00',
+  )
+  expect((await mockCalls(page, 'get_refresh_status')).length).toBeGreaterThan(statusCallsBefore)
 })
 
 test('the detail page rejoins the archive family and refetches on a commit', async ({ page }) => {

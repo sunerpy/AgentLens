@@ -608,6 +608,29 @@ impl From<CoreSourceStatus> for SourceStatus {
     }
 }
 
+/// Ordered progress emitted by one manual `trigger_refresh` invocation.
+///
+/// `Finished` carries an optional status because deleting a host while its round is running is
+/// allowed. In that race the terminal event still closes the stream and tells the frontend to
+/// remove the no-longer-registered source instead of leaving it stuck in `running`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "event",
+    content = "data"
+)]
+pub enum RefreshEvent {
+    Started {
+        status: SourceStatus,
+    },
+    Finished {
+        host_id: String,
+        status: Option<SourceStatus>,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(tag = "outcome", rename_all = "camelCase")]

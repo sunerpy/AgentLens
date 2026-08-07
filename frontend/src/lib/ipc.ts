@@ -15,7 +15,7 @@
  * - Failures reject with the serialized `IpcError` object (`{ code, message, fields }`).
  *   Use `toIpcError` to narrow a caught value instead of `String(error)`.
  */
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 
 import type {
   AggregateFilters,
@@ -32,6 +32,7 @@ import type {
   MessageFilters,
   MessagePage,
   PriceTable,
+  RefreshEvent,
   SeriesPoint,
   SourceStatus,
   Summary,
@@ -166,8 +167,13 @@ export function hostsDelete(hostId: string): Promise<void> {
 // Refresh scheduling
 // ---------------------------------------------------------------------------
 
-export function triggerRefresh(hostId: string): Promise<TriggerRefreshResult> {
-  return invoke<TriggerRefreshResult>('trigger_refresh', { hostId })
+export function triggerRefresh(
+  hostId: string,
+  onEvent: (event: RefreshEvent) => void,
+): Promise<TriggerRefreshResult> {
+  const channel = new Channel<RefreshEvent>()
+  channel.onmessage = onEvent
+  return invoke<TriggerRefreshResult>('trigger_refresh', { hostId, onEvent: channel })
 }
 
 export function getRefreshStatus(): Promise<SourceStatus[]> {

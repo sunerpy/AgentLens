@@ -26,6 +26,9 @@ import type {
 const invoke = vi.fn()
 
 vi.mock('@tauri-apps/api/core', () => ({
+  Channel: class<T> {
+    onmessage: (message: T) => void = () => undefined
+  },
   invoke: (...args: unknown[]) => invoke(...args),
 }))
 
@@ -297,12 +300,18 @@ describe('ipc/主机与刷新的实参名', () => {
     expect(payload.hostId).toBe('remote-1')
   })
 
-  it('trigger_refresh 递 { hostId }', async () => {
-    await ipc.triggerRefresh('local')
+  it('trigger_refresh 递 { hostId, onEvent } 并把 Channel 消息交给调用方', async () => {
+    const onEvent = vi.fn()
+    await ipc.triggerRefresh('local', onEvent)
     const { command, keys, payload } = callShape()
     expect(command).toBe('trigger_refresh')
-    expect(keys).toEqual(['hostId'])
+    expect(keys).toEqual(['hostId', 'onEvent'])
     expect(payload.hostId).toBe('local')
+
+    const channel = payload.onEvent as { onmessage: (message: unknown) => void }
+    const event = { event: 'finished', data: { hostId: 'local', status: null } }
+    channel.onmessage(event)
+    expect(onEvent).toHaveBeenCalledWith(event)
   })
 
   it('get_refresh_status 不带任何载荷', async () => {
