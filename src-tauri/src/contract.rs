@@ -10,7 +10,8 @@ use agentlens_core::pricing::{
     PriceMatchKind as CorePriceMatchKind, PriceTable as CorePriceTable,
 };
 use agentlens_core::query::{
-    BreakdownRow as CoreBreakdownRow, CoverageNote as CoreCoverageNote,
+    BreakdownRow as CoreBreakdownRow, CostCoverage as CoreCostCoverage,
+    CostCoverageLayer as CoreCostCoverageLayer, CoverageNote as CoreCoverageNote,
     CoverageShortfall as CoreCoverageShortfall, CoverageStatus as CoreCoverageStatus,
     DetailCost as CoreDetailCost, DetailPage as CoreDetailPage, DetailRow as CoreDetailRow,
     SeriesBucket as CoreSeriesBucket, SeriesGroup as CoreSeriesGroup,
@@ -245,6 +246,44 @@ impl From<CoreCostTotals> for CostTotals {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct CostCoverageLayer {
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+    pub record_count: u64,
+    #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+    pub billable_tokens: u64,
+}
+
+impl From<CoreCostCoverageLayer> for CostCoverageLayer {
+    fn from(value: CoreCostCoverageLayer) -> Self {
+        Self {
+            record_count: value.record_count,
+            billable_tokens: value.billable_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct CostCoverage {
+    pub actual: CostCoverageLayer,
+    pub estimated: CostCoverageLayer,
+    pub unavailable: CostCoverageLayer,
+}
+
+impl From<CoreCostCoverage> for CostCoverage {
+    fn from(value: CoreCostCoverage) -> Self {
+        Self {
+            actual: value.actual.into(),
+            estimated: value.estimated.into(),
+            unavailable: value.unavailable.into(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "lowercase")]
@@ -409,6 +448,7 @@ impl From<CoreSeriesQueryResult> for SeriesQueryResult {
 pub struct Summary {
     pub tokens: TokenValues,
     pub cost: CostTotals,
+    pub cost_coverage: CostCoverage,
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
     pub message_count: u64,
     #[cfg_attr(feature = "ts-export", ts(type = "number"))]
@@ -422,6 +462,7 @@ impl From<CoreSummary> for Summary {
         Self {
             tokens: value.tokens.into(),
             cost: value.cost.into(),
+            cost_coverage: value.cost_coverage.into(),
             message_count: value.message_count,
             session_record_count: value.session_record_count,
             active_session_count: value.active_session_count,
@@ -1019,6 +1060,23 @@ mod tests {
         }
     }
 
+    fn core_cost_coverage() -> CoreCostCoverage {
+        CoreCostCoverage {
+            actual: CoreCostCoverageLayer {
+                record_count: 4,
+                billable_tokens: 40,
+            },
+            estimated: CoreCostCoverageLayer {
+                record_count: 5,
+                billable_tokens: 50,
+            },
+            unavailable: CoreCostCoverageLayer {
+                record_count: 6,
+                billable_tokens: 60,
+            },
+        }
+    }
+
     #[test]
     fn enum_and_error_contracts_keep_every_wire_discriminator_stable() {
         assert_eq!(
@@ -1092,12 +1150,19 @@ mod tests {
         let summary = Summary::from(CoreSummary {
             tokens: core_tokens(),
             cost: core_cost(),
+            cost_coverage: core_cost_coverage(),
             message_count: 21,
             session_record_count: 3,
             active_session_count: 8,
         });
         assert_eq!(summary.tokens, tokens);
         assert_eq!(summary.cost, cost);
+        assert_eq!(summary.cost_coverage.actual.record_count, 4);
+        assert_eq!(summary.cost_coverage.actual.billable_tokens, 40);
+        assert_eq!(summary.cost_coverage.estimated.record_count, 5);
+        assert_eq!(summary.cost_coverage.estimated.billable_tokens, 50);
+        assert_eq!(summary.cost_coverage.unavailable.record_count, 6);
+        assert_eq!(summary.cost_coverage.unavailable.billable_tokens, 60);
         assert_eq!(summary.message_count, 21);
         assert_eq!(summary.session_record_count, 3);
         assert_eq!(summary.active_session_count, 8);

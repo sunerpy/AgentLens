@@ -67,7 +67,8 @@ const COST_ROWS_SQL: &str = "SELECT
         coalesce(sum(tok_cache_write), 0),
         sum(CASE WHEN cost IS NOT NULL AND abs(cost) < 1e999 THEN cost END),
         sum(CASE
-            WHEN tok_input > 0 OR tok_output > 0 OR tok_cache_read > 0 OR tok_cache_write > 0
+            WHEN (cost IS NOT NULL AND abs(cost) < 1e999)
+              OR tok_input > 0 OR tok_output > 0 OR tok_cache_read > 0 OR tok_cache_write > 0
             THEN 1 ELSE 0
         END),
         min(tok_input), min(tok_output), min(tok_reasoning), min(tok_cache_read), min(tok_cache_write)
@@ -563,6 +564,26 @@ impl TokenValues {
     }
 }
 
+/// Record and billable-token coverage for one mutually exclusive cost layer.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CostCoverageLayer {
+    /// Records whose cost resolved into this layer.
+    pub record_count: u64,
+    /// Input, output, cache-read, and cache-write tokens represented by this layer.
+    pub billable_tokens: u64,
+}
+
+/// Coverage quantities kept separate for actual, estimated, and unavailable costs.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct CostCoverage {
+    /// Coverage behind the source-reported actual amount.
+    pub actual: CostCoverageLayer,
+    /// Coverage behind the query-time estimated amount.
+    pub estimated: CostCoverageLayer,
+    /// Coverage excluded from both amounts because no price was available.
+    pub unavailable: CostCoverageLayer,
+}
+
 /// Optional equality filters applied to aggregate queries.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct AggregateFilters {
@@ -645,6 +666,8 @@ pub struct Summary {
     pub tokens: TokenValues,
     /// Actual, estimated, and unavailable costs kept separate.
     pub cost: CostTotals,
+    /// Record and billable-token coverage behind each mutually exclusive cost layer.
+    pub cost_coverage: CostCoverage,
     /// Complete message count.
     pub message_count: u64,
     /// Complete session-level record count.
@@ -1023,9 +1046,11 @@ pub fn query_summary(
 ) -> Result<Summary> {
     let (start, end) = range.utc_bounds()?;
     let aggregate = query_raw_aggregate(archive.connection(), start, end, filters)?;
+    let cost = query_cost_totals(archive.connection(), start, end, filters, prices)?;
     Ok(Summary {
         tokens: tokens_from_raw(aggregate)?,
-        cost: query_cost_totals(archive.connection(), start, end, filters, prices)?,
+        cost: cost.totals,
+        cost_coverage: cost.coverage,
         message_count: nonnegative("message_count", aggregate.message_count)?,
         session_record_count: nonnegative("session_record_count", aggregate.session_record_count)?,
         active_session_count: nonnegative("active_session_count", aggregate.active_session_count)?,
@@ -1397,13 +1422,19 @@ fn tokens_from_raw(raw: RawAggregate) -> Result<TokenValues> {
     ))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct CostQueryResult {
+    totals: CostTotals,
+    coverage: CostCoverage,
+}
+
 fn query_cost_totals(
     connection: &Connection,
     start: i64,
     end: i64,
     filters: &AggregateFilters,
     prices: &PriceTable,
-) -> Result<CostTotals> {
+) -> Result<CostQueryResult> {
     let mut statement = connection.prepare(COST_ROWS_SQL)?;
     let mut rows = statement.query(params![
         start,
@@ -1414,13 +1445,13 @@ fn query_cost_totals(
         filters.provider_id.as_deref(),
         filters.model_id.as_deref(),
     ])?;
-    let mut totals = CostTotals::default();
+    let mut result = CostQueryResult::default();
     while let Some(row) = rows.next()? {
         let provider_id: String = row.get(0)?;
         let model_id: String = row.get(1)?;
         let source_text: String = row.get(2)?;
         let tokens = grouped_tokens(row, 4, 11)?;
-        let grouped = aggregated_cost(
+        let grouped = aggregated_cost_with_coverage(
             prices,
             &provider_id,
             &model_id,
@@ -1429,9 +1460,10 @@ fn query_cost_totals(
             parse_cost_source(&source_text)?,
             nonnegative("cost_row_count", row.get(10)?)?,
         );
-        add_cost_totals(&mut totals, grouped);
+        add_cost_totals(&mut result.totals, grouped.totals);
+        add_cost_coverage(&mut result.coverage, grouped.coverage);
     }
-    Ok(totals)
+    Ok(result)
 }
 
 fn add_breakdown_costs(
@@ -1532,22 +1564,43 @@ fn aggregated_cost(
     cost_source: CostSource,
     row_count: u64,
 ) -> CostTotals {
-    let mut totals = CostTotals::default();
+    aggregated_cost_with_coverage(
+        prices,
+        provider_id,
+        model_id,
+        tokens,
+        trusted_cost,
+        cost_source,
+        row_count,
+    )
+    .totals
+}
+
+fn aggregated_cost_with_coverage(
+    prices: &PriceTable,
+    provider_id: &str,
+    model_id: &str,
+    tokens: TokenValues,
+    trusted_cost: Option<f64>,
+    cost_source: CostSource,
+    row_count: u64,
+) -> CostQueryResult {
+    let mut result = CostQueryResult::default();
+    let billable_tokens = tokens
+        .tok_input
+        .saturating_add(tokens.tok_output)
+        .saturating_add(tokens.tok_cache_read)
+        .saturating_add(tokens.tok_cache_write);
     // Pricing consumes exactly four buckets. `tok_reasoning` is an output subset and is not
     // independently billable, so a row with no input/output/cache usage has an exact zero cost
     // regardless of whether the provider/model has a catalog entry.
-    if tokens.tok_input == 0
-        && tokens.tok_output == 0
-        && tokens.tok_cache_read == 0
-        && tokens.tok_cache_write == 0
-        && trusted_cost.is_none()
-    {
-        return totals;
+    if billable_tokens == 0 && trusted_cost.is_none() {
+        return result;
     }
-    match (trusted_cost, cost_source) {
-        (Some(value), CostSource::Actual) => totals.actual_sum = value,
-        (Some(value), CostSource::Estimated) => totals.estimated_sum = value,
-        _ => match prices.resolve_cost(
+    let resolved = match (trusted_cost, cost_source) {
+        (Some(value), CostSource::Actual) => ResolvedCost::Actual(value),
+        (Some(value), CostSource::Estimated) => ResolvedCost::Estimated(value),
+        _ => prices.resolve_cost(
             provider_id,
             model_id,
             TokenCounts {
@@ -1558,13 +1611,27 @@ fn aggregated_cost(
             },
             None,
             cost_source,
-        ) {
-            ResolvedCost::Actual(value) => totals.actual_sum = value,
-            ResolvedCost::Estimated(value) => totals.estimated_sum = value,
-            ResolvedCost::Unavailable => totals.unavailable_count = row_count,
-        },
+        ),
+    };
+    let coverage = CostCoverageLayer {
+        record_count: row_count,
+        billable_tokens,
+    };
+    match resolved {
+        ResolvedCost::Actual(value) => {
+            result.totals.actual_sum = value;
+            result.coverage.actual = coverage;
+        }
+        ResolvedCost::Estimated(value) => {
+            result.totals.estimated_sum = value;
+            result.coverage.estimated = coverage;
+        }
+        ResolvedCost::Unavailable => {
+            result.totals.unavailable_count = row_count;
+            result.coverage.unavailable = coverage;
+        }
     }
-    totals
+    result
 }
 
 fn add_cost_totals(target: &mut CostTotals, value: CostTotals) {
@@ -1573,6 +1640,17 @@ fn add_cost_totals(target: &mut CostTotals, value: CostTotals) {
     target.unavailable_count = target
         .unavailable_count
         .saturating_add(value.unavailable_count);
+}
+
+fn add_cost_coverage(target: &mut CostCoverage, value: CostCoverage) {
+    for (target, value) in [
+        (&mut target.actual, value.actual),
+        (&mut target.estimated, value.estimated),
+        (&mut target.unavailable, value.unavailable),
+    ] {
+        target.record_count = target.record_count.saturating_add(value.record_count);
+        target.billable_tokens = target.billable_tokens.saturating_add(value.billable_tokens);
+    }
 }
 
 fn add_group_aggregate(
@@ -1892,6 +1970,46 @@ mod tests {
         )
         .expect("query mixed-cost summary");
 
+        assert_eq!(summary.cost.unavailable_count, 1);
+    }
+
+    #[test]
+    fn summary_reports_record_and_billable_token_coverage_for_each_cost_layer() {
+        let (_temp, archive) = empty_archive();
+        let range = report_range("2026-07-31", "2026-08-01", "UTC");
+        let (start, _) = range.utc_bounds().expect("cost coverage test bounds");
+
+        let mut actual = fixed_record("actual", start + 1_000, 10);
+        actual.cost = Some(1.25);
+        actual.cost_source = CostSource::Actual;
+        insert_record(&archive, &actual);
+
+        let estimated = fixed_record("estimated", start + 2_000, 20);
+        insert_record(&archive, &estimated);
+
+        let mut unavailable = fixed_record("unavailable", start + 3_000, 30);
+        unavailable.model_id = "unpriced-model".to_owned();
+        insert_record(&archive, &unavailable);
+
+        let prices = PriceTable::from_entries(vec![PriceEntry::new(
+            "query-provider",
+            "query-model",
+            1.0,
+            2.0,
+            0.5,
+            0.75,
+        )]);
+        let summary = query_summary(&archive, &range, &AggregateFilters::default(), &prices)
+            .expect("query layered cost coverage");
+
+        assert_eq!(summary.cost_coverage.actual.record_count, 1);
+        assert_eq!(summary.cost_coverage.actual.billable_tokens, 48);
+        assert_eq!(summary.cost_coverage.estimated.record_count, 1);
+        assert_eq!(summary.cost_coverage.estimated.billable_tokens, 88);
+        assert_eq!(summary.cost_coverage.unavailable.record_count, 1);
+        assert_eq!(summary.cost_coverage.unavailable.billable_tokens, 128);
+        assert_eq!(summary.cost.actual_sum, 1.25);
+        assert!(summary.cost.estimated_sum > 0.0);
         assert_eq!(summary.cost.unavailable_count, 1);
     }
 

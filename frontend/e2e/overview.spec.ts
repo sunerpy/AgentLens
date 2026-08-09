@@ -375,6 +375,11 @@ test('an all-zero summary renders zeros, never an empty state', async ({ page })
           totalInput: 0,
         },
         cost: { actualSum: 0, estimatedSum: 0, unavailableCount: 0 },
+        costCoverage: {
+          actual: { recordCount: 0, billableTokens: 0 },
+          estimated: { recordCount: 0, billableTokens: 0 },
+          unavailable: { recordCount: 0, billableTokens: 0 },
+        },
         messageCount: 0,
         sessionRecordCount: 0,
         activeSessionCount: 0,
@@ -474,6 +479,11 @@ test('缺价清单逐条相加等于表头总数，全库口径不同屏', async
       summary: {
         tokens: { ...tokens, tokInput: 2_000, tokOutput: 200, totalInput: 2_000 },
         cost: { actualSum: 0.5, estimatedSum: 0, unavailableCount: 4 },
+        costCoverage: {
+          actual: { recordCount: 4, billableTokens: 1_100 },
+          estimated: { recordCount: 0, billableTokens: 0 },
+          unavailable: { recordCount: 4, billableTokens: 1_100 },
+        },
         messageCount: 8,
         sessionRecordCount: 0,
         activeSessionCount: 2,

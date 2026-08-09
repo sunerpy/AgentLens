@@ -149,6 +149,14 @@ pub enum IngestError {
     /// SQLite failed while applying, rolling back, or committing the round.
     #[error("archive ingest database operation failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// A collection request cannot cover a reversed wall-clock window.
+    #[error("archive ingest coverage window is reversed: [{start}, {end})")]
+    InvalidCoverageWindow {
+        /// Inclusive request boundary.
+        start: i64,
+        /// Exclusive collection cutoff.
+        end: i64,
+    },
 }
 
 /// Observable counters from one scan-round transaction.
@@ -164,6 +172,29 @@ pub struct IngestStats {
     /// Cursor written in the same transaction, or `None` for interruption, empty scans, and
     /// backup/legacy backfills.
     pub cursor_time_updated: Option<i64>,
+}
+
+/// Half-open wall-clock window a completed live collection has actually scanned.
+///
+/// This is deliberately the requested `[since, now)` window rather than the timestamps of records
+/// found inside it. An empty successful scan still proves the window was inspected; deriving the
+/// boundaries from records would collapse “scanned and idle” back into “never scanned”.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoverageWindow {
+    /// Inclusive request boundary.
+    pub start: i64,
+    /// Exclusive collection cutoff.
+    pub end: i64,
+}
+
+impl CoverageWindow {
+    /// Validates a request window. Zero-length windows are accepted but cover no report bucket.
+    pub fn new(start: i64, end: i64) -> Result<Self> {
+        if end < start {
+            return Err(IngestError::InvalidCoverageWindow { start, end });
+        }
+        Ok(Self { start, end })
+    }
 }
 
 /// One atomic archive transaction spanning every batch delivered by a scanner round.
@@ -269,18 +300,12 @@ impl<'connection> IngestRound<'connection> {
     ///
     /// An interrupted result (`reached_eof == false`) explicitly rolls back all delivered batches.
     /// Backup and legacy rounds commit their records after EOF but never write `source_cursor`.
-    pub fn finish(mut self, scan_result: &ScanResult) -> Result<IngestStats> {
-        let transaction = self
-            .transaction
-            .take()
-            .expect("an unfinished ingest round always owns its transaction");
-
-        if !scan_result.reached_eof {
-            transaction.rollback()?;
-            return Ok(self.stats);
-        }
-
-        self.commit_round(transaction, scan_result.observed_max_time_updated)
+    pub fn finish(self, scan_result: &ScanResult) -> Result<IngestStats> {
+        self.finish_with_coverage(
+            scan_result.reached_eof,
+            scan_result.observed_max_time_updated,
+            None,
+        )
     }
 
     /// Commits a round described by source-neutral completion facts.
@@ -290,9 +315,22 @@ impl<'connection> IngestRound<'connection> {
     /// prefix. Adapters whose scanners do not produce an OpenCode [`ScanResult`] use this entry
     /// point instead of [`Self::finish`].
     pub fn finish_with(
+        self,
+        reached_eof: bool,
+        observed_max_time_updated: Option<i64>,
+    ) -> Result<IngestStats> {
+        self.finish_with_coverage(reached_eof, observed_max_time_updated, None)
+    }
+
+    /// Finishes a source-neutral round and atomically records a successful live request window.
+    ///
+    /// Coverage is written in the same transaction as records and the live cursor. Interrupted
+    /// rounds roll everything back, while EOF-complete zero-record rounds still persist the window.
+    pub fn finish_with_coverage(
         mut self,
         reached_eof: bool,
         observed_max_time_updated: Option<i64>,
+        coverage: Option<CoverageWindow>,
     ) -> Result<IngestStats> {
         let transaction = self
             .transaction
@@ -303,13 +341,14 @@ impl<'connection> IngestRound<'connection> {
             transaction.rollback()?;
             return Ok(self.stats);
         }
-        self.commit_round(transaction, observed_max_time_updated)
+        self.commit_round(transaction, observed_max_time_updated, coverage)
     }
 
     fn commit_round(
         mut self,
         transaction: Transaction<'connection>,
         observed_max_time_updated: Option<i64>,
+        coverage: Option<CoverageWindow>,
     ) -> Result<IngestStats> {
         if self.origin == Origin::Live {
             if let Some(observed_max) = observed_max_time_updated {
@@ -319,11 +358,47 @@ impl<'connection> IngestRound<'connection> {
                 )?;
                 self.stats.cursor_time_updated = Some(observed_max);
             }
+            if let Some(coverage) = coverage {
+                extend_live_coverage(&transaction, &self.host_id, &self.source, coverage)?;
+            }
         }
         transaction.commit()?;
         self.stats.committed = true;
         Ok(self.stats)
     }
+}
+
+fn extend_live_coverage(
+    transaction: &Transaction<'_>,
+    host_id: &str,
+    source: &str,
+    requested: CoverageWindow,
+) -> Result<()> {
+    let existing = transaction.query_row(
+        "SELECT min(interval_start), max(interval_end)
+         FROM coverage_interval
+         WHERE host_id = ?1 AND source = ?2 AND origin = 'live'",
+        params![host_id, source],
+        |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    )?;
+    let start = existing
+        .0
+        .map_or(requested.start, |current| current.min(requested.start));
+    let end = existing
+        .1
+        .map_or(requested.end, |current| current.max(requested.end));
+    transaction.execute(
+        "DELETE FROM coverage_interval
+         WHERE host_id = ?1 AND source = ?2 AND origin = 'live'",
+        params![host_id, source],
+    )?;
+    transaction.execute(
+        "INSERT INTO coverage_interval (
+            host_id, source, origin, interval_start, interval_end
+         ) VALUES (?1, ?2, 'live', ?3, ?4)",
+        params![host_id, source, start, end],
+    )?;
+    Ok(())
 }
 
 /// Provenance tiers in the order [`ingest_by_origin`] commits them.
@@ -357,6 +432,27 @@ pub fn ingest_by_origin(
     reached_eof: bool,
     live_cursor: Option<i64>,
 ) -> Result<IngestStats> {
+    ingest_by_origin_with_coverage(
+        connection,
+        host_id,
+        source,
+        records,
+        reached_eof,
+        live_cursor,
+        None,
+    )
+}
+
+/// Ingests provenance tiers and attaches coverage only to the live tier's transaction.
+pub fn ingest_by_origin_with_coverage(
+    connection: &mut Connection,
+    host_id: &str,
+    source: &str,
+    records: &[NormalizedUsageRecord],
+    reached_eof: bool,
+    live_cursor: Option<i64>,
+    coverage: Option<CoverageWindow>,
+) -> Result<IngestStats> {
     let mut merged = IngestStats::default();
     let mut committed_every_tier = true;
     for origin in ORIGIN_COMMIT_ORDER {
@@ -375,7 +471,8 @@ pub fn ingest_by_origin(
         };
         let mut round = IngestRound::begin_for_source(connection, host_id, source, origin)?;
         round.ingest_batch(&tier)?;
-        let stats = round.finish_with(reached_eof, cursor)?;
+        let tier_coverage = (origin == Origin::Live).then_some(coverage).flatten();
+        let stats = round.finish_with_coverage(reached_eof, cursor, tier_coverage)?;
         merged.received_records += stats.received_records;
         merged.changed_records += stats.changed_records;
         committed_every_tier &= stats.committed;
@@ -487,10 +584,15 @@ mod tests {
 
     use crate::archive::{Archive, CostSource, NormalizedUsageRecord, Origin};
     use crate::fixture::{generate, FixtureGuard, Manifest};
+    use crate::query::{AggregateFilters, CoverageLookup, CoverageStatus, TimeBucket};
+    use crate::source::claude_code::CLAUDE_CODE_SOURCE;
+    use crate::source::codex::CODEX_SOURCE;
+    use crate::source::hermes::HERMES_SOURCE;
     use crate::source::opencode::{
         scan_database, ScanRequest, ScanResult, SinkError, SkippedBreakdown, DEFAULT_BATCH_SIZE,
         OVERLAP_WINDOW_MS,
     };
+    use crate::source::opencode_legacy::CoverageStore;
 
     use super::*;
 
@@ -595,6 +697,138 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count duplicate groups")
+    }
+
+    fn coverage_rows(connection: &Connection) -> Vec<(String, String, i64, i64)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT source, origin, interval_start, interval_end
+                 FROM coverage_interval
+                 ORDER BY source, origin",
+            )
+            .expect("prepare coverage rows");
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query coverage rows")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect coverage rows")
+    }
+
+    #[test]
+    fn successful_live_ingest_writes_request_window_for_all_four_sources() {
+        let temp = tempfile::tempdir().expect("archive tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+        let window = CoverageWindow::new(100, 200).expect("valid request window");
+
+        for source in [
+            OPENCODE_SOURCE,
+            CLAUDE_CODE_SOURCE,
+            CODEX_SOURCE,
+            HERMES_SOURCE,
+        ] {
+            let round = IngestRound::begin_for_source(
+                archive.connection_mut(),
+                TEST_HOST,
+                source,
+                Origin::Live,
+            )
+            .expect("begin source round");
+            let stats = round
+                .finish_with_coverage(true, None, Some(window))
+                .expect("finish source round");
+            assert!(stats.committed, "{source} round must commit");
+        }
+
+        assert_eq!(
+            coverage_rows(archive.connection()),
+            vec![
+                (CLAUDE_CODE_SOURCE.to_owned(), "live".to_owned(), 100, 200),
+                (CODEX_SOURCE.to_owned(), "live".to_owned(), 100, 200),
+                (HERMES_SOURCE.to_owned(), "live".to_owned(), 100, 200),
+                (OPENCODE_SOURCE.to_owned(), "live".to_owned(), 100, 200),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_successful_ingest_still_writes_coverage_but_failed_rounds_do_not() {
+        let temp = tempfile::tempdir().expect("archive tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+        let window = CoverageWindow::new(300, 400).expect("valid request window");
+
+        let empty = IngestRound::begin_for_source(
+            archive.connection_mut(),
+            TEST_HOST,
+            CLAUDE_CODE_SOURCE,
+            Origin::Live,
+        )
+        .expect("begin empty round")
+        .finish_with_coverage(true, None, Some(window))
+        .expect("finish empty round");
+        assert!(empty.committed);
+
+        let interrupted = IngestRound::begin_for_source(
+            archive.connection_mut(),
+            TEST_HOST,
+            CODEX_SOURCE,
+            Origin::Live,
+        )
+        .expect("begin interrupted round")
+        .finish_with_coverage(false, None, Some(window))
+        .expect("finish interrupted round");
+        assert!(!interrupted.committed);
+
+        let dropped = IngestRound::begin_for_source(
+            archive.connection_mut(),
+            TEST_HOST,
+            HERMES_SOURCE,
+            Origin::Live,
+        )
+        .expect("begin failed scanner round");
+        drop(dropped);
+
+        assert_eq!(
+            coverage_rows(archive.connection()),
+            vec![(CLAUDE_CODE_SOURCE.to_owned(), "live".to_owned(), 300, 400,)],
+            "only the EOF-complete committed round may claim coverage"
+        );
+    }
+
+    #[test]
+    fn four_source_request_windows_make_a_selected_bucket_full() {
+        let temp = tempfile::tempdir().expect("archive tempdir");
+        let mut archive = Archive::open_in_data_dir(temp.path()).expect("open archive");
+        let window = CoverageWindow::new(1_000, 2_000).expect("valid request window");
+        for source in [
+            OPENCODE_SOURCE,
+            CLAUDE_CODE_SOURCE,
+            CODEX_SOURCE,
+            HERMES_SOURCE,
+        ] {
+            IngestRound::begin_for_source(
+                archive.connection_mut(),
+                TEST_HOST,
+                source,
+                Origin::Live,
+            )
+            .expect("begin source round")
+            .finish_with_coverage(true, None, Some(window))
+            .expect("finish source round");
+        }
+
+        let store = CoverageStore::load(archive.connection()).expect("load coverage");
+        let bucket = TimeBucket {
+            start_utc_ms: 1_100,
+            end_utc_ms: 1_900,
+            label: "fixture".to_owned(),
+        };
+        assert_eq!(
+            store.status(&bucket, &AggregateFilters::default()),
+            CoverageStatus::Full,
+            "every enabled (host, source) pair covers the bucket"
+        );
     }
 
     fn scan_fixture_into_archive(

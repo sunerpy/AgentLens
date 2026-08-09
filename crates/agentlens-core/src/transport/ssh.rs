@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
@@ -123,9 +123,13 @@ for REQUEST_FILE in "$HOME"/.cache/agentlens/run.*/request; do
     WORKDIR=${REQUEST_FILE%/request}
   fi
 done
-if [ "$MATCH_COUNT" -ne 1 ]; then
-  printf '%s\n' 'AgentLens request marker missing or ambiguous' >&2
+if [ "$MATCH_COUNT" -eq 0 ]; then
+  printf '%s\n' 'AgentLens request marker missing' >&2
   exit 71
+fi
+if [ "$MATCH_COUNT" -gt 1 ]; then
+  printf '%s\n' 'AgentLens request marker ambiguous' >&2
+  exit 72
 fi
 trap 'rm -rf "$WORKDIR"' EXIT
 cd "$WORKDIR"
@@ -150,6 +154,7 @@ fi
 
 static CHECKSUM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ASKPASS_CHANNEL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static COLLECT_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub type Result<T> = std::result::Result<T, SshError>;
 
@@ -948,10 +953,23 @@ pub struct CollectPayload {
     pub snapshot: bool,
     /// Adapter the remote collector must run, or `None` for its default source.
     ///
-    /// Omitted from the encoded JSON when absent, so an OpenCode request stays byte-identical to
-    /// the pre-multi-source wire format.
+    /// Omitted from the encoded JSON when absent, preserving the pre-multi-source business fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Transport-only correlation id. The collector accepts and ignores it.
+    ///
+    /// `None` preserves the exact pre-multi-source JSON for compatibility fixtures; production SSH
+    /// rounds always send `Some`, and the paired collector accepts both the old and new formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+fn next_collect_request_id() -> String {
+    let sequence = COLLECT_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let epoch_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    format!("{:x}-{epoch_nanos:x}-{sequence:x}", std::process::id())
 }
 
 /// Encode the exact collector request format (`URL_SAFE_NO_PAD`).
@@ -1219,6 +1237,7 @@ impl<R: CommandRunner> SshTransport<R> {
             data_dir,
             snapshot: request.snapshot,
             source: request.source.clone(),
+            request_id: Some(next_collect_request_id()),
         })?;
         ensure_not_cancelled(is_cancelled)?;
 
@@ -2086,6 +2105,7 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
             data_dir: None,
             snapshot: false,
             source: None,
+            request_id: None,
         })
         .expect_err("negative cursor is invalid");
         assert!(matches!(negative, SshError::InvalidInput { .. }));
@@ -2620,13 +2640,19 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
                 CommandStage::Gc,
             ]
         );
-        let expected_payload = encode_collect_payload(&CollectPayload {
-            since: 0,
-            data_dir: None,
-            snapshot: false,
-            source: None,
-        })
-        .expect("encode expected request");
+        let expected_payload = commands
+            .iter()
+            .find(|command| command.stage == CommandStage::Stage2)
+            .and_then(|command| command.args.last())
+            .and_then(|value| value.to_str())
+            .expect("stage2 payload argument")
+            .to_owned();
+        let decoded = decode_collect_payload(&expected_payload).expect("decode expected request");
+        assert_eq!(decoded.since, 0);
+        assert_eq!(decoded.data_dir, None);
+        assert!(!decoded.snapshot);
+        assert_eq!(decoded.source, None);
+        assert!(decoded.request_id.is_some());
         assert_remote_ssh_commands_keep_constant_command_and_payload_argv(
             &commands,
             &expected_payload,
@@ -2649,6 +2675,45 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
                 .stdin
         )
         .contains("run.*"));
+    }
+
+    #[test]
+    fn ssh_two_rounds_with_identical_business_inputs_use_distinct_payloads() {
+        let runner = FakeRunner::default();
+        push_startup(&runner);
+        push_successful_collection(&runner);
+        push_successful_collection(&runner);
+        let (_temp, artifacts) = artifact();
+        let transport = transport(&runner, artifacts).expect("construct transport");
+        let request = request();
+
+        transport.collect(&request).expect("first collection");
+        transport.collect(&request).expect("second collection");
+
+        let payloads = runner
+            .commands()
+            .into_iter()
+            .filter(|command| command.stage == CommandStage::Stage2)
+            .map(|command| {
+                command
+                    .args
+                    .last()
+                    .and_then(|value| value.to_str())
+                    .expect("stage2 payload argument")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(payloads.len(), 2);
+        assert_ne!(
+            payloads[0], payloads[1],
+            "a per-round identifier must distinguish otherwise identical requests"
+        );
+        for payload in payloads {
+            let decoded = decode_collect_payload(&payload).expect("decode round payload");
+            assert_eq!(decoded.since, request.since);
+            assert_eq!(decoded.snapshot, request.snapshot);
+            assert_eq!(decoded.source, request.source);
+        }
     }
 
     #[test]
@@ -3505,6 +3570,7 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
             data_dir: Some(hostile.into()),
             snapshot: true,
             source: None,
+            request_id: None,
         })
         .expect("encode hostile request");
         fs::write(workdir.join("request"), format!("{payload}\n")).expect("write request marker");
@@ -3597,6 +3663,7 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
             data_dir: None,
             snapshot: false,
             source: None,
+            request_id: None,
         })
         .expect("encode GC request");
 
@@ -3624,6 +3691,7 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
                 data_dir: None,
                 snapshot: false,
                 source: None,
+                request_id: None,
             })
             .expect("encode consecutive request");
             let stage2 = run_local_script(&home, Some(&payload), STAGE2_SCRIPT);
@@ -3642,6 +3710,41 @@ AGENTLENS_MACHINE_ID_HASH=a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("run."))
             .count();
         assert_eq!(remaining, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ssh_stage4_distinguishes_missing_and_ambiguous_request_markers() {
+        let temp = tempfile::tempdir().expect("marker tempdir");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("create HOME");
+        let payload = encode_collect_payload(&CollectPayload {
+            since: 7,
+            data_dir: None,
+            snapshot: false,
+            source: None,
+            request_id: None,
+        })
+        .expect("encode marker request");
+
+        let missing = run_local_script(&home, Some(&payload), STAGE4_SCRIPT);
+        assert_eq!(missing.status.code(), Some(71));
+        let missing_stderr = String::from_utf8(missing.stderr).expect("missing stderr UTF-8");
+        assert!(missing_stderr.contains("AgentLens request marker missing"));
+        assert!(!missing_stderr.contains("ambiguous"));
+
+        for _ in 0..2 {
+            let stage2 = run_local_script(&home, Some(&payload), STAGE2_SCRIPT);
+            assert!(
+                stage2.status.success(),
+                "STAGE2 must create duplicate markers"
+            );
+        }
+        let ambiguous = run_local_script(&home, Some(&payload), STAGE4_SCRIPT);
+        assert_eq!(ambiguous.status.code(), Some(72));
+        let ambiguous_stderr = String::from_utf8(ambiguous.stderr).expect("ambiguous stderr UTF-8");
+        assert!(ambiguous_stderr.contains("AgentLens request marker ambiguous"));
+        assert!(!ambiguous_stderr.contains("missing"));
     }
 
     // Gated exactly like its only caller, the Linux-only local GC fixture.

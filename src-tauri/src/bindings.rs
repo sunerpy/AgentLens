@@ -6,13 +6,13 @@ use ts_rs::TS;
 
 #[cfg(all(test, feature = "ts-export"))]
 use crate::contract::{
-    AggregateFilters, AppSettings, BreakdownDimensions, BreakdownRow, CostTotals, CoverageNote,
-    CoverageShortfall, CoverageStatus, DateRange, DetailCost, DetailFilters, Granularity, Host,
-    HostCreateInput, HostKind, HostUpdateInput, IpcError, IpcErrorCode, MessageFilters,
-    MessagePage, MessageRow, ObservedModelPrice, PriceCatalog, PriceEntry, PriceMatchKind,
-    PriceTable, RefreshEvent, SeriesGroup, SeriesGroupDimension, SeriesPoint, SeriesQueryResult,
-    SourceState, SourceStatus, Summary, TimeBucket, TokenValues, TriggerMode, TriggerRefreshResult,
-    WeekStart,
+    AggregateFilters, AppSettings, BreakdownDimensions, BreakdownRow, CostCoverage,
+    CostCoverageLayer, CostTotals, CoverageNote, CoverageShortfall, CoverageStatus, DateRange,
+    DetailCost, DetailFilters, Granularity, Host, HostCreateInput, HostKind, HostUpdateInput,
+    IpcError, IpcErrorCode, MessageFilters, MessagePage, MessageRow, ObservedModelPrice,
+    PriceCatalog, PriceEntry, PriceMatchKind, PriceTable, RefreshEvent, SeriesGroup,
+    SeriesGroupDimension, SeriesPoint, SeriesQueryResult, SourceState, SourceStatus, Summary,
+    TimeBucket, TokenValues, TriggerMode, TriggerRefreshResult, WeekStart,
 };
 #[cfg(all(test, feature = "ts-export"))]
 use crate::credentials::{
@@ -34,6 +34,8 @@ pub(crate) fn export_all(output_dir: &Path) -> Result<(), ts_rs::ExportError> {
     export::<MessageFilters>(output_dir)?;
     export::<TokenValues>(output_dir)?;
     export::<CostTotals>(output_dir)?;
+    export::<CostCoverageLayer>(output_dir)?;
+    export::<CostCoverage>(output_dir)?;
     export::<CoverageStatus>(output_dir)?;
     export::<CoverageShortfall>(output_dir)?;
     export::<CoverageNote>(output_dir)?;
@@ -88,7 +90,7 @@ mod tests {
 
     use super::*;
 
-    const TYPE_NAMES: [&str; 49] = [
+    const TYPE_NAMES: [&str; 51] = [
         "IpcErrorCode",
         "IpcError",
         "WeekStart",
@@ -100,6 +102,8 @@ mod tests {
         "MessageFilters",
         "TokenValues",
         "CostTotals",
+        "CostCoverageLayer",
+        "CostCoverage",
         "CoverageStatus",
         "CoverageShortfall",
         "CoverageNote",

@@ -189,6 +189,11 @@ function summary(unavailableCount: number): Summary {
       totalInput: 100,
     },
     cost: { actualSum: 1.5, estimatedSum: 2.5, unavailableCount },
+    costCoverage: {
+      actual: { recordCount: 117, billableTokens: 20_278_199 },
+      estimated: { recordCount: 251_365, billableTokens: 60_130_238_648 },
+      unavailable: { recordCount: unavailableCount, billableTokens: unavailableCount * 1_000 },
+    },
     messageCount: 6,
     sessionRecordCount: 0,
     activeSessionCount: 2,
@@ -196,6 +201,20 @@ function summary(unavailableCount: number): Summary {
 }
 
 describe('SummaryCards 的成本卡片', () => {
+  it('实际与估算金额分别显示各自覆盖的记录数和可计费 Token', () => {
+    render(<SummaryCards summary={summary(7)} />)
+
+    expect(screen.getByTestId('summary-cost-actual-coverage').textContent).toBe(
+      zh.overview.summary.costCoverage('117', '20.3M'),
+    )
+    expect(screen.getByTestId('summary-cost-estimated-coverage').textContent).toBe(
+      zh.overview.summary.costCoverage('251,365', '60.1B'),
+    )
+    expect(screen.getByTestId('summary-cost-unavailable-coverage').textContent).toBe(
+      zh.overview.summary.costCoverage('7', '7K'),
+    )
+  })
+
   it('长金额保留完整精度并允许在狭窄卡片内安全换行', () => {
     const longCost = summary(0)
     longCost.cost.actualSum = 297_017.5844

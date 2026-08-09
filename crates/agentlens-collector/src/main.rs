@@ -121,6 +121,8 @@ struct EncodedCollectRequest {
     data_dir: Option<String>,
     snapshot: Option<bool>,
     source: Option<String>,
+    #[serde(default, rename = "request_id")]
+    _request_id: Option<String>,
 }
 
 /// Source-neutral facts one adapter scan contributes to the v1 metadata line.
@@ -1290,6 +1292,29 @@ mod tests {
         assert_eq!(parsed.since, 123456789);
         assert_eq!(parsed.data_dir.as_deref(), Some(Path::new(original)));
         assert!(parsed.snapshot);
+    }
+
+    #[test]
+    fn collector_accepts_old_and_request_identified_payloads() {
+        for request_id in [None, Some("round-123")] {
+            let mut payload = serde_json::json!({
+                "since": 42,
+                "snapshot": false
+            });
+            if let Some(request_id) = request_id {
+                payload["request_id"] = serde_json::Value::String(request_id.to_owned());
+            }
+            let encoded =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+            let parsed = parse_collect_request(&[
+                OsString::from("collect"),
+                OsString::from("--request-base64url"),
+                OsString::from(encoded),
+            ])
+            .expect("old and new payloads must decode");
+            assert_eq!(parsed.since, 42);
+            assert!(!parsed.snapshot);
+        }
     }
 
     #[test]

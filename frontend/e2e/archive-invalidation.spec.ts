@@ -33,6 +33,11 @@ const COLLECTED_SUMMARY = {
     totalInput: 13_423_444_831,
   },
   cost: { actualSum: 83.52, estimatedSum: 0, unavailableCount: 155_348 },
+  costCoverage: {
+    actual: { recordCount: 150, billableTokens: 1_000_000 },
+    estimated: { recordCount: 0, billableTokens: 0 },
+    unavailable: { recordCount: 155_348, billableTokens: 13_430_119_689 },
+  },
   messageCount: 155_498,
   sessionRecordCount: 0,
   activeSessionCount: 4_094,

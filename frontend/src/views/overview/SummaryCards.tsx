@@ -158,6 +158,7 @@ function CostCard({
   archiveMissingPrices: readonly MissingPriceEntry[]
 }) {
   const { cost } = summary
+  const { costCoverage } = summary
   const hasUnavailable = cost.unavailableCount > 0
   return (
     <Card className="lg:col-span-2" data-testid="summary-cost-card">
@@ -169,20 +170,42 @@ function CostCard({
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="grid grid-cols-2 gap-x-6 gap-y-4">
-          <Metric
-            label={zh.common.cost.actual}
-            value={formatMoney(cost.actualSum)}
-            testId="summary-cost-actual"
-            emphasis
-            allowWrap
-          />
-          <Metric
-            label={zh.common.cost.estimated}
-            value={formatMoney(cost.estimatedSum)}
-            testId="summary-cost-estimated"
-            emphasis
-            allowWrap
-          />
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <Metric
+              label={zh.common.cost.actual}
+              value={formatMoney(cost.actualSum)}
+              testId="summary-cost-actual"
+              emphasis
+              allowWrap
+            />
+            <span
+              data-testid="summary-cost-actual-coverage"
+              className="text-[0.7rem] leading-relaxed text-muted-foreground"
+            >
+              {zh.overview.summary.costCoverage(
+                formatCount(costCoverage.actual.recordCount),
+                formatCompact(costCoverage.actual.billableTokens),
+              )}
+            </span>
+          </div>
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <Metric
+              label={zh.common.cost.estimated}
+              value={formatMoney(cost.estimatedSum)}
+              testId="summary-cost-estimated"
+              emphasis
+              allowWrap
+            />
+            <span
+              data-testid="summary-cost-estimated-coverage"
+              className="text-[0.7rem] leading-relaxed text-muted-foreground"
+            >
+              {zh.overview.summary.costCoverage(
+                formatCount(costCoverage.estimated.recordCount),
+                formatCompact(costCoverage.estimated.billableTokens),
+              )}
+            </span>
+          </div>
         </div>
         {hasUnavailable ? (
           <>
@@ -206,6 +229,15 @@ function CostCard({
               </div>
               <span className="text-[0.7rem] text-muted-foreground">
                 {zh.overview.summary.costUnavailableHint}
+              </span>
+              <span
+                data-testid="summary-cost-unavailable-coverage"
+                className="text-[0.7rem] text-muted-foreground"
+              >
+                {zh.overview.summary.costCoverage(
+                  formatCount(costCoverage.unavailable.recordCount),
+                  formatCompact(costCoverage.unavailable.billableTokens),
+                )}
               </span>
             </div>
             <CostMissingPrices

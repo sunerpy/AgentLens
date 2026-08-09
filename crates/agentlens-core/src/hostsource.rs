@@ -22,8 +22,8 @@ use thiserror::Error;
 use crate::archive::{Archive, NormalizedUsageRecord, Origin};
 use crate::host::{HostError, HostKind, HostRecord, HostRegistry, MachineIdentity};
 use crate::ingest::{
-    ingest_by_origin, read_cursor, read_source_cursor, IngestError, IngestRound, IngestStats,
-    OPENCODE_SOURCE,
+    ingest_by_origin_with_coverage, read_cursor, read_source_cursor, CoverageWindow, IngestError,
+    IngestRound, IngestStats, OPENCODE_SOURCE,
 };
 use crate::source::claude_code::{self, CLAUDE_CODE_SOURCE};
 use crate::source::codex::{self, CODEX_SOURCE};
@@ -32,7 +32,7 @@ use crate::source::opencode::{
     scan_connection, OpenCodeError, ScanRequest, ScanResult, SinkError, SkippedBreakdown,
     SourceConnection, SqliteSourceConnection,
 };
-use crate::source::opencode_legacy::{extend_live_coverage, CoverageInterval, LegacyError};
+use crate::source::opencode_legacy::{CoverageInterval, LegacyError};
 use crate::transport::ssh::{
     CommandRunner, SshCollectRequest, SshCollection, SshError, SshProbe, SshTransport,
 };
@@ -365,13 +365,12 @@ impl LocalHostSource {
             last_success_utc,
             batch_size: self.batch_size,
         };
+        let coverage_window = CoverageWindow::new(watermark.unwrap_or(0).max(0), now_utc_ms)?;
 
-        let mut earliest_observed = None::<i64>;
         let mut ingest_failure = None::<IngestError>;
         let mut round =
             IngestRound::begin(archive.connection_mut(), &self.host_id, INCREMENTAL_ORIGIN)?;
         let scan = scan_connection(connection, &request, |batch| {
-            observe_earliest(batch, &mut earliest_observed);
             match round.ingest_batch(batch) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -385,16 +384,12 @@ impl LocalHostSource {
             drop(round);
             return Err(HostSourceError::Ingest(error));
         }
-        let stats = round.finish(&scan)?;
-        let coverage = finish_coverage(
-            archive,
-            &self.host_id,
-            OPENCODE_SOURCE,
-            &stats,
+        let stats = round.finish_with_coverage(
             scan.reached_eof,
-            earliest_observed,
-            now_utc_ms,
+            scan.observed_max_time_updated,
+            Some(coverage_window),
         )?;
+        let coverage = committed_coverage(&stats, scan.reached_eof, coverage_window)?;
 
         Ok(CollectOutcome {
             host_id: self.host_id.clone(),
@@ -507,8 +502,8 @@ impl ClaudeCodeLocalSource {
             last_success_utc,
             batch_size: self.batch_size,
         };
+        let coverage_window = CoverageWindow::new(watermark.unwrap_or(0).max(0), now_utc_ms)?;
 
-        let mut earliest_observed = None::<i64>;
         let mut ingest_failure = None::<IngestError>;
         let mut round = IngestRound::begin_for_source(
             archive.connection_mut(),
@@ -517,7 +512,6 @@ impl ClaudeCodeLocalSource {
             INCREMENTAL_ORIGIN,
         )?;
         let scan = claude_code::scan_source(transcripts, &request, |batch| {
-            observe_earliest(batch, &mut earliest_observed);
             match round.ingest_batch(batch) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -531,16 +525,12 @@ impl ClaudeCodeLocalSource {
             drop(round);
             return Err(HostSourceError::Ingest(error));
         }
-        let stats = round.finish_with(scan.reached_eof, scan.observed_max_time_updated)?;
-        let coverage = finish_coverage(
-            archive,
-            &self.host_id,
-            CLAUDE_CODE_SOURCE,
-            &stats,
+        let stats = round.finish_with_coverage(
             scan.reached_eof,
-            earliest_observed,
-            now_utc_ms,
+            scan.observed_max_time_updated,
+            Some(coverage_window),
         )?;
+        let coverage = committed_coverage(&stats, scan.reached_eof, coverage_window)?;
 
         Ok(CollectOutcome {
             host_id: self.host_id.clone(),
@@ -643,35 +633,27 @@ impl CodexLocalSource {
             last_success_utc,
             batch_size: self.batch_size,
         };
+        let coverage_window = CoverageWindow::new(watermark.unwrap_or(0).max(0), now_utc_ms)?;
 
-        let mut earliest_observed = None::<i64>;
         // Buffered rather than ingested inside the sink because the tier a record belongs to is a
         // property of the record, and one open transaction can only accept one tier. The scanner
         // already materializes every record before it delivers the first batch, so this adds no
         // asymptotic memory the walk did not already require.
         let mut collected = Vec::new();
         let scan = codex::scan_data_dir(&self.data_dir, &request, |batch| {
-            observe_earliest(batch, &mut earliest_observed);
             collected.extend_from_slice(batch);
             Ok(())
         })?;
-        let stats = ingest_by_origin(
+        let stats = ingest_by_origin_with_coverage(
             archive.connection_mut(),
             &self.host_id,
             CODEX_SOURCE,
             &collected,
             scan.reached_eof,
             None,
+            Some(coverage_window),
         )?;
-        let coverage = finish_coverage(
-            archive,
-            &self.host_id,
-            CODEX_SOURCE,
-            &stats,
-            scan.reached_eof,
-            earliest_observed,
-            now_utc_ms,
-        )?;
+        let coverage = committed_coverage(&stats, scan.reached_eof, coverage_window)?;
 
         Ok(CollectOutcome {
             host_id: self.host_id.clone(),
@@ -779,8 +761,8 @@ impl HermesLocalSource {
             last_success_utc,
             batch_size: self.batch_size,
         };
+        let coverage_window = CoverageWindow::new(watermark.unwrap_or(0).max(0), now_utc_ms)?;
 
-        let mut earliest_observed = None::<i64>;
         let mut ingest_failure = None::<IngestError>;
         let mut round = IngestRound::begin_for_source(
             archive.connection_mut(),
@@ -789,7 +771,6 @@ impl HermesLocalSource {
             INCREMENTAL_ORIGIN,
         )?;
         let scan = hermes::scan_data_dir(&self.data_dir, &request, |batch| {
-            observe_earliest(batch, &mut earliest_observed);
             match round.ingest_batch(batch) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -803,16 +784,12 @@ impl HermesLocalSource {
             drop(round);
             return Err(HostSourceError::Ingest(error));
         }
-        let stats = round.finish_with(scan.reached_eof, scan.observed_max_time_updated)?;
-        let coverage = finish_coverage(
-            archive,
-            &self.host_id,
-            HERMES_SOURCE,
-            &stats,
+        let stats = round.finish_with_coverage(
             scan.reached_eof,
-            earliest_observed,
-            now_utc_ms,
+            scan.observed_max_time_updated,
+            Some(coverage_window),
         )?;
+        let coverage = committed_coverage(&stats, scan.reached_eof, coverage_window)?;
 
         Ok(CollectOutcome {
             host_id: self.host_id.clone(),
@@ -974,6 +951,7 @@ impl<R: CommandRunner> HostSource for SshHostSource<R> {
             .get(&self.host_id)?
             .and_then(|host| host.last_success_utc);
         let since = watermark.unwrap_or(0).max(0);
+        let coverage_window = CoverageWindow::new(since, now_utc_ms)?;
         let collection = self.transport.collect(&SshCollectRequest {
             ssh_target: self.ssh_target.clone(),
             since,
@@ -995,28 +973,19 @@ impl<R: CommandRunner> HostSource for SshHostSource<R> {
             last_success_utc,
             skip_reason: None,
         };
-        let earliest_observed = records.iter().map(|record| record.time_created_utc).min();
-
         // Tiered for the same reason as the local Codex round: `--source codex` on the remote
         // collector reports archived sessions as `bak`, so a single live round would reject the
         // whole payload. Single-origin adapters take the live tier alone and behave as before.
-        let stats = ingest_by_origin(
+        let stats = ingest_by_origin_with_coverage(
             archive.connection_mut(),
             &self.host_id,
             &self.source,
             &records,
             scan.reached_eof,
             scan.observed_max_time_updated,
+            Some(coverage_window),
         )?;
-        let coverage = finish_coverage(
-            archive,
-            &self.host_id,
-            &self.source,
-            &stats,
-            scan.reached_eof,
-            earliest_observed,
-            now_utc_ms,
-        )?;
+        let coverage = committed_coverage(&stats, scan.reached_eof, coverage_window)?;
 
         Ok(CollectOutcome {
             host_id: self.host_id.clone(),
@@ -1148,35 +1117,15 @@ struct RemoteScanWindowV1 {
     cutoff: i64,
 }
 
-fn observe_earliest(batch: &[NormalizedUsageRecord], earliest: &mut Option<i64>) {
-    for record in batch {
-        *earliest = Some(match *earliest {
-            Some(current) => current.min(record.time_created_utc),
-            None => record.time_created_utc,
-        });
-    }
-}
-
-fn finish_coverage(
-    archive: &mut Archive,
-    host_id: &str,
-    source: &str,
+fn committed_coverage(
     stats: &IngestStats,
     reached_eof: bool,
-    earliest_observed: Option<i64>,
-    cutoff: i64,
+    window: CoverageWindow,
 ) -> Result<Option<CoverageInterval>> {
     if !(reached_eof && stats.committed) {
         return Ok(None);
     }
-    let interval = extend_live_coverage(
-        archive.connection_mut(),
-        host_id,
-        source,
-        earliest_observed,
-        cutoff,
-    )?;
-    Ok(Some(interval))
+    Ok(Some(CoverageInterval::new(window.start, window.end)?))
 }
 
 /// Identity of one collectable slot: a host **and** the adapter collected on it.

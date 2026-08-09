@@ -181,6 +181,8 @@ export const zh = {
       tokenTotalHint: '总输入 = 输入 + 缓存读取 + 缓存写入',
       costTitle: '成本',
       costDescription: '实际 / 估算 / 缺失分层，永不相加',
+      costCoverage: (records: string, tokens: string) =>
+        `${records} 条记录 · ${tokens} 可计费 Token`,
       costUnavailableLabel: '无可信成本',
       costUnavailableUnit: '条',
       costUnavailableHint: '这些记录不计入任何金额，也不当 0',

@@ -258,6 +258,11 @@ const TREND: SeriesPoint[] = [
 const SUMMARY: Summary = {
   tokens: tokens(386_150, 29_550, 2_150, 231_200, 11_750),
   cost: cost(0.0484, 0.0075, 1),
+  costCoverage: {
+    actual: { recordCount: 90, billableTokens: 538_000 },
+    estimated: { recordCount: 18, billableTokens: 118_550 },
+    unavailable: { recordCount: 1, billableTokens: 2_100 },
+  },
   messageCount: 109,
   sessionRecordCount: 0,
   activeSessionCount: 14,
@@ -700,6 +705,11 @@ export const SESSION_GRANULARITY_DATASET: Pick<MockIpcDataset, 'summary' | 'tren
     summary: {
       tokens: tokens(450_150, 38_350, 2_150, 253_600, 13_350),
       cost: cost(0.0611, 0.0075, 1),
+      costCoverage: {
+        actual: { recordCount: 97, billableTokens: 634_800 },
+        estimated: { recordCount: 18, billableTokens: 118_550 },
+        unavailable: { recordCount: 1, billableTokens: 2_100 },
+      },
       messageCount: 109,
       sessionRecordCount: 7,
       activeSessionCount: 21,
