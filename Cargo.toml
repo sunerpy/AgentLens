@@ -1,0 +1,51 @@
+[workspace]
+members = [
+  "crates/agentlens-core",
+  "crates/agentlens-collector",
+  "crates/agentlens-askpass",
+  "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/sunerpy/AgentLens"
+authors = ["AgentLens Contributors"]
+
+[workspace.dependencies]
+agentlens-core = { path = "crates/agentlens-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# rusqlite 必须启用 bundled：静态编译随包 C SQLite，交叉编译 musl 时不依赖系统库。
+rusqlite = { version = "0.40", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+sha2 = "0.11"
+hex = "0.4"
+dirs = "6"
+thiserror = "2"
+base64 = "0.23"
+tempfile = "3"
+tracing = "0.1"
+# `ansi` 被刻意关掉：日志落文件，转义序列只会让日志查看页显示乱码。
+# `json` 让每条记录是一行自描述 JSON —— 日志查看页要按 level 过滤，靠正则切
+# 人类可读格式迟早在消息里带括号时切错。`env-filter` 提供 `RUST_LOG`。
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+  "fmt",
+  "json",
+  "env-filter",
+  "std",
+] }
+
+# Release profile 参照 cc-switch（github.com/farion1231/cc-switch @ 4317bd9
+# src-tauri/Cargo.toml#L108-114）。刻意保留 panic = "unwind"：
+# 后续 todo 需要 panic hook 与 backtrace，禁止改为 "abort"。
+[profile.release]
+lto = "thin"
+opt-level = "s"
+strip = "symbols"
+codegen-units = 1
+panic = "unwind"

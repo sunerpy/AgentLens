@@ -1,0 +1,28 @@
+# pre-commit 钩子配置（https://pre-commit.com）
+#
+# 安装：`make hooks`（等价于 pre-commit install --hook-type pre-commit --hook-type pre-push）。
+# 未安装 pre-commit 框架时 `make hooks` 会自动退化为写入 .git/hooks/ 下的纯 shell 钩子，
+# 两条路径跑的是同一批 make 目标，契约不会漂移。
+#
+# 全部使用 local 钩子而非远端 repo：钩子入口就是 Makefile 目标，因此「本地跑什么」与
+# 「CI 跑什么」永远是同一个定义，不需要额外 pin 外部仓库版本。
+repos:
+  - repo: local
+    hooks:
+      # 提交前只做格式化：必须够快，否则会把人逼到 `--no-verify`。
+      # make fmt 覆盖 cargo fmt + prettier(frontend/src) + oxfmt(YAML/JSON/MD)。
+      - id: fmt
+        name: fmt (cargo fmt + prettier + oxfmt)
+        entry: make fmt
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # 推送前跑测试：较慢的正确性门禁，在代码离开本机前拦住失败。
+      # 需要连带前端单测时用 `make test-unit`（见 Makefile 说明）。
+      - id: test
+        name: test (cargo test --workspace)
+        entry: make test
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

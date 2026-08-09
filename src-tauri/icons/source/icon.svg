@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <!-- AgentLens glyph. Pointy-top hexagon, three facets, no plate,
+       transparent canvas. The slate-500 outline is what keeps the shape
+       legible on light backgrounds, where the light facet is ~1.0:1. -->
+  <!-- facets -->
+  <path d="M 512 34.816 L 98.747 273.408 L 98.747 750.592 L 512 989.184 Z" fill="#E7EDF5"/>
+  <path d="M 512 34.816 L 925.253 273.408 L 925.253 512 L 512 512 Z" fill="#F97316"/>
+  <path d="M 512 512 L 925.253 512 L 925.253 750.592 L 512 989.184 Z" fill="#14B8A6"/>
+  <!-- facet seams -->
+  <path d="M 512 34.816 L 512 989.184" stroke="#64748B" stroke-width="28.672" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M 512 512 L 925.253 512" stroke="#64748B" stroke-width="28.672" stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- silhouette -- carries the shape on light backgrounds -->
+  <path d="M 512 34.816 L 925.253 273.408 L 925.253 750.592 L 512 989.184 L 98.747 750.592 L 98.747 273.408 Z" stroke="#64748B" stroke-width="28.672" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>
