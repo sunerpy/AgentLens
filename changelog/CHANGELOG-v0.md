@@ -1,4 +1,13 @@
-# Changelog (0.x)
+# Changelog
+
+## 0.0.1 (2026-08-09)
+
+
+### Features
+
+* AgentLens —— AI 编码工具用量看板 ([293cd92](https://github.com/sunerpy/AgentLens/commit/293cd923afd7d5e60f0be469df0f64f943177b3b))
+
+## Changelog (0.x)
 
 `0.x` 全部发布的变更日志。由 release-please 维护，请勿手改（见
 [`changelog/README.md`](README.md)）。
