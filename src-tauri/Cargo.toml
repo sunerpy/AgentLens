@@ -1,0 +1,61 @@
+[package]
+name = "agentlens-tauri"
+description = "AgentLens 桌面壳（Tauri 2）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# `_lib` 后缀是 Tauri 官方模板约定：避免 Windows 上 lib 与 bin 同名冲突
+# （https://github.com/rust-lang/cargo/issues/8519）。
+name = "agentlens_tauri_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+ts-export = ["dep:ts-rs"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agentlens-core = { workspace = true }
+# tray-icon：托盘常驻能力（托盘行为本身由后续 todo 实现，此处仅启用 feature）
+tauri = { version = "2", features = ["tray-icon"] }
+# opener：唯一「在系统文件管理器里定位归档库」的通道。只用 reveal_item_in_dir —— 它不受
+# scope 约束（scope 只作用于 open_url / open_path），因此 capability 里不需要路径白名单。
+tauri-plugin-opener = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+rusqlite = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ts-rs = { version = "=11.0.1", optional = true, features = ["serde-json-impl"] }
+# OS 钥匙串（口令/passphrase 唯一落地点，绝不写配置文件）。
+# 默认 feature 会退化成进程内 mock store —— 那等于"看起来通过"的假绿灯，
+# 所以显式关掉 default 并按平台钉死真实后端：Linux libsecret / Windows Credential Manager。
+keyring = { version = "=3.6.3", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = [
+  "sync-secret-service",
+  "crypto-rust",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = [
+  "windows-native",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `test` feature 只进 dev-dependencies：它带来的 MockRuntime 让 IPC 命令能在没有 GTK/WebView2
+# 的环境里被真实调用一遍（否则 async 壳只能靠类型断言覆盖），而 release 构建不含 dev-deps，
+# 因此这个 mock 运行时不会进产物。
+tauri = { version = "2", features = ["test"] }

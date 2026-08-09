@@ -1,0 +1,43 @@
+# oxfmt 的忽略清单：只在 `make fmt` / `make fmt-check` 里通过
+# `--ignore-path .oxfmtignore` 显式传入（oxfmt 默认只读 .gitignore/.prettierignore，
+# 不认这个文件名，所以必须显式指定）。
+#
+# 分工契约：oxfmt 只管 YAML / JSON / Markdown，prettier 只管 frontend/src 下的
+# TS/TSX。两者的域由 Makefile 里的 glob 保证互斥（oxfmt 从不接收 .ts/.tsx 路径），
+# 本文件负责在 YAML/JSON/MD 这一侧再排除「由别的工具生成或持有」的文件。
+#
+# 因为 --ignore-path 会**替换**默认的 .gitignore，被 .gitignore 忽略的目录必须在
+# 这里重新列一遍，否则 oxfmt 会去格式化 target/ 与 node_modules/ 里的文件。
+
+# ---- 构建与依赖产物（.gitignore 已忽略，这里必须重列）----
+target/
+artifacts/
+dist/
+frontend/dist/
+frontend/node_modules/
+node_modules/
+
+# ---- 生成物：由 ts-rs + prettier 产出，格式已由 bindings 门禁固定 ----
+# 重新格式化会让 `cargo test --features ts-export bindings_export` 之后的
+# git diff 变脏，直接破坏「生成物零漂移」这条门禁。
+frontend/src/generated/
+
+# ---- 工具持有的文件：改了会和生成方打架 ----
+# npm 持有 lockfile；release-please / git-cliff 持有变更日志与其清单。
+# 若 oxfmt 重排变更日志，下一次生成就会产生冲突 diff，让 PR 间的 fmt-check 假失败。
+frontend/package-lock.json
+CHANGELOG.md
+changelog/
+.release-please-manifest.json
+release-please-config.json
+
+# ---- 编排层与执行期文件：不属于产品代码，禁止改动 ----
+.omo/
+
+# ---- 其它并行工作流持有的文件（各自落地后可解除）----
+# README 与 docs/ 归双语文档重构负责人；.github/workflows/ 归 CI 与发布流水线
+# 负责人；tauri.conf.json 归平台支持负责人。此处排除是为了避免跨人改同一文件。
+README.md
+docs/
+.github/
+src-tauri/tauri.conf.json

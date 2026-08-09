@@ -1,0 +1,2434 @@
+//! 手工价格覆盖表与成本估算（todo 9）。
+//!
+//! 本模块以 `data_dir/agentlens/prices.json` 作为价格的**唯一事实源**（没有对应 SQL 表），
+//! 条目形状为 `{ provider_id, model_id, input_per_mtok, output_per_mtok,
+//! cache_read_per_mtok, cache_write_per_mtok }`；写入必须原子（写临时文件后 rename）。
+//!
+//! 对 `cost_source = unavailable` 且命中价格表的记录，在查询期动态计算 `estimated` 成本，
+//! 不回写归档库的原始 `cost` 列；未命中则保持 `unavailable`。
+//! `estimated` 与 `actual` 分开返回，绝不混加。
+//!
+//! 官方公开单价以随二进制编译的版本化 JSON 目录作为离线回退；`prices.json` 仍只保存用户覆盖。
+//! 未来显式的 models.dev 导入器可以更新同一目录形状，但应用启动与查询路径绝不联网。
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::archive::{CostSource, NormalizedUsageRecord};
+
+/// Data-directory subdirectory shared with the archive database.
+const PRICES_DIRECTORY: &str = "agentlens";
+/// File name of the single price source of truth.
+const PRICES_FILE: &str = "prices.json";
+/// Prefix of the same-directory temporary file used by the atomic write.
+///
+/// The leading dot plus this exact prefix is what makes a leftover temporary file impossible to
+/// confuse with the real document: [`PriceTable::load`] only ever opens [`PRICES_FILE`].
+const TEMP_FILE_PREFIX: &str = ".prices.json.tmp-";
+/// Divisor behind every `*_per_mtok` price: prices are quoted per 1,000,000 tokens.
+const TOKENS_PER_MTOK: f64 = 1_000_000.0;
+const READ_MAX_ATTEMPTS: usize = 8;
+const READ_RETRY_DELAY: Duration = Duration::from_millis(1);
+const READ_RETRY_LIMIT: Duration = Duration::from_millis(20);
+/// Serializes in-process replacements against readers so Windows never has to open the destination
+/// while another thread is moving a temporary file over it. The bounded retry below remains
+/// necessary for replacements performed by another AgentLens process.
+static PRICES_IO_LOCK: RwLock<()> = RwLock::new(());
+
+/// Document version understood by this build.
+///
+/// The field exists so a future models.dev importer can rewrite the same file with a richer layout
+/// while older builds still fail loudly instead of silently mis-reading it.
+pub const PRICES_SCHEMA_VERSION: u32 = 1;
+/// Document version understood by the bundled provider catalog parser.
+pub const PRICE_CATALOG_SCHEMA_VERSION: u32 = 1;
+const BUILTIN_PRICE_CATALOG_JSON: &str = include_str!("pricing_catalog.json");
+
+fn is_transient_read_error(source: &io::Error) -> bool {
+    let transient = source.kind() == io::ErrorKind::PermissionDenied;
+    #[cfg(windows)]
+    let transient = transient || source.raw_os_error() == Some(32);
+    transient
+}
+
+/// Result type returned by pricing operations.
+pub type Result<T> = std::result::Result<T, PricingError>;
+
+/// Errors returned while resolving, loading, validating, or atomically writing `prices.json`.
+#[derive(Debug, Error)]
+pub enum PricingError {
+    /// The operating system did not expose a per-user data directory.
+    #[error("cannot resolve the user data directory for AgentLens prices.json")]
+    DataDirectoryUnavailable,
+    /// The prices path has no usable parent directory.
+    #[error("prices file path is invalid: {0}")]
+    InvalidPricesPath(PathBuf),
+    /// The prices directory could not be created.
+    #[error("cannot prepare prices directory at {path}: {source}")]
+    Directory {
+        /// Directory involved in the failed operation.
+        path: PathBuf,
+        /// Original filesystem error.
+        source: std::io::Error,
+    },
+    /// The prices file exists but could not be read.
+    #[error("cannot read prices file at {path}: {source}")]
+    Read {
+        /// Prices file that could not be read.
+        path: PathBuf,
+        /// Original filesystem error.
+        source: std::io::Error,
+    },
+    /// The prices file is not valid JSON, or not a valid price document.
+    #[error(
+        "prices file at {path} is not valid AgentLens price JSON: {source}; fix the file by hand or delete it to run without price overrides"
+    )]
+    Parse {
+        /// Prices file that failed to parse.
+        path: PathBuf,
+        /// Original JSON error, including its line and column.
+        source: serde_json::Error,
+    },
+    /// The document declares a `schema_version` this build does not understand.
+    #[error(
+        "prices file schema_version {found} is not supported by this build (supported: {supported}); upgrade AgentLens instead of editing the version by hand"
+    )]
+    UnsupportedSchema {
+        /// Version found in the document.
+        found: u32,
+        /// Version understood by this build.
+        supported: u32,
+    },
+    /// A price is negative or non-finite.
+    #[error(
+        "price entry {provider_id}/{model_id} has an invalid {field}: {value}; every per-Mtok price must be finite and must not be negative"
+    )]
+    InvalidPrice {
+        /// Provider of the offending entry.
+        provider_id: String,
+        /// Model of the offending entry.
+        model_id: String,
+        /// Offending field name.
+        field: &'static str,
+        /// Offending value.
+        value: f64,
+    },
+    /// A lookup-key component is empty or whitespace only.
+    #[error(
+        "price entry at index {index} has a blank {field}; provider_id and model_id form the lookup key and must be non-empty"
+    )]
+    BlankIdentifier {
+        /// Zero-based index of the offending entry.
+        index: usize,
+        /// Offending field name.
+        field: &'static str,
+    },
+    /// Two entries share the same lookup key.
+    #[error(
+        "price table contains more than one entry for {provider_id}/{model_id}; the lookup key (provider_id, model_id) must be unique"
+    )]
+    DuplicateEntry {
+        /// Duplicated provider.
+        provider_id: String,
+        /// Duplicated model.
+        model_id: String,
+    },
+    /// The in-memory table could not be serialized.
+    #[error("cannot serialize the price table: {source}")]
+    Serialize {
+        /// Original JSON error.
+        source: serde_json::Error,
+    },
+    /// The temporary file could not be created, written, or flushed to disk.
+    #[error("cannot write the temporary prices file at {path}: {source}")]
+    Write {
+        /// Temporary file path.
+        path: PathBuf,
+        /// Original filesystem error.
+        source: std::io::Error,
+    },
+    /// The temporary file could not replace the target, so nothing was changed.
+    #[error("cannot atomically replace {target} with {temp}: {source}")]
+    Rename {
+        /// Fully written temporary file (already removed again).
+        temp: PathBuf,
+        /// Intended target path, left untouched.
+        target: PathBuf,
+        /// Original filesystem error.
+        source: std::io::Error,
+    },
+}
+
+/// Billable token buckets that feed a cost estimate.
+///
+/// Reasoning tokens are deliberately absent: providers disagree on whether `tok_reasoning` is a
+/// subset of output or a separate bucket, the document has no `reasoning_per_mtok` field, and
+/// guessing either way would silently double-count or under-count. Excluding them from the type
+/// makes a wrong wiring impossible rather than merely discouraged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenCounts {
+    /// Cache-miss input tokens, priced with `input_per_mtok`.
+    pub input: u64,
+    /// Output tokens, priced with `output_per_mtok`.
+    pub output: u64,
+    /// Cache-read input tokens, priced with `cache_read_per_mtok`.
+    pub cache_read: u64,
+    /// Cache-write input tokens, priced with `cache_write_per_mtok`.
+    pub cache_write: u64,
+}
+
+impl From<&NormalizedUsageRecord> for TokenCounts {
+    /// Copies the four billable buckets straight off an archive record.
+    ///
+    /// `tok_input` is the cache-MISS input count, so the derived `total_input`
+    /// (`input + cache_read + cache_write`) must never be substituted here: doing so would charge
+    /// the full input price on cached tokens as well.
+    fn from(record: &NormalizedUsageRecord) -> Self {
+        Self {
+            input: record.tok_input,
+            output: record.tok_output,
+            cache_read: record.tok_cache_read,
+            cache_write: record.tok_cache_write,
+        }
+    }
+}
+
+/// One manual price override, quoted per 1,000,000 tokens in the user's own currency.
+///
+/// Unknown JSON fields are preserved in [`PriceEntry::extra`] so a future models.dev importer can
+/// annotate entries (provenance, timestamps) without older builds dropping the annotations on the
+/// next save.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PriceEntry {
+    /// Provider identifier, matched verbatim against `usage_record.provider_id`.
+    pub provider_id: String,
+    /// Model identifier, matched verbatim against `usage_record.model_id`.
+    pub model_id: String,
+    /// Price of cache-miss input tokens per 1,000,000 tokens.
+    pub input_per_mtok: f64,
+    /// Price of output tokens per 1,000,000 tokens.
+    pub output_per_mtok: f64,
+    /// Price of cache-read input tokens per 1,000,000 tokens.
+    pub cache_read_per_mtok: f64,
+    /// Price of cache-write input tokens per 1,000,000 tokens.
+    pub cache_write_per_mtok: f64,
+    /// Forward-compatibility passthrough for unknown entry-level fields.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Versioned, offline snapshot of official public provider prices bundled with the application.
+///
+/// `catalog_version` is an update identifier while `updated_at` tells the user how old the price
+/// snapshot is. Entries deliberately reuse [`PriceEntry`] so a future explicit importer can emit
+/// the same price shape as the manual override file without introducing a second pricing schema.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PriceCatalog {
+    /// Catalog document schema, independent from the price snapshot version.
+    pub schema_version: u32,
+    /// Monotonic snapshot identifier chosen by the catalog producer.
+    pub catalog_version: String,
+    /// ISO-8601 date on which the public provider pages were reviewed.
+    pub updated_at: String,
+    /// Currency shared by every entry in this snapshot.
+    pub currency: String,
+    /// Canonical provider/model prices.
+    pub entries: Vec<PriceEntry>,
+}
+
+/// How a provider/model pair reached a catalog or override entry.
+///
+/// Only [`PriceMatchKind::Exact`] is fully authoritative for the observed identifiers.
+/// `Normalized`, `Family`, and `CrossProvider` are intentionally separate so UI and future
+/// importers can explain why a price is approximate instead of collapsing every successful lookup
+/// into silent certainty.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PriceMatchKind {
+    /// Provider and model identifiers are byte-for-byte identical.
+    Exact,
+    /// Case, provider alias, platform prefix, or Bedrock version suffix was normalized.
+    Normalized,
+    /// No normalized exact match existed; the nearest dated model in the same family was used.
+    Family,
+    /// The observed provider was absent from the catalog, so model identity selected another
+    /// provider's entry using the deterministic direct-provider preference documented by
+    /// [`match_price`].
+    CrossProvider,
+}
+
+impl PriceMatchKind {
+    /// Whether consumers must present this result as an approximation.
+    pub const fn is_approximate(self) -> bool {
+        !matches!(self, Self::Exact)
+    }
+}
+
+/// One successful pure provider/model match.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PriceMatch<'a> {
+    /// Matched price entry.
+    pub entry: &'a PriceEntry,
+    /// Matching layer that selected the entry.
+    pub kind: PriceMatchKind,
+}
+
+#[derive(Debug)]
+struct ModelIdentity {
+    normalized: String,
+    family: String,
+    version: Option<u32>,
+}
+
+/// Returns the immutable offline catalog compiled into this build.
+///
+/// Parsing is process-global and lazy. The JSON is a build-owned resource, so a malformed bundle is
+/// a programming error; the catalog tests validate it before release rather than turning every
+/// pricing query into a fallible file operation.
+pub fn builtin_price_catalog() -> &'static PriceCatalog {
+    static CATALOG: OnceLock<PriceCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let catalog: PriceCatalog = serde_json::from_str(BUILTIN_PRICE_CATALOG_JSON)
+            .expect("bundled pricing_catalog.json must be valid JSON");
+        assert_eq!(
+            catalog.schema_version, PRICE_CATALOG_SCHEMA_VERSION,
+            "bundled pricing_catalog.json has an unsupported schema_version"
+        );
+        assert!(
+            !catalog.catalog_version.trim().is_empty()
+                && !catalog.updated_at.trim().is_empty()
+                && catalog.currency == "USD",
+            "bundled pricing_catalog.json metadata is invalid"
+        );
+        PriceTable::from_entries(catalog.entries.clone())
+            .validate()
+            .expect("bundled pricing_catalog.json entries must be valid and unique");
+        catalog
+    })
+}
+
+/// Matches a provider/model pair without consulting files, global state, time, or the network.
+///
+/// Layers are deterministic and conservative: literal tuple, normalized tuple, nearest dated entry
+/// in the same model family, then (only when the normalized provider is absent from the catalog)
+/// cross-provider model identity. Known provider families never cross (for example Anthropic direct
+/// pricing is not substituted for Bedrock pricing), and an unknown model family returns `None`
+/// rather than inventing a price.
+///
+/// A model can occur under both a direct provider and a managed platform with different prices.
+/// Cross-provider ties therefore prefer canonical direct providers (`anthropic`, `google`, and
+/// `openai`) over `amazon-bedrock`, because an otherwise unknown gateway normally forwards a direct
+/// API. Remaining ties use normalized provider and literal model identifiers, so results never
+/// depend on catalog entry order.
+pub fn match_price<'a>(
+    entries: &'a [PriceEntry],
+    provider_id: &str,
+    model_id: &str,
+) -> Option<PriceMatch<'a>> {
+    match_price_with_policy(entries, provider_id, model_id, true)
+}
+
+fn match_price_with_policy<'a>(
+    entries: &'a [PriceEntry],
+    provider_id: &str,
+    model_id: &str,
+    allow_cross_provider: bool,
+) -> Option<PriceMatch<'a>> {
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.provider_id == provider_id && entry.model_id == model_id)
+    {
+        return Some(PriceMatch {
+            entry,
+            kind: PriceMatchKind::Exact,
+        });
+    }
+
+    let provider = normalize_provider(provider_id);
+    let model = model_identity(model_id);
+    let provider_is_known = entries
+        .iter()
+        .any(|entry| normalize_provider(&entry.provider_id) == provider);
+    if let Some(entry) = entries.iter().find(|entry| {
+        normalize_provider(&entry.provider_id) == provider
+            && model_identity(&entry.model_id).normalized == model.normalized
+    }) {
+        return Some(PriceMatch {
+            entry,
+            kind: PriceMatchKind::Normalized,
+        });
+    }
+
+    let mut family = entries
+        .iter()
+        .filter_map(|entry| {
+            if normalize_provider(&entry.provider_id) != provider {
+                return None;
+            }
+            let candidate = model_identity(&entry.model_id);
+            (candidate.family == model.family).then_some((entry, candidate.version))
+        })
+        .collect::<Vec<_>>();
+    if !family.is_empty() {
+        family.sort_by(|(left_entry, left_version), (right_entry, right_version)| {
+            family_distance(model.version, *left_version)
+                .cmp(&family_distance(model.version, *right_version))
+                // On equal distance, prefer the newer dated entry, then a stable lexical key.
+                .then_with(|| right_version.cmp(left_version))
+                .then_with(|| left_entry.model_id.cmp(&right_entry.model_id))
+        });
+        return Some(PriceMatch {
+            entry: family[0].0,
+            kind: PriceMatchKind::Family,
+        });
+    }
+
+    let variant_model = pricing_model_identity(model_id);
+    if variant_model.normalized != model.normalized {
+        if let Some(entry) = entries.iter().find(|entry| {
+            normalize_provider(&entry.provider_id) == provider
+                && model_identity(&entry.model_id).normalized == variant_model.normalized
+        }) {
+            return Some(PriceMatch {
+                entry,
+                kind: PriceMatchKind::CrossProvider,
+            });
+        }
+    }
+
+    (allow_cross_provider && !provider_is_known)
+        .then(|| match_cross_provider(entries, model_id))
+        .flatten()
+}
+
+fn match_cross_provider<'a>(entries: &'a [PriceEntry], model_id: &str) -> Option<PriceMatch<'a>> {
+    let model = pricing_model_identity(model_id);
+    let mut normalized = entries
+        .iter()
+        .filter(|entry| pricing_model_identity(&entry.model_id).normalized == model.normalized)
+        .collect::<Vec<_>>();
+    normalized.sort_by(|left, right| compare_cross_provider_entries(left, right));
+    if let Some(entry) = normalized.first() {
+        return Some(PriceMatch {
+            entry,
+            kind: PriceMatchKind::CrossProvider,
+        });
+    }
+
+    let mut family = entries
+        .iter()
+        .filter_map(|entry| {
+            let candidate = pricing_model_identity(&entry.model_id);
+            (candidate.family == model.family).then_some((entry, candidate.version))
+        })
+        .collect::<Vec<_>>();
+    family.sort_by(|(left_entry, left_version), (right_entry, right_version)| {
+        family_distance(model.version, *left_version)
+            .cmp(&family_distance(model.version, *right_version))
+            .then_with(|| right_version.cmp(left_version))
+            .then_with(|| compare_cross_provider_entries(left_entry, right_entry))
+    });
+    family.first().map(|(entry, _)| PriceMatch {
+        entry,
+        kind: PriceMatchKind::CrossProvider,
+    })
+}
+
+fn pricing_model_identity(model_id: &str) -> ModelIdentity {
+    let identity = model_identity(model_id);
+    // 这里只剥离已确认共享价格条目的运行档位。`mini` / `nano` 是独立模型：GPT-5.4
+    // 分别为 2.5/15、0.75/4.5、0.2/1.25 美元，误剥离会造成最高 3 倍以上偏差。
+    // `preview` / `latest` 是发布通道或滚动别名，`free` 是计费层级，也不能假定等价。
+    let base = [
+        "xhigh", "high", "medium", "low", "minimal", "max", "thinking", "fast",
+    ]
+    .iter()
+    .find_map(|variant| identity.normalized.strip_suffix(&format!("-{variant}")))
+    .unwrap_or(&identity.normalized);
+    model_identity(base)
+}
+
+fn compare_cross_provider_entries(left: &PriceEntry, right: &PriceEntry) -> std::cmp::Ordering {
+    cross_provider_rank(&left.provider_id)
+        .cmp(&cross_provider_rank(&right.provider_id))
+        .then_with(|| {
+            normalize_provider(&left.provider_id).cmp(&normalize_provider(&right.provider_id))
+        })
+        .then_with(|| left.model_id.cmp(&right.model_id))
+}
+
+fn cross_provider_rank(provider_id: &str) -> u8 {
+    match normalize_provider(provider_id).as_str() {
+        "anthropic" | "google" | "openai" => 0,
+        "amazon-bedrock" => 1,
+        _ => 2,
+    }
+}
+
+fn normalize_provider(provider_id: &str) -> String {
+    let normalized = normalize_identifier(provider_id);
+    match normalized.as_str() {
+        "aws" | "aws-bedrock" | "bedrock" | "amazon-bedrock-runtime" => "amazon-bedrock".to_owned(),
+        "google-ai" | "google-generative-ai" | "gemini" | "vertex-ai" | "vertexai" => {
+            "google".to_owned()
+        }
+        value => value.to_owned(),
+    }
+}
+
+fn model_identity(model_id: &str) -> ModelIdentity {
+    let mut platform_free = model_id.trim().to_ascii_lowercase().replace('_', "-");
+    // Bedrock cross-region inference profile prefixes, per
+    // https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html
+    // Geographic prefixes bill at the Geo / In-region rate, so stripping one must land on the Geo
+    // catalog entry, which pricing_catalog.json lists before its `global.` twin.
+    for prefix in ["us-gov.", "us.", "eu.", "apac.", "jp.", "au.", "global."] {
+        if platform_free.starts_with(prefix) {
+            platform_free = platform_free[prefix.len()..].to_owned();
+            break;
+        }
+    }
+    for prefix in ["anthropic.", "openai.", "google."] {
+        if platform_free.starts_with(prefix) {
+            platform_free = platform_free[prefix.len()..].to_owned();
+            break;
+        }
+    }
+    if let Some((base, suffix)) = platform_free.rsplit_once("-v") {
+        if is_bedrock_version_suffix(suffix) {
+            platform_free = base.to_owned();
+        }
+    }
+
+    let normalized = normalize_identifier(&platform_free);
+    let (family, version) = match normalized.rsplit_once('-') {
+        Some((family, version)) if is_date_version(version) => {
+            (family.to_owned(), version.parse::<u32>().ok())
+        }
+        _ => (normalized.clone(), None),
+    };
+    ModelIdentity {
+        normalized,
+        family,
+        version,
+    }
+}
+
+fn normalize_identifier(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator = false;
+    for character in value.trim().chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push(character);
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    normalized
+}
+
+fn is_bedrock_version_suffix(value: &str) -> bool {
+    value.split_once(':').is_some_and(|(major, minor)| {
+        !major.is_empty()
+            && major.bytes().all(|byte| byte.is_ascii_digit())
+            && !minor.is_empty()
+            && minor.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn is_date_version(value: &str) -> bool {
+    value.len() == 8 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn family_distance(requested: Option<u32>, candidate: Option<u32>) -> u32 {
+    match (requested, candidate) {
+        (Some(requested), Some(candidate)) => requested.abs_diff(candidate),
+        (None, Some(candidate)) => u32::MAX - candidate,
+        (Some(_), None) => u32::MAX - 1,
+        (None, None) => 0,
+    }
+}
+
+impl PriceEntry {
+    /// Builds an entry with no forward-compatibility extras.
+    pub fn new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        input_per_mtok: f64,
+        output_per_mtok: f64,
+        cache_read_per_mtok: f64,
+        cache_write_per_mtok: f64,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            input_per_mtok,
+            output_per_mtok,
+            cache_read_per_mtok,
+            cache_write_per_mtok,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// Computes the cost of one record's token buckets.
+    ///
+    /// The mapping is fixed and each bucket is charged exactly once:
+    /// `input → input_per_mtok`, `output → output_per_mtok`,
+    /// `cache_read → cache_read_per_mtok`, `cache_write → cache_write_per_mtok`.
+    /// Every bucket contributes `tokens / 1_000_000 * per_mtok`; reasoning tokens are not priced.
+    pub fn estimate(&self, tokens: TokenCounts) -> f64 {
+        Self::bucket_cost(tokens.input, self.input_per_mtok)
+            + Self::bucket_cost(tokens.output, self.output_per_mtok)
+            + Self::bucket_cost(tokens.cache_read, self.cache_read_per_mtok)
+            + Self::bucket_cost(tokens.cache_write, self.cache_write_per_mtok)
+    }
+
+    fn bucket_cost(tokens: u64, per_mtok: f64) -> f64 {
+        tokens as f64 / TOKENS_PER_MTOK * per_mtok
+    }
+
+    fn validate(&self, index: usize) -> Result<()> {
+        for (field, value) in [
+            ("provider_id", self.provider_id.as_str()),
+            ("model_id", self.model_id.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(PricingError::BlankIdentifier { index, field });
+            }
+        }
+
+        for (field, value) in [
+            ("input_per_mtok", self.input_per_mtok),
+            ("output_per_mtok", self.output_per_mtok),
+            ("cache_read_per_mtok", self.cache_read_per_mtok),
+            ("cache_write_per_mtok", self.cache_write_per_mtok),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(PricingError::InvalidPrice {
+                    provider_id: self.provider_id.clone(),
+                    model_id: self.model_id.clone(),
+                    field,
+                    value,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Cost of one record after the price table has been consulted.
+///
+/// The three states stay distinct all the way to the caller; there is deliberately no accessor that
+/// collapses [`ResolvedCost::Actual`] and [`ResolvedCost::Estimated`] into a single number, and
+/// [`ResolvedCost::Unavailable`] never degrades to `0.0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ResolvedCost {
+    /// Trustworthy source-reported cost.
+    Actual(f64),
+    /// Cost derived from a local price override at query time; never written back to the archive.
+    Estimated(f64),
+    /// Neither a source cost nor a price override exists.
+    Unavailable,
+}
+
+impl ResolvedCost {
+    /// Returns the [`CostSource`] this resolution corresponds to.
+    pub const fn source(self) -> CostSource {
+        match self {
+            Self::Actual(_) => CostSource::Actual,
+            Self::Estimated(_) => CostSource::Estimated,
+            Self::Unavailable => CostSource::Unavailable,
+        }
+    }
+
+    /// Returns the actual cost, or `None` for estimated and unavailable rows.
+    pub const fn actual(self) -> Option<f64> {
+        match self {
+            Self::Actual(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Returns the estimated cost, or `None` for actual and unavailable rows.
+    pub const fn estimated(self) -> Option<f64> {
+        match self {
+            Self::Estimated(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// Layered cost aggregate: actual and estimated money never share a field.
+///
+/// Field names match the fixture manifest and todo 8's summary contract
+/// (`cost: {actual_sum, unavailable_count, estimated_sum}`). Rows without any cost only ever
+/// increment `unavailable_count`; they are never added as `0.0`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct CostTotals {
+    /// Sum of trustworthy source-reported costs.
+    pub actual_sum: f64,
+    /// Sum of query-time estimates produced from the price table.
+    pub estimated_sum: f64,
+    /// Number of rows with neither an actual cost nor a price override.
+    pub unavailable_count: u64,
+}
+
+impl CostTotals {
+    /// Folds one resolved cost into the matching layer.
+    pub fn add(&mut self, resolved: ResolvedCost) {
+        match resolved {
+            ResolvedCost::Actual(value) => self.actual_sum += value,
+            ResolvedCost::Estimated(value) => self.estimated_sum += value,
+            ResolvedCost::Unavailable => self.unavailable_count += 1,
+        }
+    }
+}
+
+/// The whole `prices.json` document: the single source of truth for manual price overrides.
+///
+/// # Lookup key
+///
+/// Entries are keyed by `(provider_id, model_id)` and **`variant` is deliberately ignored**. The
+/// archive's model key is `(provider_id, model_id, variant)`, but real prices vary by model, not by
+/// reasoning-effort variant, so `xhigh`, `low`, and a missing variant all resolve to the same entry.
+/// Downstream code (todos 8 and 19) must not add a variant column to the price editor.
+///
+/// # On-disk shape
+///
+/// ```json
+/// {
+///   "schema_version": 1,
+///   "entries": [
+///     {
+///       "provider_id": "kiro-auth",
+///       "model_id": "claude-opus-5-max",
+///       "input_per_mtok": 3.0,
+///       "output_per_mtok": 15.0,
+///       "cache_read_per_mtok": 0.3,
+///       "cache_write_per_mtok": 3.75
+///     }
+///   ]
+/// }
+/// ```
+///
+/// Field names are snake_case exactly as written here, because the file is meant to be edited by
+/// hand (and by todo 19's editor). All six entry fields are required: a missing price is a readable
+/// error rather than a silent `0`. Unknown fields at document and entry level are preserved across a
+/// load/save round trip so a later models.dev importer can enrich the same file.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PriceTable {
+    /// Document version; must equal [`PRICES_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// Manual price overrides, in the order the file lists them.
+    pub entries: Vec<PriceEntry>,
+    /// Forward-compatibility passthrough for unknown document-level fields.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for PriceTable {
+    fn default() -> Self {
+        Self {
+            schema_version: PRICES_SCHEMA_VERSION,
+            entries: Vec::new(),
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+impl PriceTable {
+    /// Returns an empty table stamped with the current schema version.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a table built from `entries`, stamped with the current schema version.
+    pub fn from_entries(entries: Vec<PriceEntry>) -> Self {
+        Self {
+            schema_version: PRICES_SCHEMA_VERSION,
+            entries,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// Checks the document contract: known schema version, non-blank keys, finite non-negative
+    /// prices, and at most one entry per `(provider_id, model_id)`.
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != PRICES_SCHEMA_VERSION {
+            return Err(PricingError::UnsupportedSchema {
+                found: self.schema_version,
+                supported: PRICES_SCHEMA_VERSION,
+            });
+        }
+
+        let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            entry.validate(index)?;
+            if !seen.insert((entry.provider_id.as_str(), entry.model_id.as_str())) {
+                return Err(PricingError::DuplicateEntry {
+                    provider_id: entry.provider_id.clone(),
+                    model_id: entry.model_id.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finds the best override or bundled-catalog entry, including its matching layer.
+    ///
+    /// Manual entries require a byte-for-byte `(provider_id, model_id)` match before the bundled
+    /// fallback. This keeps an operator-authored override scoped to exactly the tuple they entered;
+    /// normalization and family inference are properties of the bundled catalog only.
+    pub fn lookup_match(&self, provider_id: &str, model_id: &str) -> Option<PriceMatch<'_>> {
+        self.entries
+            .iter()
+            .find(|entry| entry.provider_id == provider_id && entry.model_id == model_id)
+            .map(|entry| PriceMatch {
+                entry,
+                kind: PriceMatchKind::Exact,
+            })
+            .or_else(|| match_price(&builtin_price_catalog().entries, provider_id, model_id))
+    }
+
+    /// Finds the best entry for `(provider_id, model_id)`, ignoring any model variant.
+    ///
+    /// The scan is linear because a hand-maintained table holds a handful of models; callers that
+    /// resolve millions of rows may hoist their own map if profiling ever demands it.
+    pub fn lookup(&self, provider_id: &str, model_id: &str) -> Option<&PriceEntry> {
+        self.lookup_match(provider_id, model_id)
+            .map(|matched| matched.entry)
+    }
+
+    /// Estimates a cost for `(provider_id, model_id)`, or `None` when the model is not priced.
+    pub fn estimate(&self, provider_id: &str, model_id: &str, tokens: TokenCounts) -> Option<f64> {
+        self.lookup(provider_id, model_id)
+            .map(|entry| entry.estimate(tokens))
+    }
+
+    /// Resolves one row's cost at query time.
+    ///
+    /// A stored value is trusted only when it is present, finite, and declared `actual` or
+    /// `estimated`. Anything else (including the contradictory `unavailable` + value combination)
+    /// falls through to the price table: a hit yields [`ResolvedCost::Estimated`], a miss stays
+    /// [`ResolvedCost::Unavailable`]. Nothing here writes to the archive.
+    pub fn resolve_cost(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        tokens: TokenCounts,
+        cost: Option<f64>,
+        cost_source: CostSource,
+    ) -> ResolvedCost {
+        let trusted = cost.filter(|value| value.is_finite());
+        match (trusted, cost_source) {
+            (Some(value), CostSource::Actual) => ResolvedCost::Actual(value),
+            (Some(value), CostSource::Estimated) => ResolvedCost::Estimated(value),
+            _ => match self.lookup(provider_id, model_id) {
+                Some(entry) => ResolvedCost::Estimated(entry.estimate(tokens)),
+                None => ResolvedCost::Unavailable,
+            },
+        }
+    }
+
+    /// Resolves one archive record's cost without touching the archive.
+    pub fn resolve_record(&self, record: &NormalizedUsageRecord) -> ResolvedCost {
+        self.resolve_cost(
+            &record.provider_id,
+            &record.model_id,
+            TokenCounts::from(record),
+            record.cost,
+            record.cost_source,
+        )
+    }
+
+    /// Loads and validates the document at an explicit path.
+    ///
+    /// A missing file is not an error: it means no manual overrides exist yet, so an empty table is
+    /// returned. A present but malformed file is a hard [`PricingError`]; use
+    /// [`PriceTable::load_or_empty`] to keep running with estimation disabled instead.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let _read_guard = PRICES_IO_LOCK
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Self::load_with_reader(path, |path| fs::read(path), thread::sleep)
+    }
+
+    fn load_with_reader<R, W>(path: &Path, mut reader: R, mut wait: W) -> Result<Self>
+    where
+        R: FnMut(&Path) -> io::Result<Vec<u8>>,
+        W: FnMut(Duration),
+    {
+        let started = Instant::now();
+        let mut attempts = 0;
+        let bytes = loop {
+            attempts += 1;
+            match reader(path) {
+                Ok(bytes) => break bytes,
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Self::new());
+                }
+                Err(source)
+                    if is_transient_read_error(&source)
+                        && attempts < READ_MAX_ATTEMPTS
+                        && started.elapsed() < READ_RETRY_LIMIT =>
+                {
+                    // MoveFileEx replacement leaves the old destination delete-pending only until
+                    // its last reader handle closes, normally a sub-millisecond window. Eight open
+                    // attempts spaced by 1 ms cover that window generously, while the independent
+                    // 20 ms wall cap prevents scheduler delays from turning a real ACL failure into
+                    // a noticeable stall. A failure that persists still returns the last typed
+                    // PricingError::Read unchanged; this retry adds latency, never hides the error.
+                    let remaining = READ_RETRY_LIMIT.saturating_sub(started.elapsed());
+                    wait(READ_RETRY_DELAY.min(remaining));
+                    if started.elapsed() >= READ_RETRY_LIMIT {
+                        return Err(PricingError::Read {
+                            path: path.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+                Err(source) => {
+                    return Err(PricingError::Read {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+        };
+
+        let table: Self = serde_json::from_slice(&bytes).map_err(|source| PricingError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        table.validate()?;
+        Ok(table)
+    }
+
+    /// Loads `agentlens/prices.json` below an injected data directory.
+    pub fn load_in_data_dir(data_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load(prices_path_in(data_dir))
+    }
+
+    /// Loads the standard `dirs::data_dir()/agentlens/prices.json` document.
+    pub fn load_default() -> Result<Self> {
+        Self::load(default_prices_path()?)
+    }
+
+    /// Loads the document, degrading to an empty table when it cannot be used.
+    ///
+    /// The returned error is meant to be surfaced to the user (and logged) while the application
+    /// keeps running with estimation disabled: a hand-edited typo must never crash the app.
+    pub fn load_or_empty(path: impl AsRef<Path>) -> (Self, Option<PricingError>) {
+        match Self::load(path) {
+            Ok(table) => (table, None),
+            Err(error) => (Self::new(), Some(error)),
+        }
+    }
+
+    /// Validates, then atomically writes the document to an explicit path.
+    ///
+    /// The document is serialized to a same-directory temporary file, flushed with `fsync`, and
+    /// then `rename`d over the target, so a concurrent reader always observes either the previous
+    /// or the next complete document and never a partial one. An invalid table is rejected before
+    /// anything is written, and a failure at any step removes the temporary file.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.validate()?;
+        let mut body = serde_json::to_string_pretty(self)
+            .map_err(|source| PricingError::Serialize { source })?;
+        body.push('\n');
+        let _write_guard = PRICES_IO_LOCK
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        write_atomically(path.as_ref(), body.as_bytes())
+    }
+
+    /// Atomically writes `agentlens/prices.json` below an injected data directory.
+    pub fn save_in_data_dir(&self, data_dir: impl AsRef<Path>) -> Result<()> {
+        self.save(prices_path_in(data_dir))
+    }
+
+    /// Atomically writes the standard `dirs::data_dir()/agentlens/prices.json` document.
+    pub fn save_default(&self) -> Result<()> {
+        self.save(default_prices_path()?)
+    }
+}
+
+/// Resolves the standard prices path without creating directories or touching the file.
+pub fn default_prices_path() -> Result<PathBuf> {
+    dirs::data_dir()
+        .map(prices_path_in)
+        .ok_or(PricingError::DataDirectoryUnavailable)
+}
+
+/// Builds an injectable prices path below an arbitrary data directory.
+pub fn prices_path_in(data_dir: impl AsRef<Path>) -> PathBuf {
+    data_dir.as_ref().join(PRICES_DIRECTORY).join(PRICES_FILE)
+}
+
+fn write_atomically(path: &Path, body: &[u8]) -> Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| PricingError::InvalidPricesPath(path.to_path_buf()))?;
+    fs::create_dir_all(directory).map_err(|source| PricingError::Directory {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+
+    let temp_path = directory.join(temp_file_name());
+    if let Err(source) = write_and_sync(&temp_path, body) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(PricingError::Write {
+            path: temp_path,
+            source,
+        });
+    }
+
+    if let Err(source) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(PricingError::Rename {
+            temp: temp_path,
+            target: path.to_path_buf(),
+            source,
+        });
+    }
+
+    // Best effort: flush the directory entry so the rename itself survives a power loss.
+    if let Ok(handle) = File::open(directory) {
+        let _ = handle.sync_all();
+    }
+
+    Ok(())
+}
+
+fn write_and_sync(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(body)?;
+    file.sync_all()
+}
+
+/// Builds a temporary file name unique across processes and across threads of one process.
+fn temp_file_name() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{TEMP_FILE_PREFIX}{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::archive::Origin;
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::tempdir;
+
+    /// Per-Mtok prices chosen so that every bucket contributes a DISTINCT amount; a swapped or
+    /// mis-wired bucket therefore cannot produce the expected total by accident.
+    const INPUT_PER_MTOK: f64 = 3.00;
+    const OUTPUT_PER_MTOK: f64 = 15.00;
+    const CACHE_READ_PER_MTOK: f64 = 0.30;
+    const CACHE_WRITE_PER_MTOK: f64 = 3.75;
+
+    const TOK_INPUT: u64 = 1_000_000;
+    const TOK_OUTPUT: u64 = 250_000;
+    const TOK_CACHE_READ: u64 = 4_000_000;
+    const TOK_CACHE_WRITE: u64 = 500_000;
+    const TOK_REASONING: u64 = 7_777_777;
+
+    fn priced_entry() -> PriceEntry {
+        PriceEntry::new(
+            "kiro-auth",
+            "claude-opus-5-max",
+            INPUT_PER_MTOK,
+            OUTPUT_PER_MTOK,
+            CACHE_READ_PER_MTOK,
+            CACHE_WRITE_PER_MTOK,
+        )
+    }
+
+    fn priced_table() -> PriceTable {
+        PriceTable::from_entries(vec![priced_entry()])
+    }
+
+    fn genuinely_unpriced_record() -> NormalizedUsageRecord {
+        let mut record = unavailable_record();
+        record.model_id = "private-unpriced-model-max".to_owned();
+        record
+    }
+
+    fn private_priced_table() -> PriceTable {
+        PriceTable::from_entries(vec![PriceEntry::new(
+            "kiro-auth",
+            "private-unpriced-model-max",
+            INPUT_PER_MTOK,
+            OUTPUT_PER_MTOK,
+            CACHE_READ_PER_MTOK,
+            CACHE_WRITE_PER_MTOK,
+        )])
+    }
+
+    #[test]
+    fn bundled_catalog_has_freshness_metadata_and_required_providers() {
+        let catalog = builtin_price_catalog();
+
+        assert_eq!(catalog.schema_version, 1);
+        assert!(!catalog.catalog_version.trim().is_empty());
+        assert!(!catalog.updated_at.trim().is_empty());
+        assert_eq!(catalog.currency, "USD");
+
+        let providers = catalog
+            .entries
+            .iter()
+            .map(|entry| entry.provider_id.as_str())
+            .collect::<BTreeSet<_>>();
+        for required in ["anthropic", "openai", "google", "amazon-bedrock"] {
+            assert!(providers.contains(required), "missing provider {required}");
+        }
+    }
+
+    #[test]
+    fn price_match_reports_literal_tuple_as_exact() {
+        let entries = vec![PriceEntry::new(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            3.0,
+            15.0,
+            0.3,
+            3.75,
+        )];
+
+        let matched = match_price(
+            &entries,
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+        )
+        .expect("literal tuple must match");
+
+        assert_eq!(matched.kind, PriceMatchKind::Exact);
+        assert_eq!(
+            matched.entry.model_id,
+            "anthropic.claude-sonnet-4-5-20250929-v1:0"
+        );
+    }
+
+    #[test]
+    fn price_match_normalizes_bedrock_prefix_region_suffix_and_case() {
+        let entries = vec![PriceEntry::new(
+            "amazon-bedrock",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            3.0,
+            15.0,
+            0.3,
+            3.75,
+        )];
+
+        for (provider, model) in [
+            ("aws", "claude-sonnet-4-5-20250929"),
+            ("BEDROCK", "US.ANTHROPIC.CLAUDE-SONNET-4-5-20250929-V1:0"),
+            (
+                "amazon_bedrock",
+                "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+            (
+                "amazon_bedrock",
+                "apac.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+            (
+                "amazon_bedrock",
+                "jp.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+            ("BEDROCK", "JP.ANTHROPIC.CLAUDE-SONNET-4-5-20250929-V1:0"),
+            (
+                "amazon_bedrock",
+                "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+            ("BEDROCK", "AU.ANTHROPIC.CLAUDE-SONNET-4-5-20250929-V1:0"),
+            (
+                "amazon_bedrock",
+                "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            ),
+        ] {
+            let matched = match_price(&entries, provider, model).expect("normalized Bedrock match");
+            assert_eq!(
+                matched.kind,
+                PriceMatchKind::Normalized,
+                "{provider}/{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_catalog_prices_geographic_bedrock_prefixes_at_the_in_region_rate() {
+        let entries = &builtin_price_catalog().entries;
+        let global = match_price(
+            entries,
+            "amazon-bedrock",
+            "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        )
+        .expect("global Bedrock entry must exist")
+        .entry
+        .clone();
+
+        for model in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "apac.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "jp.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "JP.ANTHROPIC.CLAUDE-SONNET-4-5-20250929-V1:0",
+            "au.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "AU.ANTHROPIC.CLAUDE-SONNET-4-5-20250929-V1:0",
+            "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        ] {
+            let matched = match_price(entries, "amazon-bedrock", model)
+                .unwrap_or_else(|| panic!("{model} must match a bundled price"));
+
+            assert_eq!(
+                matched.entry.model_id, "anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "{model} must resolve to the Geo entry, not the global one"
+            );
+            assert!(
+                (matched.entry.input_per_mtok - global.input_per_mtok * 1.1).abs() < 1e-9,
+                "{model} input price must be the 10%-higher Geo rate"
+            );
+            assert!(
+                (matched.entry.output_per_mtok - global.output_per_mtok * 1.1).abs() < 1e-9,
+                "{model} output price must be the 10%-higher Geo rate"
+            );
+        }
+    }
+
+    #[test]
+    fn price_match_selects_nearest_version_only_within_the_same_family() {
+        let entries = vec![
+            PriceEntry::new(
+                "anthropic",
+                "claude-sonnet-4-5-20250929",
+                3.0,
+                15.0,
+                0.3,
+                3.75,
+            ),
+            PriceEntry::new(
+                "anthropic",
+                "claude-sonnet-4-5-20251101",
+                4.0,
+                20.0,
+                0.4,
+                5.0,
+            ),
+            PriceEntry::new(
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                1.0,
+                5.0,
+                0.1,
+                1.25,
+            ),
+        ];
+
+        let matched = match_price(&entries, "anthropic", "claude-sonnet-4-5-20251001")
+            .expect("same-family dated model must match");
+
+        assert_eq!(matched.kind, PriceMatchKind::Family);
+        assert_eq!(matched.entry.model_id, "claude-sonnet-4-5-20250929");
+    }
+
+    #[test]
+    fn price_match_infers_claude_price_for_an_unknown_gateway() {
+        let matched = match_price(
+            &builtin_price_catalog().entries,
+            "kiro-auth",
+            "claude-opus-4-8-high",
+        )
+        .expect("unknown gateway Claude model must infer a catalog price");
+
+        assert_eq!(matched.kind, PriceMatchKind::CrossProvider);
+        assert_eq!(matched.entry.provider_id, "anthropic");
+        assert_eq!(matched.entry.model_id, "claude-opus-4-8");
+        assert_eq!(matched.entry.input_per_mtok, 5.0);
+        assert_eq!(matched.entry.output_per_mtok, 25.0);
+    }
+
+    #[test]
+    fn price_match_infers_openai_price_for_an_unknown_gateway() {
+        let matched = match_price(
+            &builtin_price_catalog().entries,
+            "kiro-auth",
+            "gpt-5.6-sol-xhigh",
+        )
+        .expect("unknown gateway OpenAI model must infer a catalog price");
+
+        assert_eq!(matched.kind, PriceMatchKind::CrossProvider);
+        assert_eq!(matched.entry.provider_id, "openai");
+        assert_eq!(matched.entry.model_id, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn price_match_strips_safe_cross_provider_variant_suffixes() {
+        for (provider, model, expected_provider, expected_model) in [
+            (
+                "kiro-auth",
+                "claude-opus-5-max",
+                "anthropic",
+                "claude-opus-5",
+            ),
+            ("kiro-auth", "gpt-5.6-sol-max", "openai", "gpt-5.6-sol"),
+            (
+                "kiro-auth",
+                "claude-opus-4-8-thinking",
+                "anthropic",
+                "claude-opus-4-8",
+            ),
+            ("openai", "gpt-5.4-mini-fast", "openai", "gpt-5.4-mini"),
+        ] {
+            let matched = match_price(&builtin_price_catalog().entries, provider, model)
+                .unwrap_or_else(|| panic!("{provider}/{model} must match a bundled price"));
+
+            assert_eq!(matched.kind, PriceMatchKind::CrossProvider, "{model}");
+            assert_eq!(matched.entry.provider_id, expected_provider, "{model}");
+            assert_eq!(matched.entry.model_id, expected_model, "{model}");
+        }
+    }
+
+    #[test]
+    fn bundled_catalog_estimates_kiro_claude_opus_max_variant() {
+        assert_eq!(
+            PriceTable::new().resolve_record(&unavailable_record()),
+            ResolvedCost::Estimated(16.375)
+        );
+    }
+
+    #[test]
+    fn price_match_preserves_differently_priced_mini_and_nano_models() {
+        for (model, expected_input, expected_output) in
+            [("gpt-5.4-mini", 0.75, 4.5), ("gpt-5.4-nano", 0.2, 1.25)]
+        {
+            let matched = match_price(&builtin_price_catalog().entries, "kiro-auth", model)
+                .unwrap_or_else(|| panic!("kiro-auth/{model} must match its own model tier"));
+
+            assert_eq!(matched.kind, PriceMatchKind::CrossProvider, "{model}");
+            assert_eq!(matched.entry.provider_id, "openai", "{model}");
+            assert_eq!(matched.entry.model_id, model, "{model}");
+            assert_eq!(matched.entry.input_per_mtok, expected_input, "{model}");
+            assert_eq!(matched.entry.output_per_mtok, expected_output, "{model}");
+        }
+    }
+
+    #[test]
+    fn price_match_keeps_known_bedrock_provider_isolated() {
+        let matched = match_price(
+            &builtin_price_catalog().entries,
+            "amazon-bedrock",
+            "anthropic.claude-opus-4-8",
+        )
+        .expect("Bedrock model must keep its catalog-specific price");
+
+        assert_eq!(matched.kind, PriceMatchKind::Exact);
+        assert_eq!(matched.entry.provider_id, "amazon-bedrock");
+        assert_eq!(matched.entry.input_per_mtok, 5.5);
+        assert_eq!(matched.entry.output_per_mtok, 27.5);
+    }
+
+    #[test]
+    fn price_match_does_not_invent_a_cross_provider_model_family() {
+        assert!(match_price(
+            &builtin_price_catalog().entries,
+            "kiro-auth",
+            "private-model-xhigh",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn price_match_cross_provider_choice_is_stable_and_order_independent() {
+        let direct = PriceEntry::new("anthropic", "claude-opus-4-8", 5.0, 25.0, 0.5, 6.25);
+        let bedrock = PriceEntry::new(
+            "amazon-bedrock",
+            "anthropic.claude-opus-4-8",
+            5.5,
+            27.5,
+            0.55,
+            6.875,
+        );
+
+        for entries in [
+            vec![direct.clone(), bedrock.clone()],
+            vec![bedrock.clone(), direct.clone()],
+        ] {
+            for _ in 0..3 {
+                let matched = match_price(&entries, "kiro-auth", "claude-opus-4-8-high")
+                    .expect("unknown gateway model must match deterministically");
+                assert_eq!(matched.kind, PriceMatchKind::CrossProvider);
+                assert_eq!(matched.entry.provider_id, "anthropic");
+                assert_eq!(matched.entry.input_per_mtok, 5.0);
+                assert_eq!(matched.entry.output_per_mtok, 25.0);
+            }
+        }
+    }
+
+    #[test]
+    fn price_match_refuses_unknown_provider_or_model_family() {
+        let entries = vec![
+            PriceEntry::new(
+                "anthropic",
+                "claude-sonnet-4-5-20250929",
+                3.0,
+                15.0,
+                0.3,
+                3.75,
+            ),
+            PriceEntry::new("openai", "gpt-5.6-sol", 1.25, 10.0, 0.125, 1.25),
+        ];
+
+        assert!(match_price(&entries, "openai", "claude-sonnet-4-5-20250929").is_none());
+        assert!(match_price(&entries, "anthropic", "claude-opus-4-5-20250929").is_none());
+        assert!(match_price(&entries, "anthropic", "private-model").is_none());
+    }
+
+    #[test]
+    fn manual_override_wins_before_bundled_catalog_fallback() {
+        let manual = PriceEntry::new(
+            "anthropic",
+            "claude-sonnet-4-5-20250929",
+            99.0,
+            199.0,
+            9.0,
+            19.0,
+        );
+        let table = PriceTable::from_entries(vec![manual]);
+
+        let matched = table
+            .lookup_match("anthropic", "claude-sonnet-4-5-20250929")
+            .expect("manual override must match");
+
+        assert_eq!(matched.kind, PriceMatchKind::Exact);
+        assert_eq!(matched.entry.input_per_mtok, 99.0);
+    }
+
+    #[test]
+    fn manual_override_never_crosses_provider_boundaries() {
+        let table = PriceTable::from_entries(vec![PriceEntry::new(
+            "kiro-auth",
+            "private-priced-model",
+            9.0,
+            90.0,
+            0.9,
+            9.0,
+        )]);
+
+        assert!(table
+            .lookup_match("myopenai", "private-priced-model")
+            .is_none());
+        assert_eq!(
+            table
+                .lookup_match("kiro-auth", "private-priced-model")
+                .expect("the exact manual provider/model pair must remain authoritative")
+                .entry
+                .input_per_mtok,
+            9.0
+        );
+    }
+
+    #[test]
+    fn manual_override_requires_a_literal_provider_and_model_tuple() {
+        let table = PriceTable::from_entries(vec![PriceEntry::new(
+            "private-gateway",
+            "private-model-20250101",
+            9.0,
+            90.0,
+            0.9,
+            9.0,
+        )]);
+
+        assert!(table
+            .lookup_match("PRIVATE-GATEWAY", "private-model-20250101")
+            .is_none());
+        assert!(table
+            .lookup_match("private-gateway", "private-model-20250102")
+            .is_none());
+        assert_eq!(
+            table
+                .lookup_match("private-gateway", "private-model-20250101")
+                .expect("the literal override tuple must remain authoritative")
+                .entry
+                .input_per_mtok,
+            9.0
+        );
+    }
+
+    #[test]
+    fn empty_override_table_falls_back_to_bundled_catalog_with_match_kind() {
+        let table = PriceTable::new();
+        let matched = table
+            .lookup_match("aws", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            .expect("bundled Bedrock price must be available without overrides");
+
+        assert_eq!(matched.kind, PriceMatchKind::Normalized);
+        assert_eq!(matched.entry.provider_id, "amazon-bedrock");
+    }
+
+    /// Unavailable-cost record on the priced model, carrying all four billable buckets plus a large
+    /// reasoning count that must never reach the estimate.
+    fn unavailable_record() -> NormalizedUsageRecord {
+        NormalizedUsageRecord {
+            host_id: "host-local".to_string(),
+            source: "opencode".to_string(),
+            granularity: crate::archive::UsageGranularity::Message,
+            message_id: "msg_pricing_1".to_string(),
+            session_id: "ses_pricing".to_string(),
+            time_created_utc: 1_785_468_844_419,
+            time_completed_utc: Some(1_785_468_845_000),
+            source_time_updated: 1_785_468_845_000,
+            origin: Origin::Live,
+            origin_priority: Origin::Live.priority(),
+            agent_raw: "Sisyphus".to_string(),
+            agent_key: "sisyphus".to_string(),
+            provider_id: "kiro-auth".to_string(),
+            model_id: "claude-opus-5-max".to_string(),
+            variant: Some("xhigh".to_string()),
+            tok_input: TOK_INPUT,
+            tok_output: TOK_OUTPUT,
+            tok_reasoning: TOK_REASONING,
+            tok_cache_read: TOK_CACHE_READ,
+            tok_cache_write: TOK_CACHE_WRITE,
+            cost: None,
+            cost_source: CostSource::Unavailable,
+            is_incomplete: false,
+            project_dir: "/config/workspace/ProdDir/AI/AgentLens".to_string(),
+        }
+    }
+
+    fn write_raw(path: &Path, body: &str) {
+        fs::create_dir_all(path.parent().expect("prices path has a parent"))
+            .expect("create prices directory");
+        fs::write(path, body).expect("write raw prices document");
+    }
+
+    fn temp_file_names(directory: &Path) -> BTreeSet<String> {
+        fs::read_dir(directory)
+            .expect("read prices directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name.starts_with(TEMP_FILE_PREFIX))
+            .collect()
+    }
+
+    #[test]
+    fn pricing_estimates_unavailable_hit_with_literal_arithmetic() {
+        let table = priced_table();
+        let resolved = table.resolve_record(&unavailable_record());
+
+        // Hand-computed arithmetic, written out bucket by bucket: tokens / 1_000_000 * per-Mtok.
+        let expected_input = 1_000_000.0 / 1_000_000.0 * 3.00; // 3.000
+        let expected_output = 250_000.0 / 1_000_000.0 * 15.00; // 3.750
+        let expected_cache_read = 4_000_000.0 / 1_000_000.0 * 0.30; // 1.200
+        let expected_cache_write = 500_000.0 / 1_000_000.0 * 3.75; // 1.875
+        let expected =
+            expected_input + expected_output + expected_cache_read + expected_cache_write;
+
+        assert_eq!(resolved, ResolvedCost::Estimated(expected));
+        assert_eq!(resolved.source(), CostSource::Estimated);
+        // Literal cross-check: 3.000 + 3.750 + 1.200 + 1.875 = 9.825.
+        assert_eq!(expected, 9.825);
+        assert_eq!(resolved.estimated(), Some(9.825));
+        assert_eq!(resolved.actual(), None);
+
+        // Guard against charging the input price on the derived total_input
+        // (input + cache_read + cache_write = 5_500_000), which would triple-charge cached tokens:
+        // 5.5 * 3.00 + 3.75 = 20.25.
+        assert_ne!(resolved.estimated(), Some(20.25));
+    }
+
+    #[test]
+    fn pricing_estimate_maps_each_token_bucket_to_its_own_price() {
+        let entry = priced_entry();
+
+        let only_input = TokenCounts {
+            input: TOK_INPUT,
+            ..TokenCounts::default()
+        };
+        let only_output = TokenCounts {
+            output: TOK_OUTPUT,
+            ..TokenCounts::default()
+        };
+        let only_cache_read = TokenCounts {
+            cache_read: TOK_CACHE_READ,
+            ..TokenCounts::default()
+        };
+        let only_cache_write = TokenCounts {
+            cache_write: TOK_CACHE_WRITE,
+            ..TokenCounts::default()
+        };
+
+        assert_eq!(entry.estimate(only_input), 3.000);
+        assert_eq!(entry.estimate(only_output), 3.750);
+        assert_eq!(entry.estimate(only_cache_read), 1.200);
+        assert_eq!(entry.estimate(only_cache_write), 1.875);
+        assert_eq!(entry.estimate(TokenCounts::default()), 0.0);
+    }
+
+    #[test]
+    fn pricing_estimate_excludes_reasoning_tokens() {
+        let table = priced_table();
+        let mut without_reasoning = unavailable_record();
+        without_reasoning.tok_reasoning = 0;
+        let mut with_reasoning = unavailable_record();
+        with_reasoning.tok_reasoning = u64::from(u32::MAX);
+
+        assert_eq!(
+            table.resolve_record(&without_reasoning),
+            table.resolve_record(&with_reasoning)
+        );
+        assert_eq!(
+            table.resolve_record(&with_reasoning),
+            ResolvedCost::Estimated(9.825)
+        );
+    }
+
+    #[test]
+    fn pricing_miss_keeps_row_unavailable() {
+        let table = priced_table();
+
+        let mut other_provider = genuinely_unpriced_record();
+        other_provider.provider_id = "myopenai".to_string();
+        let mut other_model = genuinely_unpriced_record();
+        other_model.model_id = "gpt-nonexistent".to_string();
+
+        for record in [&other_provider, &other_model] {
+            let resolved = table.resolve_record(record);
+            assert_eq!(resolved, ResolvedCost::Unavailable);
+            assert_eq!(resolved.source(), CostSource::Unavailable);
+            // No silent zero and no fabricated estimate.
+            assert_eq!(resolved.actual(), None);
+            assert_eq!(resolved.estimated(), None);
+        }
+
+        assert!(PriceTable::new()
+            .lookup("kiro-auth", "private-unpriced-model-max")
+            .is_none());
+    }
+
+    #[test]
+    fn pricing_totals_keep_actual_and_estimated_separate() {
+        let table = priced_table();
+
+        let mut actual_row = unavailable_record();
+        actual_row.cost = Some(0.05);
+        actual_row.cost_source = CostSource::Actual;
+        let estimated_row = unavailable_record();
+        let mut missing_row = unavailable_record();
+        missing_row.model_id = "unpriced-model".to_string();
+
+        let mut totals = CostTotals::default();
+        for record in [&actual_row, &estimated_row, &missing_row] {
+            totals.add(table.resolve_record(record));
+        }
+
+        assert_eq!(totals.actual_sum, 0.05);
+        assert_eq!(totals.estimated_sum, 9.825);
+        assert_eq!(totals.unavailable_count, 1);
+        // The two sums are reported side by side and never folded together.
+        assert_ne!(totals.actual_sum, totals.actual_sum + totals.estimated_sum);
+    }
+
+    #[test]
+    fn pricing_totals_reproduce_fixture_mixed_cost_day() {
+        // fixture (todo 2) mixed-cost day: one actual 0.0102 row and one unavailable row that the
+        // price table does not cover; todo 8 asserts exactly this shape.
+        let table = PriceTable::new();
+
+        let mut actual_row = genuinely_unpriced_record();
+        actual_row.cost = Some(0.0102);
+        actual_row.cost_source = CostSource::Actual;
+        let unavailable_row = genuinely_unpriced_record();
+
+        let mut totals = CostTotals::default();
+        totals.add(table.resolve_record(&actual_row));
+        totals.add(table.resolve_record(&unavailable_row));
+
+        assert_eq!(totals.actual_sum, 0.0102);
+        assert_eq!(totals.unavailable_count, 1);
+        assert_eq!(totals.estimated_sum, 0.0);
+    }
+
+    #[test]
+    fn pricing_lookup_ignores_variant() {
+        let table = priced_table();
+        let mut xhigh = unavailable_record();
+        xhigh.variant = Some("xhigh".to_string());
+        let mut low = unavailable_record();
+        low.variant = Some("low".to_string());
+        let mut none = unavailable_record();
+        none.variant = None;
+
+        for record in [&xhigh, &low, &none] {
+            assert_eq!(
+                table.resolve_record(record),
+                ResolvedCost::Estimated(9.825),
+                "variant must not participate in the lookup key"
+            );
+        }
+    }
+
+    #[test]
+    fn pricing_atomic_write_is_never_observed_half_written() {
+        let dir = tempdir().expect("tempdir");
+        let path = Arc::new(prices_path_in(dir.path()));
+
+        let document_a = PriceTable::from_entries(vec![PriceEntry::new(
+            "kiro-auth",
+            "model-a",
+            1.0,
+            2.0,
+            0.5,
+            0.25,
+        )]);
+        let document_b = PriceTable::from_entries(vec![
+            PriceEntry::new("kiro-auth", "model-b", 9.0, 90.0, 0.9, 0.09),
+            PriceEntry::new("myopenai", "model-b2", 8.0, 80.0, 0.8, 0.08),
+        ]);
+        document_a.save(path.as_ref()).expect("seed document A");
+
+        let known = Arc::new(vec![document_a.clone(), document_b.clone()]);
+        let mut handles = Vec::new();
+
+        for writer in 0..4 {
+            let path = Arc::clone(&path);
+            let document = if writer % 2 == 0 {
+                document_a.clone()
+            } else {
+                document_b.clone()
+            };
+            handles.push(thread::spawn(move || {
+                for _ in 0..150 {
+                    document.save(path.as_ref()).expect("atomic save");
+                }
+            }));
+        }
+        for _ in 0..4 {
+            let path = Arc::clone(&path);
+            let known = Arc::clone(&known);
+            handles.push(thread::spawn(move || {
+                for _ in 0..400 {
+                    let observed = PriceTable::load(path.as_ref())
+                        .expect("a reader must never observe a half-written document");
+                    assert!(
+                        known.contains(&observed),
+                        "reader observed a document that was never written: {observed:?}"
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+
+        let directory = path.parent().expect("prices parent directory");
+        assert!(
+            temp_file_names(directory).is_empty(),
+            "atomic writes must not leave temp files behind"
+        );
+        assert_eq!(
+            fs::read_dir(directory).expect("read dir").count(),
+            1,
+            "only prices.json may remain in the directory"
+        );
+        assert!(known.contains(&PriceTable::load(path.as_ref()).expect("final load")));
+    }
+
+    #[test]
+    fn pricing_load_retries_transient_reader_errors_until_success() {
+        let path = Path::new("injected-prices.json");
+        let expected = priced_table();
+        let bytes = serde_json::to_vec(&expected).expect("serialize injected document");
+        let mut attempts = 0;
+
+        let loaded = PriceTable::load_with_reader(
+            path,
+            |_| {
+                attempts += 1;
+                if attempts <= 3 {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!("transient attempt {attempts}"),
+                    ))
+                } else {
+                    Ok(bytes.clone())
+                }
+            },
+            |_| {},
+        )
+        .expect("transient reader failures must recover");
+
+        assert_eq!(loaded, expected);
+        assert_eq!(attempts, 4);
+    }
+
+    #[test]
+    fn pricing_load_bounds_permanently_transient_reader_errors() {
+        let path = Path::new("injected-prices.json");
+        let mut attempts = 0;
+
+        let error = PriceTable::load_with_reader(
+            path,
+            |_| {
+                attempts += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("transient attempt {attempts}"),
+                ))
+            },
+            |_| {},
+        )
+        .expect_err("a permanently denied reader must remain a typed error");
+
+        assert_eq!(
+            attempts, READ_MAX_ATTEMPTS,
+            "transient retries must have a hard bound"
+        );
+        match error {
+            PricingError::Read {
+                path: error_path,
+                source,
+            } => {
+                assert_eq!(error_path, path);
+                assert_eq!(
+                    source.to_string(),
+                    format!("transient attempt {READ_MAX_ATTEMPTS}")
+                );
+            }
+            other => panic!("unexpected error {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pricing_load_does_not_retry_not_found() {
+        let path = Path::new("injected-prices.json");
+        let mut attempts = 0;
+
+        let loaded = PriceTable::load_with_reader(
+            path,
+            |_| {
+                attempts += 1;
+                Err(io::Error::new(io::ErrorKind::NotFound, "missing"))
+            },
+            |_| {},
+        )
+        .expect("a missing price file means no overrides");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(loaded, PriceTable::new());
+    }
+
+    #[test]
+    fn pricing_load_does_not_retry_non_transient_reader_errors() {
+        let path = Path::new("injected-prices.json");
+        let mut attempts = 0;
+
+        let error = PriceTable::load_with_reader(
+            path,
+            |_| {
+                attempts += 1;
+                Err(io::Error::new(io::ErrorKind::InvalidData, "hard failure"))
+            },
+            |_| {},
+        )
+        .expect_err("non-transient reader errors must fail immediately");
+
+        assert_eq!(attempts, 1);
+        assert!(matches!(error, PricingError::Read { .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pricing_windows_sharing_violation_is_transient() {
+        let source = io::Error::from_raw_os_error(32);
+        assert!(is_transient_read_error(&source));
+    }
+
+    #[test]
+    fn pricing_load_rejects_malformed_documents_with_readable_errors() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+
+        let cases = [
+            (
+                "truncated",
+                r#"{"schema_version": 1, "entries": [{"provider_id": "kiro-auth""#,
+                "EOF while parsing",
+            ),
+            (
+                "wrong type",
+                r#"{"schema_version": "one", "entries": []}"#,
+                "invalid type",
+            ),
+            (
+                "price as string",
+                r#"{"schema_version": 1, "entries": [{"provider_id":"a","model_id":"b","input_per_mtok":"3","output_per_mtok":1,"cache_read_per_mtok":1,"cache_write_per_mtok":1}]}"#,
+                "invalid type",
+            ),
+            (
+                "trailing garbage",
+                r#"{"schema_version": 1, "entries": []} }}}"#,
+                "trailing characters",
+            ),
+            (
+                "missing schema_version",
+                r#"{"entries": []}"#,
+                "missing field `schema_version`",
+            ),
+            (
+                "missing price field",
+                r#"{"schema_version": 1, "entries": [{"provider_id":"a","model_id":"b","input_per_mtok":3,"output_per_mtok":1,"cache_read_per_mtok":1}]}"#,
+                "missing field `cache_write_per_mtok`",
+            ),
+        ];
+
+        for (label, body, expected_fragment) in cases {
+            write_raw(&path, body);
+            let error = PriceTable::load(&path).expect_err(label);
+            assert!(
+                matches!(error, PricingError::Parse { .. }),
+                "{label}: unexpected error {error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("prices.json"),
+                "{label}: error must name the file: {message}"
+            );
+            assert!(
+                message.contains(expected_fragment),
+                "{label}: error must explain the problem ({expected_fragment}): {message}"
+            );
+            assert!(
+                message.contains("delete it to run without price overrides"),
+                "{label}: error must tell the user how to recover: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn pricing_load_or_empty_disables_estimation_on_malformed_document() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+        write_raw(&path, "{ this is not json");
+
+        let (table, error) = PriceTable::load_or_empty(&path);
+        let error = error.expect("malformed document must be reported");
+        assert!(matches!(error, PricingError::Parse { .. }));
+        assert!(table.entries.is_empty());
+        assert_eq!(table.schema_version, PRICES_SCHEMA_VERSION);
+        // System keeps running with estimation disabled instead of crashing.
+        assert_eq!(
+            table.resolve_record(&genuinely_unpriced_record()),
+            ResolvedCost::Unavailable
+        );
+    }
+
+    #[test]
+    fn pricing_load_rejects_negative_and_non_finite_prices() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+        write_raw(
+            &path,
+            r#"{"schema_version": 1, "entries": [{"provider_id":"kiro-auth","model_id":"m","input_per_mtok":-1.0,"output_per_mtok":1,"cache_read_per_mtok":1,"cache_write_per_mtok":1}]}"#,
+        );
+        let error = PriceTable::load(&path).expect_err("negative price must be rejected");
+        assert!(
+            matches!(
+                &error,
+                PricingError::InvalidPrice { field, value, .. }
+                    if *field == "input_per_mtok" && *value == -1.0
+            ),
+            "unexpected error {error:?}"
+        );
+        assert!(error.to_string().contains("negative"));
+
+        // Non-finite prices can never reach the estimator either.
+        let infinite = PriceTable::from_entries(vec![PriceEntry::new(
+            "kiro-auth",
+            "m",
+            f64::INFINITY,
+            1.0,
+            1.0,
+            1.0,
+        )]);
+        assert!(matches!(
+            infinite.validate(),
+            Err(PricingError::InvalidPrice { .. })
+        ));
+        // save() validates first, so an invalid table is never persisted.
+        let unsaved = prices_path_in(dir.path().join("nested"));
+        assert!(infinite.save(&unsaved).is_err());
+        assert!(!unsaved.exists());
+    }
+
+    #[test]
+    fn pricing_load_accepts_large_finite_prices() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+        write_raw(
+            &path,
+            r#"{"schema_version": 1, "entries": [{"provider_id":"kiro-auth","model_id":"m","input_per_mtok":1e308,"output_per_mtok":0,"cache_read_per_mtok":0,"cache_write_per_mtok":0}]}"#,
+        );
+        let table = PriceTable::load(&path).expect("large finite prices are the user's choice");
+        let estimate = table
+            .lookup("kiro-auth", "m")
+            .expect("entry")
+            .estimate(TokenCounts {
+                input: 1,
+                ..TokenCounts::default()
+            });
+        assert!(estimate.is_finite());
+        assert_eq!(estimate, 1.0 / 1_000_000.0 * 1e308);
+    }
+
+    #[test]
+    fn pricing_load_rejects_duplicate_and_blank_entries() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+
+        let duplicate = PriceTable::from_entries(vec![priced_entry(), priced_entry()]);
+        assert!(matches!(
+            duplicate.validate(),
+            Err(PricingError::DuplicateEntry { .. })
+        ));
+
+        write_raw(
+            &path,
+            r#"{"schema_version": 1, "entries": [{"provider_id":"  ","model_id":"m","input_per_mtok":1,"output_per_mtok":1,"cache_read_per_mtok":1,"cache_write_per_mtok":1}]}"#,
+        );
+        let error = PriceTable::load(&path).expect_err("blank provider must be rejected");
+        assert!(
+            matches!(&error, PricingError::BlankIdentifier { field, .. } if *field == "provider_id"),
+            "unexpected error {error:?}"
+        );
+    }
+
+    #[test]
+    fn pricing_load_rejects_unsupported_schema_version() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+
+        for version in [0u32, PRICES_SCHEMA_VERSION + 1] {
+            write_raw(
+                &path,
+                &format!(r#"{{"schema_version": {version}, "entries": []}}"#),
+            );
+            let error = PriceTable::load(&path).expect_err("unsupported schema version");
+            assert!(
+                matches!(
+                    error,
+                    PricingError::UnsupportedSchema { found, supported }
+                        if found == version && supported == PRICES_SCHEMA_VERSION
+                ),
+                "version {version} produced {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pricing_document_round_trip_preserves_unknown_fields() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+        write_raw(
+            &path,
+            r#"{
+  "schema_version": 1,
+  "generated_by": "models.dev",
+  "generated_at_utc": 1785468844419,
+  "entries": [
+    {
+      "provider_id": "kiro-auth",
+      "model_id": "claude-opus-5-max",
+      "input_per_mtok": 3.0,
+      "output_per_mtok": 15.0,
+      "cache_read_per_mtok": 0.3,
+      "cache_write_per_mtok": 3.75,
+      "source_url": "https://models.dev/example"
+    }
+  ]
+}
+"#,
+        );
+
+        let table = PriceTable::load(&path).expect("unknown fields must be tolerated");
+        assert_eq!(
+            table
+                .extra
+                .get("generated_by")
+                .and_then(|value| value.as_str()),
+            Some("models.dev")
+        );
+        assert_eq!(
+            table.entries[0]
+                .extra
+                .get("source_url")
+                .and_then(|value| value.as_str()),
+            Some("https://models.dev/example")
+        );
+        assert_eq!(
+            table.resolve_record(&unavailable_record()),
+            ResolvedCost::Estimated(9.825)
+        );
+
+        table.save(&path).expect("re-save");
+        let reloaded = PriceTable::load(&path).expect("reload");
+        assert_eq!(
+            reloaded, table,
+            "a save/load round trip must not drop fields"
+        );
+    }
+
+    #[test]
+    fn pricing_load_missing_file_yields_empty_table() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+        assert!(!path.exists());
+
+        let table = PriceTable::load(&path).expect("a missing file simply means no overrides");
+        assert_eq!(table.schema_version, PRICES_SCHEMA_VERSION);
+        assert!(table.entries.is_empty());
+        assert_eq!(
+            table.resolve_record(&genuinely_unpriced_record()),
+            ResolvedCost::Unavailable
+        );
+
+        let (fallback, error) = PriceTable::load_or_empty(&path);
+        assert!(error.is_none());
+        assert_eq!(fallback, table);
+    }
+
+    #[test]
+    fn pricing_overwrite_is_visible_and_removed_entry_stops_estimating() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+
+        private_priced_table().save(&path).expect("first save");
+        assert_eq!(
+            PriceTable::load(&path)
+                .expect("load after first save")
+                .resolve_record(&genuinely_unpriced_record()),
+            ResolvedCost::Estimated(9.825)
+        );
+
+        let doubled = PriceTable::from_entries(vec![PriceEntry::new(
+            "kiro-auth",
+            "private-unpriced-model-max",
+            INPUT_PER_MTOK * 2.0,
+            OUTPUT_PER_MTOK * 2.0,
+            CACHE_READ_PER_MTOK * 2.0,
+            CACHE_WRITE_PER_MTOK * 2.0,
+        )]);
+        doubled.save(&path).expect("overwrite");
+        assert_eq!(
+            PriceTable::load(&path)
+                .expect("load after overwrite")
+                .resolve_record(&genuinely_unpriced_record()),
+            ResolvedCost::Estimated(9.825 * 2.0)
+        );
+
+        PriceTable::new().save(&path).expect("remove the entry");
+        assert_eq!(
+            PriceTable::load(&path)
+                .expect("load after removal")
+                .resolve_record(&genuinely_unpriced_record()),
+            ResolvedCost::Unavailable
+        );
+    }
+
+    #[test]
+    fn pricing_save_cleans_up_temp_file_when_rename_fails() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+        // A directory sitting at the target path makes the final rename fail deterministically.
+        fs::create_dir_all(&path).expect("create blocking directory");
+
+        let error = priced_table()
+            .save(&path)
+            .expect_err("rename onto a directory must fail");
+        assert!(
+            matches!(error, PricingError::Rename { .. }),
+            "unexpected error {error:?}"
+        );
+        assert!(path.is_dir(), "the pre-existing entry must survive");
+
+        let directory = path.parent().expect("prices parent directory");
+        assert!(
+            temp_file_names(directory).is_empty(),
+            "a failed save must not leave an orphan temp file"
+        );
+    }
+
+    #[test]
+    fn pricing_orphan_temp_file_never_poisons_a_load() {
+        let dir = tempdir().expect("tempdir");
+        let path = prices_path_in(dir.path());
+        priced_table().save(&path).expect("save the real document");
+
+        // Exactly the on-disk state left by a process killed between temp-write and rename.
+        let orphan = path
+            .parent()
+            .expect("prices parent directory")
+            .join(format!("{TEMP_FILE_PREFIX}999999-0"));
+        fs::write(&orphan, "{ truncated garbage").expect("write orphan temp");
+
+        let table = PriceTable::load(&path).expect("the real document is still intact");
+        assert_eq!(table, priced_table());
+        assert_eq!(
+            table.resolve_record(&unavailable_record()),
+            ResolvedCost::Estimated(9.825)
+        );
+
+        // A later successful save still works and does not touch the foreign temp file.
+        PriceTable::new().save(&path).expect("later save");
+        assert!(orphan.exists());
+        assert!(PriceTable::load(&path).expect("load").entries.is_empty());
+    }
+
+    #[test]
+    fn pricing_path_helpers_target_data_dir_subdirectory() {
+        let dir = tempdir().expect("tempdir");
+        assert_eq!(
+            prices_path_in(dir.path()),
+            dir.path().join("agentlens").join("prices.json")
+        );
+        let default_path = default_prices_path().expect("this platform exposes a data directory");
+        assert!(default_path.ends_with(Path::new("agentlens").join("prices.json")));
+    }
+
+    #[test]
+    fn pricing_resolve_passes_actual_cost_through_untouched() {
+        let table = priced_table();
+        let mut record = unavailable_record();
+        record.cost = Some(0.0102);
+        record.cost_source = CostSource::Actual;
+
+        // The model IS priced; an actual cost must still win and must not be re-estimated.
+        let resolved = table.resolve_record(&record);
+        assert_eq!(resolved, ResolvedCost::Actual(0.0102));
+        assert_eq!(resolved.actual(), Some(0.0102));
+        assert_eq!(resolved.estimated(), None);
+
+        record.cost_source = CostSource::Estimated;
+        assert_eq!(
+            table.resolve_record(&record),
+            ResolvedCost::Estimated(0.0102)
+        );
+    }
+
+    #[test]
+    fn pricing_resolve_treats_missing_actual_value_as_unavailable() {
+        let empty = PriceTable::new();
+        let table = private_priced_table();
+
+        let mut declared_actual_without_value = genuinely_unpriced_record();
+        declared_actual_without_value.cost = None;
+        declared_actual_without_value.cost_source = CostSource::Actual;
+        let mut non_finite_value = genuinely_unpriced_record();
+        non_finite_value.cost = Some(f64::NAN);
+        non_finite_value.cost_source = CostSource::Actual;
+        let mut unavailable_with_stray_value = genuinely_unpriced_record();
+        unavailable_with_stray_value.cost = Some(0.5);
+
+        for record in [
+            &declared_actual_without_value,
+            &non_finite_value,
+            &unavailable_with_stray_value,
+        ] {
+            assert_eq!(
+                empty.resolve_record(record),
+                ResolvedCost::Unavailable,
+                "no trustworthy value and no price entry means unavailable"
+            );
+            assert_eq!(
+                table.resolve_record(record),
+                ResolvedCost::Estimated(9.825),
+                "no trustworthy value plus a price entry means estimated"
+            );
+        }
+    }
+
+    #[test]
+    fn pricing_data_dir_wrappers_round_trip_and_direct_estimate_preserves_partial_semantics() {
+        let dir = tempdir().expect("tempdir");
+        let table = priced_table();
+
+        table
+            .save_in_data_dir(dir.path())
+            .expect("save through data-directory wrapper");
+        let loaded =
+            PriceTable::load_in_data_dir(dir.path()).expect("load through data-directory wrapper");
+        assert_eq!(loaded, table);
+        assert_eq!(
+            loaded.estimate(
+                "kiro-auth",
+                "claude-opus-5-max",
+                TokenCounts {
+                    input: TOK_INPUT,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                }
+            ),
+            Some(3.0)
+        );
+        assert_eq!(
+            loaded.estimate(
+                "kiro-auth",
+                "missing-model",
+                TokenCounts {
+                    input: TOK_INPUT,
+                    ..TokenCounts::default()
+                }
+            ),
+            None,
+            "a missing price must remain unavailable rather than silently filling zero"
+        );
+    }
+
+    #[test]
+    fn pricing_validation_identifies_each_blank_key_and_invalid_price_bucket() {
+        let mut blank_model = priced_entry();
+        blank_model.model_id = " \t ".to_string();
+        assert!(matches!(
+            PriceTable::from_entries(vec![blank_model]).validate(),
+            Err(PricingError::BlankIdentifier {
+                index: 0,
+                field: "model_id"
+            })
+        ));
+
+        for (field, value) in [
+            ("input_per_mtok", -1.0),
+            ("output_per_mtok", f64::INFINITY),
+            ("cache_read_per_mtok", f64::NEG_INFINITY),
+            ("cache_write_per_mtok", f64::NAN),
+        ] {
+            let mut entry = priced_entry();
+            match field {
+                "input_per_mtok" => entry.input_per_mtok = value,
+                "output_per_mtok" => entry.output_per_mtok = value,
+                "cache_read_per_mtok" => entry.cache_read_per_mtok = value,
+                "cache_write_per_mtok" => entry.cache_write_per_mtok = value,
+                _ => unreachable!(),
+            }
+            let error = PriceTable::from_entries(vec![entry])
+                .validate()
+                .expect_err("invalid bucket price must fail validation");
+            assert!(
+                matches!(error, PricingError::InvalidPrice { field: actual, .. } if actual == field),
+                "unexpected validation error for {field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn pricing_save_reports_invalid_paths_and_directory_creation_failures() {
+        let error = priced_table()
+            .save(Path::new("prices.json"))
+            .expect_err("a parentless relative path must fail");
+        assert!(matches!(
+            error,
+            PricingError::InvalidPricesPath(path) if path == Path::new("prices.json")
+        ));
+
+        let dir = tempdir().expect("tempdir");
+        let blocking_file = dir.path().join("not-a-directory");
+        fs::write(&blocking_file, b"occupied").expect("write blocking file");
+        let target = blocking_file.join("prices.json");
+        let error = priced_table()
+            .save(&target)
+            .expect_err("a file cannot be prepared as the prices directory");
+        assert!(matches!(
+            error,
+            PricingError::Directory { path, .. } if path == blocking_file
+        ));
+        assert_eq!(
+            fs::read(&blocking_file).expect("read preserved blocker"),
+            b"occupied"
+        );
+    }
+
+    #[test]
+    fn pricing_transient_read_retry_honors_wall_clock_limit() {
+        let path = Path::new("injected-prices.json");
+        let mut attempts = 0;
+        let mut waits = 0;
+        let error = PriceTable::load_with_reader(
+            path,
+            |_| {
+                attempts += 1;
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "persistent transient failure",
+                ))
+            },
+            |_| {
+                waits += 1;
+                thread::sleep(READ_RETRY_LIMIT + Duration::from_millis(1));
+            },
+        )
+        .expect_err("elapsed retry budget must return the latest typed read error");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(waits, 1);
+        assert!(matches!(
+            error,
+            PricingError::Read { path: error_path, source }
+                if error_path == path && source.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    #[ignore = "manual QA: set AGENTLENS_QA_PRICES_DIR, run in background, then SIGKILL mid-write"]
+    fn pricing_manual_qa_write_loop() {
+        let Some(data_dir) = std::env::var_os("AGENTLENS_QA_PRICES_DIR") else {
+            eprintln!("AGENTLENS_QA_PRICES_DIR is unset; nothing to do");
+            return;
+        };
+        let path = prices_path_in(PathBuf::from(data_dir));
+        let mut price = 1.0f64;
+        while price <= 200_000.0 {
+            let table = PriceTable::from_entries(vec![PriceEntry::new(
+                "kiro-auth",
+                "qa-loop",
+                price,
+                15.0,
+                0.3,
+                3.75,
+            )]);
+            table.save(&path).expect("atomic save must succeed");
+            if price % 500.0 == 0.0 {
+                eprintln!("qa write loop wrote input_per_mtok={price}");
+            }
+            price += 1.0;
+        }
+    }
+}

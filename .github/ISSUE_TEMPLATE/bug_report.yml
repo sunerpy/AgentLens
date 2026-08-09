@@ -1,0 +1,67 @@
+name: Bug report
+description: 报告一个可复现的缺陷
+title: '[Bug] '
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请不要在本 issue 中粘贴任何主机地址、用户名、SSH 目标、机器标识哈希、归档库绝对路径
+        或凭据。日志片段请自行确认内容后再贴，应用不会自动提交日志。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 期望的行为与实际的行为
+      placeholder: 点击刷新后进度条停在 0%，界面无任何提示。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: 应用版本
+      description: 「日志与反馈」页会自动填入此项
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: 平台信息
+      description: 「日志与反馈」页会自动填入此项，格式为「系统 架构 · WebView 版本」
+      placeholder: linux x86_64 · WebView 2.48.1
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段（可选）
+      description: |
+        「日志与反馈」页可以打开日志目录并复制列表。粘贴前请自行删除主机名、SSH 目标与
+        绝对路径 —— 公共 issue 一旦发布，删除也不能撤回已经公开的内容。
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认本 issue 不含主机地址、用户名、机器标识哈希、归档路径或任何凭据
+          required: true

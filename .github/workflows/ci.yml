@@ -1,0 +1,539 @@
+name: ci
+
+# ===========================================================================
+# AgentLens 三平台 CI —— 逐步翻译自 .aws/buildspec/{linux,windows,macos}.yml
+# ---------------------------------------------------------------------------
+# 本文件不设计任何新步骤：每一步都对应一条已经在 AWS CodeBuild（us-west-2）真机
+# 上跑绿的命令。绿灯凭据（见 .omo/evidence/aws-aw5-test-matrix.md）：
+#   Linux   agentlens-linux:23bd9b56    六道门禁 / 164 passed 18 ignored / 覆盖率过 75% 门槛
+#                                       / 真实 ARM aarch64 collector / lcov.info 落 S3
+#   macOS   agentlens-macos:56b852cf    真实 AgentLens_0.1.0_aarch64.dmg 5,640,261 B
+#                                       / 165 passed 10 ignored
+#   Windows agentlens-windows:968344c1  buildspecOverride: null / clippy 门禁 gate ok
+#                                       / tauri lib 29 条恢复执行（此前 0）/ 3218 行日志
+#                                       中 0xc0000139 零命中
+#
+# 未在 GitHub 上执行过：本仓库尚无 git remote（`git remote -v` 为空），无法触发
+# 任何 workflow run。本文件只经过静态验证（actionlint + YAML 解析 + 目标存在性
+# 核对 + 与 buildspec 的逐步对照）。首次真实执行发生在用户创建远端之后。
+#
+# ---------------------------------------------------------------------------
+# 与 buildspec 的差异（全部为「宿主镜像差异」或「刻意增强」，无一处削弱门禁）
+#
+#   刻意不移植（CodeBuild 镜像专属绕行，GitHub runner 不存在该问题）：
+#     - 清理陈旧 cargo registry / 手装 rustup             GitHub 预置可用 rustup
+#     - 删 chocolatey rust shim、过滤 PATH                GitHub 的 rust 非 choco shim
+#     - 装 VS2022 BuildTools + vctools、导入 vcvars64     windows runner 自带 MSVC
+#     - 手装 Node / zig 压缩包                            改用 setup-node / setup-zig
+#     - brew install node@22 + 导出 keg PATH              同上
+#     - 单 phase / 单 PowerShell block 约束               GitHub 每 step 独立进程
+#
+#   刻意增强（命令本身均已在 Linux buildspec 上跑绿，此处只扩大平台覆盖）：
+#     - 前端 format:check / lint / typecheck / test:unit、check-i18n.mjs、
+#       ts-rs bindings 漂移门禁 三平台都跑。buildspec 里 windows/macos 跳过它们
+#       只是为了缩短「串行且缓慢」的 CodeBuild 构建；GitHub 矩阵三平台并行，该
+#       理由不成立，而跨平台跑这些门禁能真正抓住平台差异。
+#     - bindings 漂移检查去掉了 `2>/dev/null || true`：CodeBuild 的 S3 源没有
+#       .git，检查退化为「导出成功」；actions/checkout 给的是真 .git，于是该门禁
+#       在这里完全生效——正是 linux.yml 注释里预告的那一步。
+#     - macos.yml post_build 的 `|| true` 一处未保留：缺 dmg 必须红。
+#
+# ---------------------------------------------------------------------------
+# 已从 Windows/macOS 实测里带过来的五个缺陷防线（逐条对应到下面的 YAML）
+#
+# (1) PowerShell 里原生进程非零退出不会中断脚本 —— 失败门禁会报绿。
+#     CodeBuild 的解法是每道门禁后跟 Assert-Ok。这里两道防线叠加：
+#       a. 所有共享门禁走 `shell: bash`。GitHub 以
+#          `bash --noprofile --norc -eo pipefail {0}` 运行它，-e 保证非零即失败。
+#       b. Windows 侧的 sidecar / NSIS 两步用 pwsh，并**原样移植 Assert-Ok**。
+#     GitHub 确实会自动兜底 —— 已核对官方文档（workflow-syntax，
+#     "Exit codes and error action preference"）：对 pwsh 与 powershell 两种内建
+#     shell，它「会在脚本内容前置 `$ErrorActionPreference = 'stop'`」并「在
+#     powershell 脚本后追加
+#     `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }`」。
+#     但那只反映**最后一条命令**的退出码；块中间某条 cargo 失败仍可能被后续命令
+#     的成功覆盖，这正是 CodeBuild 上实测到的形态。所以 Assert-Ok 保留，逐条断言。
+#
+# (2) PowerShell 5.1 按 ANSI 解析脚本，一个非 ASCII 字符（如破折号）就会撕裂
+#     字符串，1 秒内 exit 1 且日志里没有任何错误文本（实测花了三次构建定位）。
+#     => 下面每个 `shell: pwsh` 的 run 块内部一律 ASCII-only。注释与 step 名用
+#     中文没问题（YAML 本身是 UTF-8，由 Actions 运行时解析，不进 PowerShell 解析器）。
+#
+# (3) 泄漏的 `$ErrorActionPreference = "Stop"` 让 CodeBuild 的产物上传阶段烧掉
+#     整个 120 分钟超时（配对实验：不重置挂死，重置 5 秒上传完）。
+#     => 这里在结构上就不可能发生：GitHub 每个 step 是独立进程，没有 env.xml
+#     序列化/恢复，产物上传由 actions/upload-artifact 在 Node 里做，不继承任何
+#     PowerShell 会话状态。因此本文件从不设置也无需重置 $ErrorActionPreference，
+#     Assert-Ok 用 throw，由 step 边界收敛，不需要 try/finally。
+#
+# (4) 绝不把 `2>&1` 与 `$ErrorActionPreference = "Stop"` 一起用在 cargo 上：
+#     cargo 把 `Updating crates.io index` 写到 stderr，PowerShell 会把它变成
+#     终止性 NativeCommandError（实测直接打死一次探针构建）。
+#     注意 (1) 里核实的那条文档同时意味着：`shell: pwsh` 的块里 Stop **是 GitHub
+#     强制前置的**，我无法关掉。所以「不写 2>&1」在这里不是可选的卫生习惯，而是
+#     硬约束 —— 一旦重定向 cargo 的 stderr，第一行索引更新就会终止整个步骤。
+#     => 本文件任何 pwsh 块里都没有 `2>&1`；需要留存输出的地方（Windows 的 tauri
+#     lib 哨兵）走 bash 且只管道 stdout（libtest 的 `test result:` 走 stdout）。
+#
+# (5) tauri-bundler 只有在环境变量 CI 恰好等于字符串 "true" 时才给 bundle_dmg.sh
+#     传 --skip-jenkins；否则它会调 osascript 美化 Finder 窗口，在无 GUI 会话的
+#     构建机上 exit 64 —— 而且是在 .app 已经构建完之后才失败。
+#     已核对官方文档（Actions variables 参考，default environment variables 表）：
+#     `CI` 「Always set to `true`」，字面小写。但同一段还写明 CI 是**唯一允许被
+#     覆盖**的默认变量，且不保证将来仍可覆盖 —— 既然它可被覆盖，就不能当成不可
+#     动的常量。=> workflow 级 env 与 dmg 步骤都显式钉住 CI: "true"，与 macos.yml
+#     一致，绝不依赖默认值。
+#
+# YAML 教训（buildspec 上踩过）：未加引号的列表项里出现 `: ` 会被解析成 map，
+# ` #` 会从中间开始注释。提交前用 `python3 -c 'import yaml; yaml.safe_load(...)'`
+# 与 `actionlint` 双验证。
+# ===========================================================================
+
+on:
+  # push 只跑 main：徽章（无 ?branch= 参数时取默认分支）与 Codecov 的主线基线都需要它。
+  # 功能分支不在这里触发 —— 否则同一个提交会被 push 与 pull_request 各触发一次，
+  # 白跑一遍三平台（约 60 分钟机时），还会让「哪个 run 才是准的」变得含糊。
+  # 代价是：没开 PR 的分支推上去不会有 CI。本仓库 main 受保护、只允许 squash 合并，
+  # 一切改动都要过 PR，所以这个代价不存在实际盲区。
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+# group 里必须带 github.event_name。少了它，push 与 pull_request 的 run 会落进同一组，
+# cancel-in-progress 于是让两者互相击杀：实测提交 63502bb 上三平台的成功证据被打散到两个
+# run 里（push 的 macOS 绿、PR 的 Linux 绿），而 Windows 在两个 run 里都是 cancelled ——
+# 从未真正跑完，PR 因此永远拿不到完整绿灯。
+# 排查时要留意：cancelled 不是 failure，失败步骤显示为「Set up job」时说明根本没进到代码。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # bash 在三个 runner 上都可用（Windows 走 Git bash），GitHub 以
+    # `bash --noprofile --norc -eo pipefail {0}` 运行它 —— 非零退出即失败，
+    # 这就是防线 (1) 在共享门禁上的落点。
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # 前端在 Vite 8 / Vitest 4 / TS 6 上，要求 Node >= 20.19
+  NODE_VERSION: "22"
+  # 与 linux.yml 同一枚举：oxfmt 版本必须与提交时所用一致，否则新版会重排已提交
+  # 的字节，把 fmt 门禁变成无意义的红。
+  OXFMT_VERSION: "0.59.0"
+  # zig 只作为 musl 的 C 交叉编译器（rusqlite 的 bundled feature 要编 sqlite3.c）。
+  # 版本与三份 buildspec 一致：0.14.0 是实测跑绿的那个。
+  ZIG_VERSION: "0.14.0"
+  MACOS_TARGET: aarch64-apple-darwin
+  MACOS_BUNDLE_CONFIG: src-tauri/tauri.bundle.macos.json
+  # 防线 (5)：显式钉住，不依赖 runner 默认值。
+  CI: "true"
+
+jobs:
+  gate:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      # 一个平台红不掩盖另两个平台的结论：三份日志都要看得到。
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux 全量门禁 + 覆盖率 + dist-all
+            artifact: agentlens-linux-dist
+          - os: windows-latest
+            label: Windows MSVC 门禁 + NSIS
+            artifact: agentlens-windows-nsis
+          - os: macos-latest
+            label: macOS 门禁 + dmg
+            artifact: agentlens-macos-dmg
+    env:
+      # secrets 上下文不能用在 step 的 if 里，先落到 job env 才能判空。
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      # checkout 之前设置：autocrlf 一旦生效，工作区就会被写成 CRLF，而 ts-rs +
+      # prettier 生成的是 LF，bindings 漂移门禁会因为纯行尾差异假红。
+      # core.longpaths 是 windows.yml 缺陷 (E) 的原样移植：Tauri/MSVC 的输出路径
+      # 会超过 MAX_PATH。
+      - name: 固定行尾与长路径（Windows，必须在 checkout 之前）
+        if: runner.os == 'Windows'
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@v5
+
+      # 与 linux.yml install 阶段同一份包名清单。
+      # libayatana-appindicator3-dev 是必须的：src-tauri 打开了 tauri 的
+      # tray-icon feature，缺它 bundler 报 "Can't detect any appindicator library"。
+      # musl-tools 提供 musl-gcc（x86_64 collector 的 C 编译器）。
+      # 未移植 unzip / xz-utils：它们只服务于 buildspec 手动解 node/zig 压缩包。
+      - name: 安装 Tauri 2 系统依赖与 musl 工具链（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential pkg-config libssl-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev \
+            musl-tools \
+            curl file
+
+      - name: 安装 Rust stable 与双 musl 目标
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          rustc --version
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
+
+      - name: 安装 llvm-tools-preview（仅 Linux 出覆盖率）
+        if: runner.os == 'Linux'
+        run: rustup component add llvm-tools-preview
+
+      - name: 安装 zig（aarch64/x86_64 musl 的 C 交叉编译器）
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # 硬安装、硬断言：`make fmt-check` 在缺少 oxfmt 时只打印提示并**静默跳过**
+      # YAML/JSON/Markdown 格式检查，把格式门禁悄悄降级成「只查 Rust」。
+      - name: 安装 oxfmt（缺它会让 make fmt-check 静默降级）
+        if: runner.os == 'Linux'
+        run: |
+          npm install -g "oxfmt@${OXFMT_VERSION}"
+          command -v oxfmt
+          oxfmt --version
+
+      # 预编译分发，`cargo install cargo-llvm-cov` 会多花几分钟。
+      - name: 安装 cargo-llvm-cov（预编译）
+        if: runner.os == 'Linux'
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xzf - -C "$HOME/.cargo/bin"
+          cargo llvm-cov --version
+
+      - name: 安装 tauri-cli v2
+        run: |
+          cargo install tauri-cli --locked --version "^2"
+          cargo tauri --version
+
+      # Windows / macOS 都没有 musl cc，两个 Linux collector sidecar 只能靠 zig
+      # 自带的 musl sysroot 交叉编译。Linux 侧由 Makefile 直接处理，不需要它。
+      - name: 安装 cargo-zigbuild（Windows / macOS 交叉编译 musl collector）
+        if: runner.os != 'Linux'
+        run: cargo install cargo-zigbuild --locked
+
+      # ts-rs 漂移门禁会在 frontend/ 里调 npx prettier 与 npx tsc，所以 node_modules
+      # 必须先于 Rust 门禁存在。
+      - name: 安装前端依赖（npm ci，lockfile 权威）
+        run: npm --prefix frontend ci
+
+      # 版本号唯一事实源是根 Cargo.toml 的 [workspace.package].version。
+      # Windows runner 上不保证有 GNU make，与 windows.yml 一样不在该平台用 make。
+      - name: 回显版本号（单一事实源自检）
+        if: runner.os != 'Windows'
+        run: make dist-version
+
+      # ---- 门禁 1：格式 + clippy + 前端静态检查 + 中文文案 -----------------
+      # Linux 用一个 make 目标，与 linux.yml 的 `make lint` 逐字一致：
+      #   fmt-check(rustfmt + oxfmt) -> clippy -D warnings
+      #   -> 前端 format:check / lint / typecheck -> node scripts/check-i18n.mjs
+      - name: 门禁 make lint（rustfmt + oxfmt + clippy -D warnings + 前端 + i18n）
+        if: runner.os == 'Linux'
+        run: make lint
+
+      # Windows / macOS 拆成裸命令，理由与 windows.yml 相同：不依赖 GNU make 与
+      # Makefile 的 bash-ism。oxfmt 不在这两个平台重跑 —— 它检查的是平台无关的
+      # YAML/JSON/Markdown，跑三遍纯属重复，Linux job 已经是权威。
+      - name: 门禁 cargo fmt --all -- --check
+        if: runner.os != 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: 门禁 cargo clippy --workspace --all-targets -- -D warnings
+        if: runner.os != 'Linux'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 门禁 前端 format:check / lint / typecheck
+        if: runner.os != 'Linux'
+        run: |
+          npm --prefix frontend run format:check
+          npm --prefix frontend run lint
+          npm --prefix frontend run typecheck
+
+      - name: 门禁 中文文案字典
+        if: runner.os != 'Linux'
+        run: node scripts/check-i18n.mjs
+
+      # ---- 门禁 2：Rust 测试 ----------------------------------------------
+      # 只跑默认集合：18 个 #[ignore] 用例需要操作者本机约 43 GB 的真实归档库或
+      # 真实系统钥匙串 / GUI。永远不要在 CI 门禁里加 --ignored / --include-ignored。
+      # 注意 crates/agentlens-core 的 ssh_real_sh_framing 是 #[cfg(unix)] 且读
+      # /bin/sh：ubuntu-latest 的 /bin/sh 指向 dash，正是当初暴露生产缺陷
+      # （dash 0.5.11，修复于 1a8cbd6）的那条路径 —— 这条覆盖是刻意保留的资产。
+      - name: 门禁 cargo test --workspace（18 个 #[ignore] 保持跳过）
+        run: cargo test --workspace
+
+      # Windows 专属回归哨兵：agentlens-tauri 的测试二进制曾因
+      # comctl32!TaskDialogIndirect 未解析，在 main 之前就被加载器拒绝
+      # （exit 0xc0000139），29 条测试全部静默不跑。修复在 src-tauri/build.rs
+      # （延迟加载 comctl32），已提交，本 workflow 不做任何绕行。
+      # 这里只断言「确实执行了非零条数」，不写死 29，避免新增测试就假红。
+      # 只管道 stdout（libtest 的 test result 走 stdout），不用 2>&1 —— 防线 (4)。
+      - name: 哨兵 tauri lib 测试确实执行（0xc0000139 回归）
+        if: runner.os == 'Windows'
+        run: |
+          cargo test -p agentlens-tauri --lib | tee tauri-lib-tests.log
+          passed="$(grep -oE 'test result: ok\. [0-9]+ passed' tauri-lib-tests.log \
+            | grep -oE '[0-9]+' | head -1)"
+          if [ -z "$passed" ] || [ "$passed" -eq 0 ]; then
+            echo "agentlens-tauri lib 测试未执行（0xc0000139 回归？）"
+            exit 1
+          fi
+          echo "agentlens-tauri lib 执行了 ${passed} 条测试"
+          rm -f tauri-lib-tests.log
+
+      # ---- 门禁 3：前端单测（Vitest，headless）-----------------------------
+      # E2E（Playwright / wdio + tauri-driver）不在此门禁内：需要浏览器与 X 显示。
+      - name: 门禁 前端单测 test:unit
+        run: npm --prefix frontend run test:unit
+
+      # Tauri 的 beforeBuildCommand 需要 frontend/dist 存在，提前构建以尽早失败。
+      - name: 前端构建产物（Tauri beforeBuildCommand 依赖 frontend/dist）
+        run: npm --prefix frontend run build
+
+      # ---- 门禁 4：ts-rs 生成物零漂移 --------------------------------------
+      # 该测试清空 frontend/src/generated/、重新导出全部 DTO、写 index.ts，再跑
+      # 仓库锁定的 prettier 与 tsc --noEmit。若已提交的 bindings 与 Rust 侧 DTO
+      # 不一致，下面这条限定路径的 git status 就非空 —— 这就是契约的强制方式。
+      # 限定路径是刻意的：别处的脏文件不该把它变成假红。
+      - name: 门禁 ts-rs bindings 零漂移
+        run: |
+          cargo test -p agentlens-tauri --features ts-export bindings_export
+          drift="$(git status --porcelain -uall -- frontend/src/generated/)"
+          if [ -n "$drift" ]; then
+            echo "生成物漂移：frontend/src/generated/ 与 Rust DTO 不一致"
+            echo "$drift"
+            git --no-pager diff -- frontend/src/generated/
+            exit 1
+          fi
+          echo "bindings 零漂移"
+
+      # ---- 门禁 5：覆盖率（仅 Linux）---------------------------------------
+      # coverage-gate 会先跑 coverage 产出 artifacts/coverage/{summary.txt,lcov.info}，
+      # 再直接读 lcov 的 LF/LH 判定门槛 —— 与 Codecov 消费的是同一份字节，本地数字
+      # 与面板数字不会漂移。门槛恒为 90；2026-08-06 Linux 基线与门禁复验均为 91.63%
+      #（分别 15894/17346、15895/17346），1 行命中差异约 0.006pp，远小于 1.63pp 余量。
+      - name: 门禁 make coverage-gate（>= 90%）并产出 lcov.info
+        if: runner.os == 'Linux'
+        run: make coverage-gate
+
+      # 只有 Linux 上传：三平台都传会让同一份代码被重复计数。
+      # 未配置 CODECOV_TOKEN 时跳过上传（Codecov 是报表而非门禁，真正的地板是上一步
+      # 的 make coverage-gate，它已经硬失败过一次门槛校验）；配了 token 就必须传成功，
+      # fail_ci_if_error 不给静默失败留口子。人工启用：`gh secret set CODECOV_TOKEN`；或先在
+      # codecov.io 关联这个 public 仓库，再经确认切到 tokenless 上传。关联完成前不得删除守卫。
+      # lcov.info 另外作为 workflow 产物上传，所以即使跳过 Codecov 数据也不会丢。
+      - name: 上传覆盖率到 Codecov（仅 Linux，避免重复计数）
+        if: runner.os == 'Linux' && env.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./artifacts/coverage/lcov.info
+          disable_search: true
+          fail_ci_if_error: true
+          token: ${{ env.CODECOV_TOKEN }}
+
+      # ---- 门禁 6：真实打包 ------------------------------------------------
+      # dist-all == dist + 「aarch64 collector 必须存在」的硬要求。zig 就是为了让
+      # 这个要求可满足才装的；用会降级的 dist 会让静默单架构包被报成绿。
+      # 产出 artifacts/dist/{*.deb, 两个 musl collector, sha256sums.txt} 并复验清单。
+      - name: 打包 Linux（deb + 双架构 musl collector + sha256sums.txt）
+        if: runner.os == 'Linux'
+        env:
+          DIST_REQUIRE_AARCH64: "1"
+        run: make dist-all
+
+      - name: 校验 deb 载荷含 askpass 与双架构 collector
+        if: runner.os == 'Linux'
+        run: |
+          ls -l artifacts/dist/
+          cat artifacts/dist/sha256sums.txt
+          deb="$(ls -1 artifacts/dist/*.deb)"
+          dpkg --contents "$deb" | tee /tmp/deb-contents.txt
+          for expected in \
+            usr/bin/agentlens-askpass \
+            usr/bin/agentlens-collector-x86_64-unknown-linux-musl \
+            usr/bin/agentlens-collector-aarch64-unknown-linux-musl
+          do
+            grep -q "$expected" /tmp/deb-contents.txt \
+              || { echo "deb 缺少 ${expected}"; exit 1; }
+          done
+
+      # ---- Windows sidecar 归置 -------------------------------------------
+      # src-tauri/tauri.bundle.windows.json（已提交，不属于本文件）声明：
+      #   externalBin: agentlens-askpass  -> Tauri 解析为 agentlens-askpass-<triple>.exe
+      #   resources  : 两个 agentlens-collector-*-unknown-linux-musl + collectors.sha256
+      # collector 刻意是 LINUX musl 二进制：AgentLens 管理的远端就是 Linux 主机，
+      # Windows 端只是操作者的控制台。走 resources 而非 externalBin，因为后者会强行
+      # 追加 .exe，而运行期按不带后缀的原名查找。
+      #
+      # 以下 run 块严格 ASCII-only —— 防线 (2)。Assert-Ok 是 windows.yml 的原样
+      # 移植 —— 防线 (1)。块内没有 2>&1，也不设置 $ErrorActionPreference —— 防线 (4)(3)。
+      - name: 归置 Windows sidecar（askpass + 双架构 musl collector）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          function Assert-Ok([string]$what) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "GATE FAILED: $what exited with code $LASTEXITCODE"
+            }
+            Write-Host "gate ok: $what"
+          }
+
+          $stage = "target\dist\binaries"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          cargo build -p agentlens-askpass --release
+          Assert-Ok "cargo build -p agentlens-askpass"
+          Copy-Item "target\release\agentlens-askpass.exe" `
+            "$stage\agentlens-askpass-x86_64-pc-windows-msvc.exe" -Force
+
+          cargo zigbuild -p agentlens-collector --target x86_64-unknown-linux-musl --release
+          Assert-Ok "cargo zigbuild x86_64-unknown-linux-musl"
+          cargo zigbuild -p agentlens-collector --target aarch64-unknown-linux-musl --release
+          Assert-Ok "cargo zigbuild aarch64-unknown-linux-musl"
+          Copy-Item "target\x86_64-unknown-linux-musl\release\agentlens-collector" `
+            "$stage\agentlens-collector-x86_64-unknown-linux-musl" -Force
+          Copy-Item "target\aarch64-unknown-linux-musl\release\agentlens-collector" `
+            "$stage\agentlens-collector-aarch64-unknown-linux-musl" -Force
+
+          Push-Location $stage
+          Get-ChildItem "agentlens-collector-*" | ForEach-Object {
+            $h = (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii "collectors.sha256"
+          Get-Content "collectors.sha256" | Write-Host
+          Pop-Location
+
+          foreach ($required in @(
+            "agentlens-askpass-x86_64-pc-windows-msvc.exe",
+            "agentlens-collector-x86_64-unknown-linux-musl",
+            "agentlens-collector-aarch64-unknown-linux-musl",
+            "collectors.sha256")) {
+            if (-not (Test-Path (Join-Path $stage $required))) {
+              throw "missing sidecar: $required"
+            }
+          }
+          Get-ChildItem $stage | Format-List Name,Length | Out-String | Write-Host
+
+      # 必须从仓库根运行：在 frontend/ 下 Tauri 会 panic
+      # "Couldn't recognize the current folder as a Tauri project"。
+      # bundle overlay 已提交且由平台负责人持有，本文件不改它。
+      - name: 构建 Windows NSIS 安装包
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          function Assert-Ok([string]$what) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "GATE FAILED: $what exited with code $LASTEXITCODE"
+            }
+            Write-Host "gate ok: $what"
+          }
+
+          cargo tauri build --bundles nsis --config src-tauri/tauri.bundle.windows.json
+          Assert-Ok "cargo tauri build --bundles nsis"
+
+          $nsis = Get-ChildItem "target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue
+          if (-not $nsis) {
+            throw "NSIS installer not produced under target\release\bundle\nsis"
+          }
+          New-Item -ItemType Directory -Force -Path "artifacts\dist" | Out-Null
+          Copy-Item $nsis.FullName "artifacts\dist\" -Force
+          Copy-Item "target\dist\binaries\collectors.sha256" "artifacts\dist\" -Force
+
+          Push-Location "artifacts\dist"
+          Get-ChildItem "*.exe" | ForEach-Object {
+            $h = (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii "sha256sums.txt"
+          Get-Content "sha256sums.txt" | Write-Host
+          Pop-Location
+          Get-ChildItem "artifacts\dist" | Format-List Name,Length | Out-String | Write-Host
+
+      # ---- macOS sidecar 归置 ---------------------------------------------
+      # 目标只做 aarch64-apple-darwin，不做 universal：macos-latest 是 Apple
+      # Silicon，aarch64 是免费的原生构建；而包进去的 sidecar 无论宿主架构都是
+      # Linux musl 二进制，产品本身不耦合胖二进制。
+      - name: 归置 macOS sidecar（askpass + 双架构 musl collector）
+        if: runner.os == 'macOS'
+        run: |
+          if [ ! -f "$MACOS_BUNDLE_CONFIG" ]; then
+            echo "缺少 ${MACOS_BUNDLE_CONFIG}：macOS bundle overlay 未提交"
+            exit 1
+          fi
+          cargo build -p agentlens-askpass --release --target "$MACOS_TARGET"
+          mkdir -p target/dist/binaries
+          cp "target/$MACOS_TARGET/release/agentlens-askpass" \
+            "target/dist/binaries/agentlens-askpass-$MACOS_TARGET"
+          cargo zigbuild -p agentlens-collector --target x86_64-unknown-linux-musl --release
+          cargo zigbuild -p agentlens-collector --target aarch64-unknown-linux-musl --release
+          cp target/x86_64-unknown-linux-musl/release/agentlens-collector \
+            target/dist/binaries/agentlens-collector-x86_64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/agentlens-collector \
+            target/dist/binaries/agentlens-collector-aarch64-unknown-linux-musl
+          ( cd target/dist/binaries && shasum -a 256 agentlens-collector-* > collectors.sha256 && cat collectors.sha256 )
+          chmod 0755 target/dist/binaries/*
+
+      # 未签名 bundle：公证需要 Apple Developer 证书与 codesign/notarytool，
+      # 明确不在本门禁范围。ls -R 是从日志确认 sidecar 真的进了 .app 的唯一手段。
+      # env.CI 显式钉死 "true" —— 防线 (5)，与 macos.yml 一致。
+      - name: 构建 macOS .app / .dmg（未签名，aarch64）
+        if: runner.os == 'macOS'
+        env:
+          CI: "true"
+        run: |
+          cargo tauri build --bundles app,dmg --target "$MACOS_TARGET" --config "$MACOS_BUNDLE_CONFIG"
+          ls -R "target/$MACOS_TARGET/release/bundle/"
+          mkdir -p artifacts/dist
+          cp "target/$MACOS_TARGET"/release/bundle/dmg/*.dmg artifacts/dist/
+          cp target/dist/binaries/collectors.sha256 artifacts/dist/
+          ( cd artifacts/dist && shasum -a 256 -- *.dmg > dmg.sha256 && cat dmg.sha256 )
+          ls -l artifacts/dist/
+          test -n "$(ls artifacts/dist/*.dmg)"
+
+      - name: 上传平台产物
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: artifacts/dist/*
+          if-no-files-found: error
+
+      # 与 Codecov 上传解耦：即使没配 token，lcov.info 也一定留档。
+      - name: 上传 lcov.info（Linux）
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v5
+        with:
+          name: agentlens-coverage-lcov
+          path: |
+            artifacts/coverage/lcov.info
+            artifacts/coverage/summary.txt
+          if-no-files-found: error
