@@ -59,13 +59,23 @@ const VIEW_ICONS: Record<ViewKey, LucideIcon> = {
 }
 
 const CONTROL_CLASS = cn(
-  'inline-flex h-7 items-center justify-center gap-1.5 rounded-md px-2',
+  'inline-flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-md',
   'text-xs font-medium text-muted-foreground transition-colors outline-none',
   'hover:bg-muted hover:text-foreground',
   'focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
   'focus-visible:ring-offset-card',
   '[&_svg]:pointer-events-none [&_svg]:size-3.5 [&_svg]:shrink-0',
 )
+
+/**
+ * The collapsed rail has 48px of content box (64 minus `p-2`), which three horizontal controls
+ * cannot share, so they stack. `w-full px-0` rather than a 28px square: the plate spans the whole
+ * content box — the widest target the rail can offer — and the icon stays on the same optical
+ * axis as the nav icons below it. Dropping the inline padding also keeps each control's
+ * min-content width at one icon, which is what the `min-width: auto` note on `<aside>` is about.
+ */
+const CONTROL_COLLAPSED_CLASS = 'w-full px-0'
+const CONTROL_EXPANDED_CLASS = 'px-2'
 
 export function AppSidebar({
   active,
@@ -94,8 +104,8 @@ export function AppSidebar({
     Read off `layout`, NOT off `state`. `state` collapses the two flags into one answer and reports
     `'hidden'` for a hidden-and-collapsed rail, so deriving `collapsed` from it made the hover
     preview render EXPANDED content — full labels and a horizontal footer — inside a 64px box.
-    The labels were clipped away silently, but the footer's flex row wrapped 收起侧栏 into a
-    vertical stack of single characters.
+    The labels were clipped away silently, but the control row's flex layout wrapped 收起侧栏
+    into a vertical stack of single characters.
   */
   const collapsed = layout.collapsed
   const hidden = layout.hidden
@@ -249,8 +259,10 @@ export function AppSidebar({
           /*
             `minWidth` / `maxWidth` are not redundant with `width`. A flex item defaults to
             `min-width: auto`, i.e. it refuses to go below its own min-content width, so the
-            footer control row alone held the collapsed rail at 173px and `width: 64px` was
+            three-control row alone held the collapsed rail at 173px and `width: 64px` was
             quietly ignored. Pinning all three makes the rendered width exactly the model's.
+            Still load-bearing after the controls moved to the top: the constraint is about the
+            row's min-content width, which does not care whether it sits above or below the nav.
           */
           style={{
             width: `${String(shownWidth)}px`,
@@ -265,6 +277,74 @@ export function AppSidebar({
               : 'sticky top-titlebar h-[calc(100dvh-var(--titlebar-height))]',
           )}
         >
+          {/*
+            Above the nav, not below it. These three answer "how should the rail itself behave",
+            which is a question about the chrome the user is looking at rather than a seventh
+            place to navigate to, and the top edge is where window chrome is read. The 7px-shorter
+            plates, `text-xs` muted label and the `border-b` hairline are what keep the row from
+            reading as another nav item; the nav's own items are h-10 `text-sm`.
+          */}
+          <div
+            data-testid="sidebar-controls"
+            className={cn(
+              'flex shrink-0 border-b border-border p-2',
+              collapsed ? 'flex-col gap-0.5' : 'items-center justify-between gap-1',
+            )}
+          >
+            <button
+              type="button"
+              data-testid="sidebar-toggle-collapsed"
+              aria-label={collapsed ? zh.sidebar.expand : zh.sidebar.collapse}
+              aria-expanded={!collapsed}
+              title={collapsed ? zh.sidebar.expand : zh.sidebar.collapse}
+              onClick={toggleCollapsed}
+              className={cn(
+                CONTROL_CLASS,
+                collapsed ? CONTROL_COLLAPSED_CLASS : CONTROL_EXPANDED_CLASS,
+              )}
+            >
+              {collapsed ? <PanelLeftOpen aria-hidden /> : <PanelLeftClose aria-hidden />}
+              {collapsed ? null : <span>{zh.sidebar.collapse}</span>}
+            </button>
+            <div className={cn('flex items-center gap-1', collapsed && 'w-full flex-col gap-0.5')}>
+              <button
+                type="button"
+                data-testid="sidebar-toggle-pinned"
+                aria-label={layout.pinned ? zh.sidebar.unpin : zh.sidebar.pin}
+                aria-pressed={layout.pinned}
+                title={layout.pinned ? zh.sidebar.unpin : zh.sidebar.pin}
+                onClick={togglePinned}
+                className={cn(
+                  CONTROL_CLASS,
+                  collapsed ? CONTROL_COLLAPSED_CLASS : CONTROL_EXPANDED_CLASS,
+                )}
+              >
+                {layout.pinned ? <Pin aria-hidden /> : <PinOff aria-hidden />}
+              </button>
+              {/*
+                A toggle, not a one-way hide. While the hover preview is open it is the only way
+                back: the preview renders at full width over the 12px edge strip, so a mouse
+                click can never reach the strip again once hovering it has opened the preview.
+                That is also why the collapsed rail keeps all three controls instead of showing
+                only expand — dropping this one would strand the preview.
+              */}
+              <button
+                type="button"
+                data-testid="sidebar-toggle-hidden"
+                aria-label={hidden ? zh.sidebar.show : zh.sidebar.hide}
+                aria-pressed={hidden}
+                title={hidden ? zh.sidebar.show : zh.sidebar.hide}
+                onClick={() => setHidden(!hidden)}
+                className={cn(
+                  CONTROL_CLASS,
+                  collapsed ? CONTROL_COLLAPSED_CLASS : CONTROL_EXPANDED_CLASS,
+                )}
+              >
+                {hidden ? <PanelLeftOpen aria-hidden /> : <EyeOff aria-hidden />}
+              </button>
+            </div>
+          </div>
+
           <nav
             role="tablist"
             aria-orientation="vertical"
@@ -318,55 +398,6 @@ export function AppSidebar({
               )
             })}
           </nav>
-
-          <div
-            className={cn(
-              'flex shrink-0 items-center gap-1 border-t border-border p-2',
-              collapsed ? 'flex-col' : 'justify-between',
-            )}
-          >
-            <button
-              type="button"
-              data-testid="sidebar-toggle-collapsed"
-              aria-label={collapsed ? zh.sidebar.expand : zh.sidebar.collapse}
-              aria-expanded={!collapsed}
-              title={collapsed ? zh.sidebar.expand : zh.sidebar.collapse}
-              onClick={toggleCollapsed}
-              className={CONTROL_CLASS}
-            >
-              {collapsed ? <PanelLeftOpen aria-hidden /> : <PanelLeftClose aria-hidden />}
-              {collapsed ? null : <span>{zh.sidebar.collapse}</span>}
-            </button>
-            <div className={cn('flex items-center gap-1', collapsed && 'flex-col')}>
-              <button
-                type="button"
-                data-testid="sidebar-toggle-pinned"
-                aria-label={layout.pinned ? zh.sidebar.unpin : zh.sidebar.pin}
-                aria-pressed={layout.pinned}
-                title={layout.pinned ? zh.sidebar.unpin : zh.sidebar.pin}
-                onClick={togglePinned}
-                className={CONTROL_CLASS}
-              >
-                {layout.pinned ? <Pin aria-hidden /> : <PinOff aria-hidden />}
-              </button>
-              {/*
-                A toggle, not a one-way hide. While the hover preview is open it is the only way
-                back: the preview renders at full width over the 12px edge strip, so a mouse
-                click can never reach the strip again once hovering it has opened the preview.
-              */}
-              <button
-                type="button"
-                data-testid="sidebar-toggle-hidden"
-                aria-label={hidden ? zh.sidebar.show : zh.sidebar.hide}
-                aria-pressed={hidden}
-                title={hidden ? zh.sidebar.show : zh.sidebar.hide}
-                onClick={() => setHidden(!hidden)}
-                className={CONTROL_CLASS}
-              >
-                {hidden ? <PanelLeftOpen aria-hidden /> : <EyeOff aria-hidden />}
-              </button>
-            </div>
-          </div>
 
           {collapsed ? null : (
             <div

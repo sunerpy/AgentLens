@@ -153,6 +153,50 @@ test('expanded → collapsed → hidden → recalled', async ({ page }) => {
   await expect(page.getByTestId('sidebar-recall')).toHaveCount(0)
 })
 
+test('the three rail controls sit above the navigation in both states', async ({ page }) => {
+  await openSidebar(page)
+
+  const controls = page.getByTestId('sidebar-controls')
+  const nav = rail(page).getByRole('tablist')
+
+  const controlsAboveNav = async (label: string) => {
+    const control = await controls.boundingBox()
+    const list = await nav.boundingBox()
+    expect(control, label).not.toBeNull()
+    expect(list, label).not.toBeNull()
+    // Bottom edge of the control row against the top edge of the list: "above" has to be
+    // geometric, because DOM order alone would still pass if flex-direction were reversed.
+    expect(Math.round((control?.y ?? 0) + (control?.height ?? 0)), label).toBeLessThanOrEqual(
+      Math.round(list?.y ?? 0),
+    )
+  }
+
+  await controlsAboveNav('expanded')
+  // The rail's own top edge, not the viewport's: the row must be the first thing inside it.
+  const railBox = await rail(page).boundingBox()
+  const controlBox = await controls.boundingBox()
+  expect(Math.round(controlBox?.y ?? -1)).toBeLessThan(Math.round((railBox?.y ?? 0) + 24))
+
+  await page.getByTestId('sidebar-toggle-collapsed').click()
+  await expect(rail(page)).toHaveAttribute('data-state', 'collapsed')
+  // The row moving up must not have widened the rail: `min-width: auto` on a flex child is
+  // what held this at 173px when three controls shared one row.
+  expect(await railWidth(page)).toBe(SIDEBAR_RAIL_WIDTH)
+  await controlsAboveNav('collapsed')
+
+  // All three still operable inside a 64px rail, which is the reason they stack rather than
+  // dropping down to just expand/collapse.
+  for (const id of ['sidebar-toggle-collapsed', 'sidebar-toggle-pinned', 'sidebar-toggle-hidden']) {
+    const control = page.getByTestId(id)
+    await expect(control).toBeVisible()
+    expect(Math.round((await control.boundingBox())?.width ?? -1)).toBeGreaterThan(24)
+  }
+
+  await page.getByTestId('sidebar-toggle-pinned').click()
+  await expect(rail(page)).toHaveAttribute('data-pinned', 'false')
+  expect(await railWidth(page)).toBe(SIDEBAR_RAIL_WIDTH)
+})
+
 test('hovering the edge strip previews a hidden rail without un-hiding it', async ({ page }) => {
   await openSidebar(page)
 

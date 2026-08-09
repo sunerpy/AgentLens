@@ -216,6 +216,82 @@ describe('侧栏三态切换', () => {
   })
 })
 
+/** 子元素的身份标记：有 testid 用 testid，没有的（`<nav>`）用标签名。 */
+function railChildren(): string[] {
+  return [...rail().children].map((node) => node.getAttribute('data-testid') ?? node.tagName)
+}
+
+const CONTROL_IDS = [
+  'sidebar-toggle-collapsed',
+  'sidebar-toggle-pinned',
+  'sidebar-toggle-hidden',
+] as const
+
+describe('控件位于顶部', () => {
+  it('控制区是侧栏的第一个子元素，导航排在它之后', async () => {
+    renderSidebar()
+    await hydrated()
+
+    const controls = screen.getByTestId('sidebar-controls')
+    expect(rail().firstElementChild).toBe(controls)
+
+    const nav = screen.getByRole('tablist')
+    expect(
+      controls.compareDocumentPosition(nav) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeGreaterThan(0)
+    for (const testId of CONTROL_IDS) {
+      expect(controls.contains(screen.getByTestId(testId))).toBe(true)
+    }
+  })
+
+  it('页脚已移除：侧栏只剩控制区、导航与宽度手柄', async () => {
+    renderSidebar()
+    await hydrated()
+
+    expect(railChildren()).toEqual(['sidebar-controls', 'NAV', 'sidebar-resize'])
+
+    // 收缩态没有宽度手柄，所以只剩两个 —— 关键是控制区仍在最前，且末尾不再有页脚。
+    await collapse()
+    expect(railChildren()).toEqual(['sidebar-controls', 'NAV'])
+  })
+
+  it('收缩态下三个控件仍在顶部、纵向堆叠，且逐个都能聚焦', async () => {
+    renderSidebar()
+    await hydrated()
+
+    await collapse()
+
+    const controls = screen.getByTestId('sidebar-controls')
+    // 64px 的内容盒放不下三个横向控件，所以收缩态必须是纵向的。
+    expect(controls.className).toContain('flex-col')
+    for (const testId of CONTROL_IDS) {
+      const control = screen.getByTestId(testId)
+      expect(controls.contains(control)).toBe(true)
+      control.focus()
+      expect(document.activeElement).toBe(control)
+    }
+  })
+
+  it('收缩态保留隐藏控件：少了它，悬停预览就再没有退出口', async () => {
+    renderSidebar()
+    await hydrated()
+
+    await collapse()
+    await hide()
+    fireEvent.mouseEnter(screen.getByTestId('sidebar-recall'))
+    await waitFor(() => {
+      expect(rail().getAttribute('data-floating')).toBe('true')
+    })
+
+    const restore = screen.getByTestId('sidebar-toggle-hidden')
+    expect(restore.getAttribute('aria-label')).toBe(zh.sidebar.show)
+    fireEvent.click(restore)
+    await waitFor(() => {
+      expect(railState()).toBe('collapsed')
+    })
+  })
+})
+
 describe('持久化边界', () => {
   it('收缩写 ui.sidebar.collapsed', async () => {
     renderSidebar()
