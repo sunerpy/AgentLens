@@ -1,0 +1,55 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node
+node_modules/
+frontend/dist/
+frontend/node_modules/
+.vite/
+
+# 本地环境、私钥与凭据文件（模板文件允许入仓）
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+id_rsa
+id_rsa.*
+credentials
+
+# 本地数据库与归档产物（绝不入仓）
+*.db
+*.db-wal
+*.db-shm
+*.db.bak.*
+*.sqlite
+*.sqlite3
+
+# 打包产物
+/dist/
+/artifacts/
+
+# 编排器（OhMyOpenCode）的工作区：计划、笔记、证据、执行期状态。
+# 整个目录都不入仓。两个理由：
+# 1. 它记录的是「怎么把这个项目做出来」的过程（计划勾选、子任务笔记、验证证据），
+#    对使用者没有价值，只会让公开仓库的 diff 噪声盖过真实代码变更。
+# 2. 更硬的理由：这些笔记里天然带构建环境的标识——AWS 账号 ID、S3 桶名、子网 ID、
+#    EC2 实例 ID、QA 机主机名。交付面（Makefile / scripts）已经把这些参数化了，
+#    但如果 .omo/ 还在仓里，转 public 时它们照样公开，参数化就白做了。
+#    实测转 public 前有 4 个被跟踪文件、共 31 行命中这些标识。
+# 文件仍留在本地磁盘，只是不发布。
+.omo/
+
+# 编辑器与系统
+.DS_Store
+*.swp
+.idea/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# CodeGraph 索引与守护进程日志：本地工具产物，不入仓。
+.codegraph/

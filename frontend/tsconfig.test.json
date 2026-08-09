@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.test.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    /**
+     * 单测工程独占 `node` 类型：两个漂移门禁（`archiveQueries.test.ts` 比对
+     * `state.rs` 的事件名、`ipc.test.ts` 比对 `lib.rs` 的命令注册表）要在测试期读 Rust
+     * 源码，需要 `node:fs` / `node:path` / `import.meta.dirname`。
+     *
+     * 这些类型**故意不放进 `tsconfig.app.json`**：应用编译面是浏览器目标，一旦引入 node
+     * 类型，业务代码误用 `process` / `fs` 就不会再报错。于是用例从 app 工程里排除，
+     * 由本工程单独收，编译面各自干净。`tsconfig.e2e.json` 是同一套做法。
+     */
+    "types": ["node", "vite/client"],
+    "allowArbitraryExtensions": true,
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Path alias（与 app 工程保持一致） */
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["vitest.config.ts", "src/**/*.test.ts", "src/**/*.test.tsx"]
+}

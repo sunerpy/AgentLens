@@ -1,0 +1,13 @@
+[package]
+name = "agentlens-askpass"
+description = "AgentLens SSH_ASKPASS 一次性口令助手（从 AGENTLENS_ASKPASS_CHANNEL 读取并只输出一次）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# 刻意零依赖：本二进制被 OpenSSH 以 SSH_ASKPASS 身份执行、短暂持有明文口令，
+# 依赖面越小越好。只用 std 即可满足「读一次性通道 → 打印一次 → 退出」。
+[dependencies]
