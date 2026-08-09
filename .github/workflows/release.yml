@@ -1,0 +1,611 @@
+name: release
+
+# ===========================================================================
+# 发布流水线：release-please 驱动，draft-until-all-green。
+#
+# 形态（与 github-project-scaffold 的 release 契约一致）：
+#   push main ──▶ release-please  (维护发布 PR；PR 合并的那一次 push 才打 tag)
+#                      │ releases_created == 'true'
+#         ┌────────────┼────────────┬────────────┐
+#         ▼            ▼            ▼            ▼
+#      verify-ci   linux-deb   windows-nsis  macos-dmg   查询 CI 与构建并行
+#         └────────────┴────────────┼────────────┘
+#                                  ▼
+#                               publish  ← CI + 三平台都绿才公开 Release
+#
+# 为什么是 draft 先建、最后才发布：
+#   release-please 的 package 配置里写了 "draft": true，所以它在打完 tag 的同时
+#   建出的是 **draft** Release。三个平台各自把产物 upload 到这个 draft 上，
+#   publish job 才 `--draft=false`。任何一个平台红，Release 就永远停在 draft：
+#   缺产物的状态是**可见且可修**的，而不是对外发布了一个残包。
+#
+# 版本号：唯一事实源是根 Cargo.toml 的 [workspace.package].version，由
+# release-please 通过显式 extra-files 写入（见 release-please-config.json），
+# 本文件从不硬编码第二份版本，只回显 `make dist-version`。
+#
+# ---- 从 .github/workflows/ci.yml 原样承接的五条硬约束 --------------------
+# (1) 每条 native 命令后跟 Assert-Ok：pwsh 里 native 命令非零退出**不会**中断
+#     脚本，而 GitHub 注入的 $LASTEXITCODE 检查只反映**最后一条**命令。
+# (2) 每个 `shell: pwsh` 的 run 块严格 ASCII-only：PS 5.1 按 ANSI 解析文件，
+#     一个非 ASCII 字符就会撕裂字符串字面量，job 在 1s 内无错误文本地死掉。
+#     step 名与 YAML 注释可以是中文 —— 它们不进 pwsh 解析器。
+# (3) 绝不设置 $ErrorActionPreference：GitHub 会前置 Stop。
+# (4) 绝不在 pwsh 里给 cargo 套 2>&1：叠加 (3) 的 Stop 后，cargo 往 stderr 打的
+#     `Updating crates.io index` 这类普通噪声会变成终止性 NativeCommandError。
+# (5) macOS 打 dmg 必须 CI == "true"：tauri-bundler 只有在 CI 为 true 时才给
+#     hdiutil 传 --skip-jenkins，否则 osascript 在无头环境下以 64 退出。
+#
+# 另外：本文件任何构建/门禁步骤都没有 `|| true`，也没有 continue-on-error。
+# 把失败洗成绿正是本项目已经修过一次的缺陷。
+#
+# 本仓库尚无 git remote，这份 workflow 从未在 GitHub Actions 上执行过 ——
+# 它是 actionlint 干净的、未运行的。三平台构建步骤是 ci.yml 的原样承接，
+# 而 ci.yml 本身翻译自 AWS CodeBuild 上跑绿的 .aws/buildspec/*.yml。
+# ===========================================================================
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+# 发布流程不允许被后一次 push 取消：中途取消会留下一个装了一半产物的 draft。
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    # bash 在三个 runner 上都可用（Windows 走 Git bash），GitHub 以
+    # `bash --noprofile --norc -eo pipefail {0}` 运行它 —— 非零退出即失败。
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  NODE_VERSION: "22"
+  # 与 ci.yml 及三份 buildspec 同一枚举：0.14.0 是实测跑绿的那个。
+  ZIG_VERSION: "0.14.0"
+  MACOS_TARGET: aarch64-apple-darwin
+  MACOS_BUNDLE_CONFIG: src-tauri/tauri.bundle.macos.json
+  # git-cliff 只用来生成 Release 正文，钉死版本避免新版改模板渲染。
+  GIT_CLIFF_VERSION: "2.13.1"
+  # 约束 (5)：显式钉住，不依赖 runner 默认值。
+  CI: "true"
+
+jobs:
+  # ---- 阶段 1：release-please ---------------------------------------------
+  # 平时它只维护那个长期存在的发布 PR（累积变更 + 预演版本号与变更日志）。
+  # 只有该 PR 被合并进 main 的那一次 push，才会 releases_created == 'true'，
+  # 同时打出 tag 并建出 draft Release。
+  #
+  # 发布 PR 就是集成点：它和普通 PR 一样跑 ci.yml 的全部门禁，失败时**往同一个
+  # 分支再推修复提交**让 PR 自我修复，绝不另开 PR。
+  #
+  # squash-merge 陷阱：仓库若以 squash 合并，release-please 只看得到 squash
+  # 提交的标题。标题写成 chore:/refactor: 的 PR 会把分支里的 feat:/fix: 折叠掉，
+  # 于是**静默停止升版**。因此仓库 squash 策略必须设为 PR_TITLE，并由
+  # .github/workflows/pr-title.yml 强制 PR 标题符合 Conventional Commits。
+  release-please:
+    name: release-please（维护发布 PR、打 tag、建 draft）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      releases_created: ${{ steps.release.outputs.releases_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 回显本次判定（是否切出了新版本）
+        env:
+          RELEASES_CREATED: ${{ steps.release.outputs.releases_created }}
+          TAG_NAME: ${{ steps.release.outputs.tag_name }}
+        run: |
+          echo "releases_created = ${RELEASES_CREATED:-false}"
+          echo "tag_name         = ${TAG_NAME:-<none>}"
+
+  # ---- 阶段 2：查询 tag commit 对应的 CI 结论 -----------------------------
+  # 这里只读 Actions API，不重复 cargo/npm。它与三个构建 job 并行；唯一会把 draft
+  # 公开的 publish 同时 needs 本 job 和三个构建，因此 CI 不成功时绝无公开 Release。
+  verify-ci:
+    name: 确认 tag commit 的 CI Success
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: 轮询同一 commit 的 CI Success（超时或非 success 即失败）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG_NAME}" --jq '.sha')"
+          test -n "$tag_sha" || { echo "无法解析 ${TAG_NAME} 的 commit SHA"; exit 1; }
+          echo "tag ${TAG_NAME} -> ${tag_sha}"
+
+          run_id=''
+          for attempt in $(seq 1 120); do
+            if [ -z "$run_id" ]; then
+              run_id="$(gh api \
+                "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?branch=${DEFAULT_BRANCH}&event=push&per_page=100" \
+                --jq ".workflow_runs | map(select(.head_sha == \"${tag_sha}\")) | sort_by(.run_attempt) | last | .id // empty")"
+              if [ -n "$run_id" ]; then
+                echo "找到 CI run ${run_id}（commit ${tag_sha}）"
+              fi
+            fi
+
+            if [ -n "$run_id" ]; then
+              job_state="$(gh api \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?filter=latest&per_page=100" \
+                --jq '(.jobs | map(select(.name == "CI Success")) | last // empty) | "\(.status)|\(.conclusion // "")"')"
+              status="${job_state%%|*}"
+              conclusion="${job_state#*|}"
+
+              if [ "$status" = 'completed' ]; then
+                if [ "$conclusion" = 'success' ]; then
+                  echo "CI Success 已通过（run ${run_id}，commit ${tag_sha}）"
+                  exit 0
+                fi
+                echo "CI Success 结论为 ${conclusion:-<empty>}，拒绝公开 Release"
+                exit 1
+              fi
+
+              case "$status" in
+                ''|queued|in_progress|waiting|pending|requested)
+                  echo "等待 CI Success：attempt=${attempt}/120 status=${status:-not-created}"
+                  ;;
+                *)
+                  echo "CI Success 返回未知状态 ${status}，fail-closed"
+                  exit 1
+                  ;;
+              esac
+            else
+              echo "等待 commit ${tag_sha} 的 CI push run：attempt=${attempt}/120"
+            fi
+
+            if [ "$attempt" -lt 120 ]; then
+              sleep 60
+            fi
+          done
+
+          echo "等待 CI Success 超时，拒绝公开 Release"
+          exit 1
+
+  # ---- 阶段 2a：Linux ------------------------------------------------------
+  # 步骤与 ci.yml 的 Linux 分支逐条对应。dist-all == dist + 「aarch64 collector
+  # 必须存在」的硬要求：本 job 是 aarch64 产物的权威构建点，缺席即失败，
+  # 绝不静默产出单架构包。
+  linux-deb:
+    name: Linux deb + 双架构 musl collector
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # 必须检出 tag：main 上的 HEAD 与 tag 指向同一提交，但显式钉 tag 才能
+          # 保证产物版本号与 Release 一致，重跑时也不会漂到后续提交。
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      # 与 ci.yml / linux.yml 同一份包名清单。
+      # libayatana-appindicator3-dev 必须有：src-tauri 打开了 tray-icon feature。
+      # musl-tools 提供 musl-gcc（x86_64 collector 的 C 编译器）。
+      - name: 安装 Tauri 2 系统依赖与 musl 工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential pkg-config libssl-dev \
+            libwebkit2gtk-4.1-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            libgtk-3-dev librsvg2-dev patchelf \
+            libayatana-appindicator3-dev \
+            musl-tools \
+            curl file
+
+      - name: 安装 Rust stable 与双 musl 目标
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          rustc --version
+          cargo --version
+
+      # zig 只作为 musl 的 C 交叉编译器（rusqlite 的 bundled feature 要编 sqlite3.c）。
+      - name: 安装 zig（aarch64/x86_64 musl 的 C 交叉编译器）
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装前端依赖（npm ci，lockfile 权威）
+        run: npm --prefix frontend ci
+
+      - name: 安装 tauri-cli v2
+        run: |
+          cargo install tauri-cli --locked --version "^2"
+          cargo tauri --version
+
+      - name: 回显版本号（单一事实源自检）
+        run: make dist-version
+
+      - name: 打包 deb + 双架构 musl collector（aarch64 缺席即失败）
+        env:
+          DIST_REQUIRE_AARCH64: "1"
+        run: make dist-all
+
+      - name: 校验 deb 载荷含 askpass 与双架构 collector
+        run: |
+          ls -l artifacts/dist/
+          cat artifacts/dist/sha256sums.txt
+          deb="$(ls -1 artifacts/dist/*.deb)"
+          dpkg --contents "$deb" | tee /tmp/deb-contents.txt
+          for expected in \
+            usr/bin/agentlens-askpass \
+            usr/bin/agentlens-collector-x86_64-unknown-linux-musl \
+            usr/bin/agentlens-collector-aarch64-unknown-linux-musl
+          do
+            grep -q "$expected" /tmp/deb-contents.txt \
+              || { echo "deb 缺少 ${expected}"; exit 1; }
+          done
+
+      # 三个平台都会产出名为 sha256sums.txt 的清单：直接上传会在同一个 Release 上
+      # 撞名互相覆盖。改名后按平台隔离。两个 musl collector 只从本 job 上传
+      # （它是 aarch64 的权威构建点），其余平台不重复上传同名二进制。
+      - name: 归置发布资产（按平台隔离清单名）
+        run: |
+          mkdir -p upload
+          cp artifacts/dist/*.deb upload/
+          cp artifacts/dist/agentlens-collector-x86_64-unknown-linux-musl upload/
+          cp artifacts/dist/agentlens-collector-aarch64-unknown-linux-musl upload/
+          cp artifacts/dist/sha256sums.txt upload/sha256sums-linux.txt
+          test -n "$(ls -A upload)" || { echo "upload/ 为空，拒绝上传"; exit 1; }
+          ls -l upload/
+
+      - name: 上传资产到 draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG_NAME" upload/* --clobber
+
+  # ---- 阶段 2b：Windows ---------------------------------------------------
+  windows-nsis:
+    name: Windows NSIS 安装包
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      # 必须在 checkout 之前：autocrlf 一旦生效工作区就被写成 CRLF；
+      # core.longpaths 是 windows.yml 缺陷 (E) 的原样移植
+      # （Tauri/MSVC 输出路径会超过 MAX_PATH）。
+      - name: 固定行尾与长路径（必须在 checkout 之前）
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+          git config --global core.longpaths true
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: 安装 Rust stable 与双 musl 目标
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          rustc --version
+          cargo --version
+
+      - name: 安装 zig（musl 的 C 交叉编译器）
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装前端依赖（npm ci，lockfile 权威）
+        run: npm --prefix frontend ci
+
+      - name: 安装 tauri-cli v2
+        run: |
+          cargo install tauri-cli --locked --version "^2"
+          cargo tauri --version
+
+      # Windows 没有 musl cc，两个 Linux collector sidecar 只能靠 zig 自带的
+      # musl sysroot 交叉编译。
+      - name: 安装 cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      # sidecar 归置约定（src-tauri/tauri.bundle.windows.json 已提交，本文件不改它）：
+      #   externalBin: agentlens-askpass -> 源文件名须带 -<triple>.exe，装机时去后缀
+      #   resources  : 两个 agentlens-collector-*-unknown-linux-musl + collectors.sha256
+      # collector 刻意是 LINUX musl 二进制：AgentLens 管理的远端就是 Linux 主机。
+      # 走 resources 而非 externalBin，因为后者会强行追加 .exe，
+      # 而运行期按不带后缀的原名查找。
+      #
+      # 以下 run 块严格 ASCII-only —— 约束 (2)。Assert-Ok 是 windows.yml 的原样
+      # 移植 —— 约束 (1)。块内没有 2>&1，也不设置 $ErrorActionPreference —— 约束 (4)(3)。
+      - name: 归置 Windows sidecar（askpass + 双架构 musl collector）
+        shell: pwsh
+        run: |
+          function Assert-Ok([string]$what) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "GATE FAILED: $what exited with code $LASTEXITCODE"
+            }
+            Write-Host "gate ok: $what"
+          }
+
+          $stage = "target\dist\binaries"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          cargo build -p agentlens-askpass --release
+          Assert-Ok "cargo build -p agentlens-askpass"
+          Copy-Item "target\release\agentlens-askpass.exe" `
+            "$stage\agentlens-askpass-x86_64-pc-windows-msvc.exe" -Force
+
+          cargo zigbuild -p agentlens-collector --target x86_64-unknown-linux-musl --release
+          Assert-Ok "cargo zigbuild x86_64-unknown-linux-musl"
+          cargo zigbuild -p agentlens-collector --target aarch64-unknown-linux-musl --release
+          Assert-Ok "cargo zigbuild aarch64-unknown-linux-musl"
+          Copy-Item "target\x86_64-unknown-linux-musl\release\agentlens-collector" `
+            "$stage\agentlens-collector-x86_64-unknown-linux-musl" -Force
+          Copy-Item "target\aarch64-unknown-linux-musl\release\agentlens-collector" `
+            "$stage\agentlens-collector-aarch64-unknown-linux-musl" -Force
+
+          Push-Location $stage
+          Get-ChildItem "agentlens-collector-*" | ForEach-Object {
+            $h = (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii "collectors.sha256"
+          Get-Content "collectors.sha256" | Write-Host
+          Pop-Location
+
+          foreach ($required in @(
+            "agentlens-askpass-x86_64-pc-windows-msvc.exe",
+            "agentlens-collector-x86_64-unknown-linux-musl",
+            "agentlens-collector-aarch64-unknown-linux-musl",
+            "collectors.sha256")) {
+            if (-not (Test-Path (Join-Path $stage $required))) {
+              throw "missing sidecar: $required"
+            }
+          }
+          Get-ChildItem $stage | Format-List Name,Length | Out-String | Write-Host
+
+      # 必须从仓库根运行：在 frontend/ 下 Tauri 会 panic
+      # "Couldn't recognize the current folder as a Tauri project"。
+      # 清单改名 sha256sums-windows.txt，避免与其他平台在同一 Release 上撞名。
+      - name: 构建 NSIS 安装包并归置发布资产
+        shell: pwsh
+        run: |
+          function Assert-Ok([string]$what) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "GATE FAILED: $what exited with code $LASTEXITCODE"
+            }
+            Write-Host "gate ok: $what"
+          }
+
+          cargo tauri build --bundles nsis --config src-tauri/tauri.bundle.windows.json
+          Assert-Ok "cargo tauri build --bundles nsis"
+
+          $nsis = Get-ChildItem "target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue
+          if (-not $nsis) {
+            throw "NSIS installer not produced under target\release\bundle\nsis"
+          }
+          New-Item -ItemType Directory -Force -Path "upload" | Out-Null
+          Copy-Item $nsis.FullName "upload\" -Force
+
+          Push-Location "upload"
+          Get-ChildItem "*.exe" | ForEach-Object {
+            $h = (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii "sha256sums-windows.txt"
+          Get-Content "sha256sums-windows.txt" | Write-Host
+          Pop-Location
+
+          if (-not (Get-ChildItem "upload")) {
+            throw "upload directory is empty, refusing to upload"
+          }
+          Get-ChildItem "upload" | Format-List Name,Length | Out-String | Write-Host
+
+      - name: 上传资产到 draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG_NAME" upload/* --clobber
+
+  # ---- 阶段 2c：macOS -----------------------------------------------------
+  # 只做 aarch64-apple-darwin，不做 universal：macos-latest 是 Apple Silicon，
+  # aarch64 是免费的原生构建；包进去的 sidecar 无论宿主架构都是 Linux musl 二进制。
+  # 未签名 / 未公证：公证需要 Apple Developer 证书与 notarytool，本仓库没有这些
+  # secret，刻意不加需要不存在的 secret 的步骤。
+  macos-dmg:
+    name: macOS dmg（未签名，aarch64）
+    needs: release-please
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - name: 安装 Rust stable 与双 musl 目标
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          rustc --version
+          cargo --version
+
+      - name: 安装 zig（musl 的 C 交叉编译器）
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装前端依赖（npm ci，lockfile 权威）
+        run: npm --prefix frontend ci
+
+      - name: 安装 tauri-cli v2
+        run: |
+          cargo install tauri-cli --locked --version "^2"
+          cargo tauri --version
+
+      - name: 安装 cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: 回显版本号（单一事实源自检）
+        run: make dist-version
+
+      - name: 归置 macOS sidecar（askpass + 双架构 musl collector）
+        run: |
+          if [ ! -f "$MACOS_BUNDLE_CONFIG" ]; then
+            echo "缺少 ${MACOS_BUNDLE_CONFIG}：macOS bundle overlay 未提交"
+            exit 1
+          fi
+          cargo build -p agentlens-askpass --release --target "$MACOS_TARGET"
+          mkdir -p target/dist/binaries
+          cp "target/$MACOS_TARGET/release/agentlens-askpass" \
+            "target/dist/binaries/agentlens-askpass-$MACOS_TARGET"
+          cargo zigbuild -p agentlens-collector --target x86_64-unknown-linux-musl --release
+          cargo zigbuild -p agentlens-collector --target aarch64-unknown-linux-musl --release
+          cp target/x86_64-unknown-linux-musl/release/agentlens-collector \
+            target/dist/binaries/agentlens-collector-x86_64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/agentlens-collector \
+            target/dist/binaries/agentlens-collector-aarch64-unknown-linux-musl
+          ( cd target/dist/binaries && shasum -a 256 agentlens-collector-* > collectors.sha256 && cat collectors.sha256 )
+          chmod 0755 target/dist/binaries/*
+
+      # env.CI 显式钉死 "true" —— 约束 (5)，与 macos.yml 一致。
+      # ls -R 是从日志确认 sidecar 真的进了 .app 的唯一手段。
+      - name: 构建 .app / .dmg 并归置发布资产
+        env:
+          CI: "true"
+        run: |
+          cargo tauri build --bundles app,dmg --target "$MACOS_TARGET" --config "$MACOS_BUNDLE_CONFIG"
+          ls -R "target/$MACOS_TARGET/release/bundle/"
+          mkdir -p upload
+          cp "target/$MACOS_TARGET"/release/bundle/dmg/*.dmg upload/
+          ( cd upload && shasum -a 256 -- *.dmg > sha256sums-macos.txt && cat sha256sums-macos.txt )
+          test -n "$(ls -A upload)" || { echo "upload/ 为空，拒绝上传"; exit 1; }
+          ls -l upload/
+
+      - name: 上传资产到 draft Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG_NAME" upload/* --clobber
+
+  # ---- 阶段 3：publish ----------------------------------------------------
+  # verify-ci 与三个平台**全部**成功才会运行（needs 是 AND 语义，任一失败或被跳过
+  # 即不执行），所以 draft 只会在同 commit 的 CI 通过且产物齐全时被翻成正式 Release。
+  publish:
+    name: 三平台全绿后发布 Release
+    needs:
+      - release-please
+      - verify-ci
+      - linux-deb
+      - windows-nsis
+      - macos-dmg
+    if: needs.release-please.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+          # git-cliff 需要完整历史与 tag 才能算出 --latest 区间。
+          fetch-depth: 0
+
+      # 用钉死版本的预编译包，避免 `cargo install git-cliff` 每次多花几分钟，
+      # 也避免新版 git-cliff 改变模板渲染结果。
+      - name: 安装 git-cliff（预编译，版本钉死）
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xzf - -C /tmp
+          sudo install -m 0755 "/tmp/git-cliff-${GIT_CLIFF_VERSION}/git-cliff" /usr/local/bin/git-cliff
+          git-cliff --version
+
+      # --strip all 去掉 header/footer，只留本次版本的分组条目，正好当 Release 正文。
+      # 空正文视为失败：宁可停在 draft，也不发一个没有说明的 Release。
+      - name: 用 git-cliff 生成 Release 正文
+        env:
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          git-cliff --config cliff.toml --latest --strip all --output /tmp/release-notes.md
+          if [ ! -s /tmp/release-notes.md ]; then
+            echo "git-cliff 产出空正文，拒绝发布 ${TAG_NAME}"
+            exit 1
+          fi
+          cat /tmp/release-notes.md
+
+      # 发布前复核 draft 上的资产：三个 job 各自都断言过 upload/ 非空，这里再从
+      # Release 侧确认一次，防止上传步骤成功但资产实际没落到这个 tag 上。
+      - name: 复核 draft 资产齐全（deb / setup.exe / dmg）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          gh release view "$TAG_NAME" --json isDraft,assets \
+            --jq '.assets[].name' | tee /tmp/assets.txt
+          for pattern in '\.deb$' '\.exe$' '\.dmg$' \
+            '^sha256sums-linux\.txt$' '^sha256sums-windows\.txt$' '^sha256sums-macos\.txt$'
+          do
+            grep -qE "$pattern" /tmp/assets.txt \
+              || { echo "draft 缺少匹配 ${pattern} 的资产"; exit 1; }
+          done
+
+      - name: 翻转 draft 为正式 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          gh release edit "$TAG_NAME" \
+            --notes-file /tmp/release-notes.md \
+            --draft=false
+          state="$(gh release view "$TAG_NAME" --json isDraft --jq '.isDraft')"
+          if [ "$state" != "false" ]; then
+            echo "发布失败：${TAG_NAME} 仍是 draft"
+            exit 1
+          fi
+          echo "已发布 ${TAG_NAME}"

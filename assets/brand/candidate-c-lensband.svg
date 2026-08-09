@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AgentLens brand mark - candidate C: "Lens band"
+  Inverted mass: a solid accent lens disc split by a negative-space equator slit.
+  Positive form carries the weight, so the only thin element is the dark slit (2.25px @16).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="#0B1220"/>
+  <!-- lens disc r=405 -> 12.66px diameter @16, 107 master px plate margin -->
+  <circle cx="512" cy="512" r="405" fill="#38BDF8"/>
+  <!-- equator slit cut in plate colour: 144 master px = 2.25px @16 -->
+  <rect x="0" y="440" width="1024" height="144" fill="#0B1220"/>
+</svg>

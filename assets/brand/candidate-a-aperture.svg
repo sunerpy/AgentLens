@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AgentLens brand mark - candidate A: "Aperture"
+  Concentric lens: thick accent ring + solid center pupil on a near-black squircle plate.
+  Geometry is sized for 16x16 legibility: master is 1024px, so 1 rendered px at 16x16
+  equals 64 master px. Every accent stroke is >= 150 master px (>= 2.3px at 16x16).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- opaque squircle plate: gives background-independent contrast on light and dark shells -->
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="#0B1220"/>
+  <!-- lens barrel: ring outer r=415, inner r=245, stroke 170 master px = 2.66px @16 -->
+  <circle cx="512" cy="512" r="330" fill="none" stroke="#38BDF8" stroke-width="170"/>
+  <!-- pupil: r=130 (4.06px diameter @16); gap to ring inner edge = 115 master px = 1.80px @16 -->
+  <circle cx="512" cy="512" r="130" fill="#38BDF8"/>
+</svg>

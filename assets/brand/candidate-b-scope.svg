@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AgentLens brand mark - candidate B: "Scope"
+  Lens ring crossed by a full-width sightline / scan axis (time axis metaphor).
+  The bar intersects the ring, so no sub-pixel gaps can close up at 16x16.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="0" y="0" width="1024" height="1024" rx="224" ry="224" fill="#0B1220"/>
+  <!-- scan axis: 160 master px tall = 2.50px @16, rounded caps -->
+  <rect x="132" y="432" width="760" height="160" rx="80" ry="80" fill="#38BDF8"/>
+  <!-- lens ring: outer r=392, inner r=227, stroke 165 master px = 2.58px @16 -->
+  <circle cx="512" cy="512" r="309" fill="none" stroke="#38BDF8" stroke-width="165"/>
+</svg>

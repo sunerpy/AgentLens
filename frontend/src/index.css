@@ -1,0 +1,578 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+@import '@fontsource-variable/geist';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  /*
+   * Geist carries Latin and digits only — it has no CJK coverage at all, and this UI is
+   * majority 简体中文. Without an explicit CJK tail the browser falls through to the generic
+   * `sans-serif`, i.e. whatever the platform happens to pick, so the same screen renders in
+   * a different Chinese face on every OS and the Latin/CJK pair is never metric-matched.
+   * The tail names one good face per platform before conceding to `sans-serif`, which is why
+   * mixed 中文 + Latin runs keep a consistent x-height instead of visibly stepping.
+   *
+   * No new dependency: every fallback is a system face. Only Geist itself is bundled.
+   */
+  --font-sans:
+    'Geist Variable', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Source Han Sans SC', sans-serif;
+  /*
+   * `font-mono` was used in 15+ files (machine-id hashes, archive paths, model ids, log lines)
+   * while `--font-mono` was never declared, so those spans fell back to Tailwind's stock stack
+   * with no CJK entry — a log line mixing Chinese and ASCII broke into two unrelated faces
+   * mid-sentence. The CJK tail here is the same as `--font-sans` on purpose: Chinese glyphs are
+   * already fixed-width, so borrowing the proportional face costs no alignment and avoids a
+   * second, uglier fallback.
+   */
+  --font-mono:
+    ui-monospace, 'SFMono-Regular', 'SF Mono', 'Cascadia Mono', 'Segoe UI Mono', 'Liberation Mono',
+    Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', monospace;
+  /*
+   * The shadcn preset's eight `--color-sidebar-*` mappings USED to sit here, and the matching
+   * `--sidebar-*` values were declared under `:root` and `.dark` only. That is a preset branch
+   * nobody had ever rendered: the shell was top tabs, so no utility consumed them, and the four
+   * tinted palettes below never re-declared them. The moment a real rail used `bg-sidebar`,
+   * `forest` / `ocean` / `amber` / `violet` would each have fallen through to whichever of the
+   * two base blocks matched their `dark` class — 深海蓝 and 夜紫 in particular would have painted
+   * a LIGHT rail inside a dark theme, because `[data-theme]` and `.dark` share specificity and
+   * the tinted block had nothing to say about `--sidebar`.
+   *
+   * Rather than restate 32 more values across four palettes (a fifth theme would then have five
+   * places to remember instead of four), the rail is built from `--card` / `--border` / `--muted`
+   * — tokens all six palettes already declare and `e2e/theme.spec.ts` already exercises. Two of
+   * the preset's own sidebar values were carrying defects this file had already fixed elsewhere:
+   * `--sidebar-border: oklch(1 0 0 / 10%)` is the translucent border whose composite-against-
+   * whatever-is-behind-it problem is documented under `.dark --border`, and
+   * `--sidebar-primary: oklch(0.488 0.243 264.376)` is a hard-coded blue-violet belonging to no
+   * palette here.
+   */
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  /*
+   * Categorical series palette, separate from `--chart-*` on purpose. `--chart-1` already has a
+   * fixed semantic job (the partial-coverage hatch), so reusing that ramp for grouped trend
+   * lines would make a legend colour and a coverage colour collide.
+   *
+   * Hue order per theme is `base + [0, 120, 240, 60, 180, 300]`, never ascending: groups are
+   * assigned `--series-1` upward and most windows hold two or three, so `1..3` must be a
+   * maximally separated triad and the fill-ins still leave every adjacent pair ≥ 90° apart.
+   * Sorting these by hue or by lightness instead would hand the two commonest lines neighbouring
+   * hues. `theme.spec.ts` asserts the separation so a re-sort cannot land unnoticed.
+   *
+   * `--series-7` is off-scheme by design: near-zero chroma, reserved for the 其他 aggregate so it
+   * never competes with a named group.
+   */
+  --color-series-1: var(--series-1);
+  --color-series-2: var(--series-2);
+  --color-series-3: var(--series-3);
+  --color-series-4: var(--series-4);
+  --color-series-5: var(--series-5);
+  --color-series-6: var(--series-6);
+  --color-series-7: var(--series-7);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+  --color-titlebar: var(--titlebar);
+  --color-titlebar-foreground: var(--titlebar-foreground);
+  --color-titlebar-border: var(--titlebar-border);
+  --color-titlebar-hover: var(--titlebar-hover);
+  --color-titlebar-danger: var(--titlebar-danger);
+  --color-titlebar-danger-foreground: var(--titlebar-danger-foreground);
+  --spacing-titlebar: var(--titlebar-height);
+  --spacing-titlebar-inset: var(--titlebar-inset-start);
+  --shadow-panel: var(--elevation-panel);
+  --shadow-raised: var(--elevation-raised);
+}
+
+/*
+ * Surface model, shared by every palette below.
+ *
+ * Three tiers, and the ORDER is the point: `--background` is the recessed app canvas,
+ * `--card` is the raised data surface, `--muted` / `--secondary` are inset chips inside a card.
+ * The shadcn preset ships `--background` and `--card` at the SAME lightness (both `oklch(1 0 0)`
+ * in light mode), which is invisible on a page that is nothing but cards — a dashboard of ten
+ * cards read as one undifferentiated sheet, with only a 1.26:1 hairline hinting at the seams.
+ * Every block below therefore keeps a real lightness step between canvas and card, and `Card`
+ * carries `shadow-panel` so the step is legible even where two cards abut.
+ */
+:root {
+  --background: oklch(0.972 0.002 264);
+  --foreground: oklch(0.16 0.004 264);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.16 0.004 264);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.16 0.004 264);
+  --primary: oklch(0.22 0.006 264);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.955 0.003 264);
+  --secondary-foreground: oklch(0.24 0.006 264);
+  --muted: oklch(0.96 0.003 264);
+  --muted-foreground: oklch(0.505 0.008 264);
+  --accent: oklch(0.938 0.005 264);
+  --accent-foreground: oklch(0.24 0.008 264);
+  --destructive: oklch(0.55 0.2 27);
+  --border: oklch(0.885 0.004 264);
+  --input: oklch(0.86 0.005 264);
+  /*
+   * Focus ring, not decoration: WCAG 1.4.11 wants 3:1 for the visuals that identify a control,
+   * and the preset's `oklch(0.708 0 0)` measured 2.59:1 on white — a focus ring you cannot see.
+   * Mid-graphite clears 5:1 on the card and still reads against the near-black `--primary` fill,
+   * so one token serves both the light surfaces and the dark button.
+   */
+  --ring: oklch(0.56 0.006 264);
+  /*
+   * `--chart-1` is the partial-coverage hatch, a wash drawn BEHIND the data. At the preset's
+   * `oklch(0.87 0 0)` it measured 1.48:1 on white, i.e. the "this bucket is only partly covered"
+   * warning was invisible in the default theme. Warm gold at a real chroma reads as an
+   * intentional band without competing with a stroked line.
+   */
+  --chart-1: oklch(0.78 0.13 82);
+  --chart-2: oklch(0.58 0.11 172);
+  --chart-3: oklch(0.52 0.09 218);
+  --chart-4: oklch(0.46 0.17 264);
+  --chart-5: oklch(0.3 0.075 264);
+  --series-1: oklch(0.5 0.15 258);
+  --series-2: oklch(0.53 0.18 18);
+  --series-3: oklch(0.5 0.13 138);
+  --series-4: oklch(0.5 0.16 318);
+  --series-5: oklch(0.57 0.115 78);
+  --series-6: oklch(0.52 0.085 198);
+  --series-7: oklch(0.48 0.025 280);
+  --radius: 0.625rem;
+
+  /*
+   * Invariant: `--titlebar` steps AWAY from `--card` across `--background`, so an undecorated
+   * window still reads as OS chrome rather than page content. It used to be specified as
+   * "between background and card", which only worked while those two were equal; now that the
+   * canvas is recessed below the card, "between" would put the chrome *lighter* than the page
+   * it frames and the window would read upside down.
+   */
+  --titlebar: oklch(0.948 0.003 264);
+  --titlebar-foreground: oklch(0.44 0.006 264);
+  --titlebar-border: oklch(0.878 0.004 264);
+  --titlebar-hover: oklch(0.905 0.005 264);
+  --titlebar-danger: oklch(0.55 0.2 27);
+  --titlebar-danger-foreground: oklch(0.99 0 0);
+  --titlebar-height: 2.25rem;
+  /*
+   * Leading inset reserved for the macOS traffic lights. Zero everywhere else, because
+   * Windows/Linux draw their own buttons on the trailing edge instead. Overridden by
+   * `[data-platform='macos']` below — this only works because the `@theme` block is
+   * `inline`, so `--spacing-titlebar-inset` resolves at the use site, not at build time.
+   */
+  --titlebar-inset-start: 0rem;
+
+  --elevation-panel:
+    0 1px 2px 0 oklch(0.16 0.01 264 / 0.06), 0 1px 1px -0.5px oklch(0.16 0.01 264 / 0.04);
+  --elevation-raised:
+    0 4px 12px -2px oklch(0.16 0.01 264 / 0.1), 0 2px 4px -2px oklch(0.16 0.01 264 / 0.06);
+}
+
+[data-platform='macos'] {
+  /*
+   * 20px trafficLightPosition.x + 2×20px button pitch + 12px button width = 72px, plus
+   * 8px breathing room. Keep in sync with `trafficLightPosition` in
+   * `src-tauri/tauri.macos.conf.json`.
+   */
+  --titlebar-inset-start: 5rem;
+}
+
+.dark {
+  --background: oklch(0.16 0.003 264);
+  --foreground: oklch(0.97 0.002 264);
+  --card: oklch(0.213 0.005 264);
+  --card-foreground: oklch(0.97 0.002 264);
+  --popover: oklch(0.225 0.005 264);
+  --popover-foreground: oklch(0.97 0.002 264);
+  --primary: oklch(0.93 0.003 264);
+  --primary-foreground: oklch(0.19 0.005 264);
+  --secondary: oklch(0.275 0.006 264);
+  --secondary-foreground: oklch(0.97 0.002 264);
+  --muted: oklch(0.268 0.006 264);
+  --muted-foreground: oklch(0.72 0.006 264);
+  --accent: oklch(0.315 0.008 264);
+  --accent-foreground: oklch(0.98 0.002 264);
+  --destructive: oklch(0.68 0.19 24);
+  /*
+   * Solid, not the preset's `oklch(1 0 0 / 10%)`. A translucent border composites against
+   * whatever sits behind it, so the same token drew a visible seam on the canvas and an almost
+   * invisible one on a card — exactly where a card edge matters most. A solid value one step
+   * above `--card` is the same colour everywhere it is used.
+   */
+  --border: oklch(0.305 0.007 264);
+  --input: oklch(0.355 0.008 264);
+  --ring: oklch(0.62 0.01 264);
+  /*
+   * The preset ships the SAME chart ramp in light and dark, which was harmless while nothing
+   * ever added the `dark` class — the theme picker is the first thing that does, and it exposed
+   * `--chart-5` at L 0.269 drawing the primary trend line onto an L 0.145 background, i.e. an
+   * invisible chart. On a dark surface the ramp must run away from the background, so lightness
+   * reads 2 < 4 < 5 with `--chart-5` (Token 合计) brightest.
+   *
+   * Hues are assigned, not inherited: `--chart-4` (实际成本) and `--chart-2` (估算成本) are
+   * stroked into the same chart as two filled areas with no dash to tell them apart, so colour
+   * is their only separator and they are held ≥90° apart. The preset left both neutral grey,
+   * which made the two cost series one series.
+   */
+  --chart-1: oklch(0.79 0.12 74);
+  --chart-2: oklch(0.7 0.13 172);
+  --chart-3: oklch(0.74 0.1 218);
+  --chart-4: oklch(0.8 0.1 264);
+  --chart-5: oklch(0.93 0.03 264);
+  --series-1: oklch(0.72 0.14 258);
+  --series-2: oklch(0.71 0.16 18);
+  --series-3: oklch(0.77 0.14 138);
+  --series-4: oklch(0.74 0.15 318);
+  --series-5: oklch(0.83 0.13 78);
+  --series-6: oklch(0.78 0.1 198);
+  --series-7: oklch(0.7 0.025 280);
+
+  --titlebar: oklch(0.128 0.003 264);
+  --titlebar-foreground: oklch(0.72 0.006 264);
+  --titlebar-border: oklch(0.27 0.006 264);
+  --titlebar-hover: oklch(0.255 0.008 264);
+  --titlebar-danger: oklch(0.55 0.2 25);
+  --titlebar-danger-foreground: oklch(0.985 0 0);
+
+  --elevation-panel: 0 1px 2px 0 oklch(0 0 0 / 0.45), 0 1px 1px -0.5px oklch(0 0 0 / 0.35);
+  --elevation-raised: 0 8px 24px -4px oklch(0 0 0 / 0.6), 0 2px 6px -2px oklch(0 0 0 / 0.4);
+}
+
+/*
+ * Colour themes.
+ *
+ * Two mechanisms, deliberately kept separate:
+ * - `data-theme` on <html> selects the palette. Every block below is a *partial* override; the
+ *   tokens it omits fall through to `:root` (light themes) or `.dark` (dark themes).
+ * - the `dark` class is applied in addition, for the dark-mode themes only, because
+ *   `@custom-variant dark (&:is(.dark *))` is what any `dark:` utility keys off. A dark theme
+ *   therefore carries BOTH `class="dark"` and its own `data-theme`.
+ *
+ * Ordering matters and is load-bearing: `[data-theme='…']` and `.dark` have identical
+ * specificity (0,1,0), so these blocks must stay *after* `.dark` to win the cascade.
+ *
+ * The shell's left rail draws from `--card` / `--border` / `--muted`, which every block below
+ * already declares, so a new palette gets a correct rail for free. Do NOT reintroduce
+ * `--sidebar-*`: the reason is recorded in the `@theme` block above.
+ *
+ * Invariants carried into every block:
+ *
+ * - `--chart-1` is the partial-coverage hatch. It stays in the warm gold band (hue 78–98) at a
+ *   real chroma, held ≥40° off every stroked line, so a coverage wash can never be read as data.
+ * - `--chart-2` / `--chart-4` / `--chart-5` are the stroked ungrouped lines and must run AWAY
+ *   from `--background` in lightness — ascending on a dark surface, descending on a light one,
+ *   with `--chart-5` (Token 合计) furthest — because a line at the surface's own lightness is
+ *   invisible rather than merely off-palette.
+ * - `--chart-4` (实际成本) and `--chart-2` (估算成本) are additionally held ≥90° APART in hue.
+ *   Lightness alone is not enough for these two: they are the only pair that renders into one
+ *   chart simultaneously, both as solid filled areas with no dash to separate them, so colour is
+ *   the whole distinction. Every theme originally tinted both toward its own accent hue, which
+ *   made the two cost series read as one line at two brightnesses.
+ * - the canvas keeps LOW chroma even in the tinted themes. A saturated field competes with the
+ *   `--series-*` legend colours drawn on top of it, and the accent hue belongs on the accent,
+ *   not on 100% of the pixels.
+ * - `--titlebar` steps away from `--card` across `--background`, so an undecorated window still
+ *   reads as OS chrome.
+ *
+ * `e2e/theme.spec.ts` asserts the lightness ramp, the hatch's presence and the `--series-*`
+ * hue separation; the co-rendered `--chart-2` / `--chart-4` hue gap is a design rule enforced by
+ * review, since the spec reads tokens rather than the chart that consumes them.
+ */
+
+/*
+ * Light · cool green.
+ *
+ * Canvas and card were 0.010 apart in lightness here, which is below the threshold where an
+ * edge is perceptible at all — this palette had the flattest cards of the six. The step is now
+ * 0.027 with a stronger border, and the canvas chroma is halved so the green reads as paper
+ * rather than as a tint laid over the data.
+ */
+[data-theme='forest'] {
+  --background: oklch(0.968 0.007 156);
+  --foreground: oklch(0.19 0.022 158);
+  --card: oklch(0.995 0.003 156);
+  --card-foreground: oklch(0.19 0.022 158);
+  --popover: oklch(0.995 0.003 156);
+  --popover-foreground: oklch(0.19 0.022 158);
+  --primary: oklch(0.42 0.095 158);
+  --primary-foreground: oklch(0.99 0.012 156);
+  --secondary: oklch(0.948 0.012 156);
+  --secondary-foreground: oklch(0.26 0.035 158);
+  --muted: oklch(0.952 0.011 156);
+  --muted-foreground: oklch(0.475 0.024 158);
+  --accent: oklch(0.925 0.03 156);
+  --accent-foreground: oklch(0.28 0.05 158);
+  --destructive: oklch(0.55 0.2 25);
+  --border: oklch(0.878 0.016 156);
+  --input: oklch(0.85 0.02 156);
+  --ring: oklch(0.52 0.1 158);
+  --chart-1: oklch(0.78 0.13 84);
+  --chart-2: oklch(0.6 0.12 250);
+  --chart-3: oklch(0.53 0.09 205);
+  --chart-4: oklch(0.46 0.105 158);
+  --chart-5: oklch(0.28 0.06 162);
+
+  --titlebar: oklch(0.942 0.012 156);
+  --titlebar-foreground: oklch(0.43 0.022 158);
+  --titlebar-border: oklch(0.872 0.018 156);
+  --titlebar-hover: oklch(0.9 0.022 156);
+  --titlebar-danger: oklch(0.55 0.2 25);
+  --titlebar-danger-foreground: oklch(0.99 0 0);
+
+  --elevation-panel:
+    0 1px 2px 0 oklch(0.19 0.04 158 / 0.07), 0 1px 1px -0.5px oklch(0.19 0.04 158 / 0.05);
+  --elevation-raised:
+    0 4px 12px -2px oklch(0.19 0.04 158 / 0.12), 0 2px 4px -2px oklch(0.19 0.04 158 / 0.08);
+
+  --series-1: oklch(0.47 0.11 157);
+  --series-2: oklch(0.5 0.16 277);
+  --series-3: oklch(0.55 0.15 37);
+  --series-4: oklch(0.52 0.09 217);
+  --series-5: oklch(0.57 0.115 97);
+  --series-6: oklch(0.52 0.18 337);
+  --series-7: oklch(0.47 0.028 200);
+}
+
+/*
+ * Dark · deep blue.
+ *
+ * `--chart-2` moves off blue entirely (250° → 152°) because the old ramp put the two cost series
+ * at 205° and 228°: 23° apart, which is one blue line drawn twice. The canvas also drops from
+ * chroma 0.024 to 0.016 — a saturated blue field made every cool `--series-*` line sit on a
+ * near-relative of itself.
+ */
+[data-theme='ocean'] {
+  --background: oklch(0.175 0.016 252);
+  --foreground: oklch(0.955 0.01 240);
+  --card: oklch(0.235 0.021 252);
+  --card-foreground: oklch(0.955 0.01 240);
+  --popover: oklch(0.245 0.022 252);
+  --popover-foreground: oklch(0.955 0.01 240);
+  --primary: oklch(0.72 0.13 232);
+  --primary-foreground: oklch(0.16 0.03 252);
+  --secondary: oklch(0.295 0.026 252);
+  --secondary-foreground: oklch(0.955 0.01 240);
+  --muted: oklch(0.288 0.024 252);
+  --muted-foreground: oklch(0.735 0.024 240);
+  --accent: oklch(0.335 0.042 245);
+  --accent-foreground: oklch(0.965 0.014 240);
+  --destructive: oklch(0.68 0.18 22);
+  --border: oklch(0.325 0.03 250);
+  --input: oklch(0.375 0.035 250);
+  --ring: oklch(0.66 0.12 232);
+  --chart-1: oklch(0.8 0.12 74);
+  --chart-2: oklch(0.68 0.13 152);
+  --chart-3: oklch(0.74 0.1 196);
+  --chart-4: oklch(0.8 0.1 252);
+  --chart-5: oklch(0.93 0.035 236);
+
+  --titlebar: oklch(0.14 0.014 252);
+  --titlebar-foreground: oklch(0.75 0.024 240);
+  --titlebar-border: oklch(0.29 0.026 250);
+  --titlebar-hover: oklch(0.275 0.03 250);
+  --titlebar-danger: oklch(0.56 0.19 24);
+  --titlebar-danger-foreground: oklch(0.97 0.01 240);
+
+  --elevation-panel:
+    0 1px 2px 0 oklch(0.06 0.03 252 / 0.55), 0 1px 1px -0.5px oklch(0.06 0.03 252 / 0.4);
+  --elevation-raised:
+    0 8px 24px -4px oklch(0.06 0.03 252 / 0.65), 0 2px 6px -2px oklch(0.06 0.03 252 / 0.45);
+
+  --series-1: oklch(0.78 0.13 232);
+  --series-2: oklch(0.76 0.15 352);
+  --series-3: oklch(0.84 0.14 112);
+  --series-4: oklch(0.76 0.13 292);
+  --series-5: oklch(0.79 0.13 52);
+  --series-6: oklch(0.81 0.12 172);
+  --series-7: oklch(0.73 0.028 240);
+}
+
+/*
+ * Light · warm clay on sand. Replanted from dark to light, and its accent moved off amber.
+ *
+ * Two reasons, both structural rather than taste. First, this palette's accent hue WAS the gold
+ * band that `--chart-1` reserves for the partial-coverage hatch, so the theme's own accent and
+ * its "data is incomplete" warning were the same colour by construction — and its cost pair sat
+ * at 56° and 68°, 12° apart, the worst of the six. Moving the accent to clay (42°) and the hatch
+ * to olive-gold (98°) separates all three. Second, the registry ran 2 light / 4 dark; a warm
+ * light paper theme is the one thing the set had no version of, while a fourth dark palette was
+ * the most redundant. `THEME_MODE.amber` in `themes.ts` flips with it — the two files must agree
+ * or the shell renders half-light, half-dark.
+ */
+[data-theme='amber'] {
+  --background: oklch(0.976 0.009 78);
+  --foreground: oklch(0.2 0.018 48);
+  --card: oklch(0.998 0.004 78);
+  --card-foreground: oklch(0.2 0.018 48);
+  --popover: oklch(0.998 0.004 78);
+  --popover-foreground: oklch(0.2 0.018 48);
+  --primary: oklch(0.5 0.13 44);
+  --primary-foreground: oklch(0.99 0.01 78);
+  --secondary: oklch(0.955 0.016 78);
+  --secondary-foreground: oklch(0.28 0.03 48);
+  --muted: oklch(0.958 0.014 78);
+  --muted-foreground: oklch(0.485 0.022 52);
+  --accent: oklch(0.932 0.032 72);
+  --accent-foreground: oklch(0.3 0.05 44);
+  --destructive: oklch(0.53 0.21 27);
+  --border: oklch(0.884 0.02 76);
+  --input: oklch(0.855 0.024 76);
+  --ring: oklch(0.58 0.13 44);
+  --chart-1: oklch(0.76 0.13 98);
+  --chart-2: oklch(0.6 0.1 196);
+  --chart-3: oklch(0.54 0.1 236);
+  --chart-4: oklch(0.5 0.15 42);
+  --chart-5: oklch(0.3 0.08 44);
+
+  --titlebar: oklch(0.95 0.016 78);
+  --titlebar-foreground: oklch(0.44 0.022 52);
+  --titlebar-border: oklch(0.878 0.022 76);
+  --titlebar-hover: oklch(0.906 0.026 76);
+  --titlebar-danger: oklch(0.53 0.21 27);
+  --titlebar-danger-foreground: oklch(0.99 0.008 78);
+
+  --elevation-panel:
+    0 1px 2px 0 oklch(0.24 0.05 52 / 0.08), 0 1px 1px -0.5px oklch(0.24 0.05 52 / 0.05);
+  --elevation-raised:
+    0 4px 12px -2px oklch(0.24 0.05 52 / 0.13), 0 2px 4px -2px oklch(0.24 0.05 52 / 0.09);
+
+  --series-1: oklch(0.53 0.15 42);
+  --series-2: oklch(0.5 0.11 162);
+  --series-3: oklch(0.5 0.17 282);
+  --series-4: oklch(0.53 0.11 102);
+  --series-5: oklch(0.52 0.095 222);
+  --series-6: oklch(0.52 0.18 342);
+  --series-7: oklch(0.48 0.025 60);
+}
+
+/*
+ * Dark · violet.
+ *
+ * Same correction as ocean: the cost pair was at 288° and 302°, 14° apart, so `--chart-2` moves
+ * to teal (176°) while `--chart-4` keeps the accent violet. Canvas chroma drops 0.026 → 0.018,
+ * because violet at full strength across the whole canvas is the tint most likely to make a
+ * dashboard look coloured-in rather than themed.
+ */
+[data-theme='violet'] {
+  --background: oklch(0.17 0.018 300);
+  --foreground: oklch(0.955 0.012 300);
+  --card: oklch(0.228 0.024 302);
+  --card-foreground: oklch(0.955 0.012 300);
+  --popover: oklch(0.238 0.025 302);
+  --popover-foreground: oklch(0.955 0.012 300);
+  --primary: oklch(0.73 0.15 302);
+  --primary-foreground: oklch(0.16 0.035 300);
+  --secondary: oklch(0.292 0.028 302);
+  --secondary-foreground: oklch(0.955 0.012 300);
+  --muted: oklch(0.285 0.026 302);
+  --muted-foreground: oklch(0.735 0.026 300);
+  --accent: oklch(0.33 0.046 302);
+  --accent-foreground: oklch(0.965 0.016 300);
+  --destructive: oklch(0.68 0.19 20);
+  --border: oklch(0.325 0.032 302);
+  --input: oklch(0.375 0.038 302);
+  --ring: oklch(0.67 0.14 302);
+  --chart-1: oklch(0.8 0.12 76);
+  --chart-2: oklch(0.68 0.125 176);
+  --chart-3: oklch(0.74 0.11 232);
+  --chart-4: oklch(0.79 0.125 302);
+  --chart-5: oklch(0.93 0.035 300);
+
+  --titlebar: oklch(0.135 0.016 300);
+  --titlebar-foreground: oklch(0.755 0.026 300);
+  --titlebar-border: oklch(0.29 0.028 302);
+  --titlebar-hover: oklch(0.275 0.032 302);
+  --titlebar-danger: oklch(0.56 0.19 22);
+  --titlebar-danger-foreground: oklch(0.97 0.012 300);
+
+  --elevation-panel:
+    0 1px 2px 0 oklch(0.06 0.03 300 / 0.55), 0 1px 1px -0.5px oklch(0.06 0.03 300 / 0.4);
+  --elevation-raised:
+    0 8px 24px -4px oklch(0.06 0.03 300 / 0.65), 0 2px 6px -2px oklch(0.06 0.03 300 / 0.45);
+
+  --series-1: oklch(0.78 0.13 300);
+  --series-2: oklch(0.84 0.105 60);
+  --series-3: oklch(0.8 0.12 180);
+  --series-4: oklch(0.75 0.16 0);
+  --series-5: oklch(0.83 0.14 120);
+  --series-6: oklch(0.75 0.14 240);
+  --series-7: oklch(0.73 0.028 300);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+    /*
+     * Geist is a light-stemmed face and this UI is dense; without subpixel-off smoothing the
+     * Latin text renders visibly heavier than the CJK it sits beside on the same line.
+     */
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /*
+   * Every number in a table is a figure to be COMPARED down its column, so proportional digits
+   * are a defect here, not a preference: with them, `111` is narrower than `999` and a column of
+   * token counts stops lining up at the decimal. `tabular-nums` was already applied by hand in a
+   * dozen places, which is the shape of a rule that belongs in one — a new column could forget it
+   * and nothing would fail.
+   */
+  th,
+  td {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /*
+   * Selection policy — deny-list on chrome, NOT the usual `body { user-select: none }` plus
+   * an allow-list. This app exists to show data the user copies out: the 64-hex machine-id
+   * hash, archive paths, model ids, and the `code`/`fields` of an IPC error. An allow-list
+   * makes every new data surface opt in and fails silently when one forgets; this fails the
+   * harmless way, leaving a caption selectable.
+   *
+   * Only pure affordance is listed: control labels (`button` covers nav tabs, titlebar
+   * controls and action buttons), field captions (`label`), and the caption half of a
+   * definition list (`dt` — `dd` stays selectable, which is what keeps the host id and
+   * machine-id hash drag-copyable).
+   */
+  button,
+  label,
+  dt {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+}

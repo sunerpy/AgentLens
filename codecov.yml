@@ -1,0 +1,51 @@
+# Codecov 配置 —— 覆盖率状态门禁与排除集
+#
+# 地板 90%：与 Makefile 的 COVERAGE_MIN 同一个数字，两侧必须一致。
+# 取值依据是 2026-08-06 Linux `cargo llvm-cov --workspace` 实测行覆盖率
+# 91.63%（基线 15894/17346；门禁复验 15895/17346），相对硬地板留 1.63pp 余量。
+# 复验分母稳定、命中仅差 1 行（约 0.006pp）；历史上 76.92%（12025/15633）与
+# 79.56%（11252/14143）的分母不同，来自代码或插桩范围不同，不是 runner 随机漂移。
+# 后续棘轮仍只在覆盖率稳定提高后，把这里与 Makefile 一起逐档上调。注意 11 个 #[ignore]
+# 用例（需要约 43 GB
+# 真实归档库、外部二进制或真实 OS secret service）不参与统计，天花板本就低于纸面。
+#
+# 数据同源：CI 只在 ubuntu job 上传 artifacts/coverage/lcov.info，正是
+# `make coverage-gate` 判定门槛时读 LF/LH 的同一份字节。三平台都传会让同一份
+# 代码被重复计数，所以 windows / macos job 不产也不传覆盖率。
+#
+# threshold 1%：吸收插桩噪声（不同 runner 上分支计数会有极小抖动），不是放水口 ——
+# 真正的硬地板是 CI 里的 make coverage-gate，它在覆盖率低于 90 时直接让 job 失败，
+# 不依赖 Codecov 的状态检查。
+coverage:
+  status:
+    project:
+      default:
+        target: 90%
+        threshold: 1%
+    patch:
+      default:
+        target: 90%
+        threshold: 1%
+
+# 排除集与 `make coverage` 实际统计的范围保持一致，避免本地数字与面板数字漂移。
+# 实测口径（2026-08-06，`grep '^SF:' artifacts/coverage/lcov.info`）：
+# cargo-llvm-cov --workspace 插桩 4 个 workspace 成员的 src/ 下 Rust 文件
+#   crates/agentlens-askpass/src/    crates/agentlens-collector/src/
+#   crates/agentlens-core/src/       src-tauri/src/
+# 因此下面列出的都是**报告里本来就没有**的路径，写出来是为了让口径显式、可核对，
+# 而不是为了把已统计的代码摘出去 —— 没有任何一个 src/ 下的文件被排除。
+ignore:
+  # 前端是 Vitest 覆盖率，与 Rust 的 lcov 不是同一套口径，本仓库不上传它。
+  - "frontend/**"
+  # ts-rs + prettier 生成物，格式与内容由 bindings 零漂移门禁固定。
+  - "frontend/src/generated/**"
+  # 集成测试自身不计入被测代码（crates/agentlens-core/tests/ 未出现在 lcov 中）。
+  - "**/tests/**"
+  # 构建脚本在 cargo 的 build 阶段运行，不在插桩测试进程内。
+  - "**/build.rs"
+  # 非产品代码：门禁脚本、文档、CI 配置、编排层运行期状态。
+  - "scripts/**"
+  - "docs/**"
+  - ".github/**"
+  - ".aws/**"
+  - ".omo/**"
