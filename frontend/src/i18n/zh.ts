@@ -19,7 +19,7 @@ export const zh = {
     close: '关闭',
   },
 
-  /** 顶部导航标签（外壳独占）。 */
+  /** 左侧栏导航标签（外壳独占）。 */
   nav: {
     overview: '总览',
     drilldown: '用量分析',
@@ -27,6 +27,23 @@ export const zh = {
     hosts: '主机',
     settings: '设置',
     diagnostics: '日志',
+  },
+
+  /**
+   * 左侧栏自身的操作文案（外壳独占）。
+   *
+   * 收缩态只剩图标，读屏用户拿不到可见文字，所以每个导航项在该状态下都要用 `nav` 里的
+   * 同一条文案兜 `aria-label` 与 `title`；这里只放侧栏控件自己的文案。
+   */
+  sidebar: {
+    label: '主导航',
+    collapse: '收起侧栏',
+    expand: '展开侧栏',
+    hide: '隐藏侧栏',
+    show: '显示侧栏',
+    pin: '固定侧栏（挤压内容）',
+    unpin: '浮动侧栏（覆盖内容）',
+    resize: '调整侧栏宽度',
   },
 
   /**

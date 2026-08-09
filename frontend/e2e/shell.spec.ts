@@ -8,6 +8,10 @@ import { mockCalls, openShell, qaScreenshot } from './harness'
  *
  * Every assertion waits on an explicit locator or an `expect.poll`, never on a fixed
  * timeout, so the spec is deterministic rather than timing-sensitive.
+ *
+ * Navigation lives in the left rail now, not a top tab strip. The `nav-<key>` testids and the
+ * `aria-selected` contract are unchanged, so the switching assertions below still hold; the
+ * rail's own three states are covered by `sidebar.spec.ts`.
  */
 
 /**

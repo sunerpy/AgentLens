@@ -31,14 +31,25 @@
   --font-mono:
     ui-monospace, 'SFMono-Regular', 'SF Mono', 'Cascadia Mono', 'Segoe UI Mono', 'Liberation Mono',
     Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', monospace;
-  --color-sidebar-ring: var(--sidebar-ring);
-  --color-sidebar-border: var(--sidebar-border);
-  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-  --color-sidebar-accent: var(--sidebar-accent);
-  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-  --color-sidebar-primary: var(--sidebar-primary);
-  --color-sidebar-foreground: var(--sidebar-foreground);
-  --color-sidebar: var(--sidebar);
+  /*
+   * The shadcn preset's eight `--color-sidebar-*` mappings USED to sit here, and the matching
+   * `--sidebar-*` values were declared under `:root` and `.dark` only. That is a preset branch
+   * nobody had ever rendered: the shell was top tabs, so no utility consumed them, and the four
+   * tinted palettes below never re-declared them. The moment a real rail used `bg-sidebar`,
+   * `forest` / `ocean` / `amber` / `violet` would each have fallen through to whichever of the
+   * two base blocks matched their `dark` class — 深海蓝 and 夜紫 in particular would have painted
+   * a LIGHT rail inside a dark theme, because `[data-theme]` and `.dark` share specificity and
+   * the tinted block had nothing to say about `--sidebar`.
+   *
+   * Rather than restate 32 more values across four palettes (a fifth theme would then have five
+   * places to remember instead of four), the rail is built from `--card` / `--border` / `--muted`
+   * — tokens all six palettes already declare and `e2e/theme.spec.ts` already exercises. Two of
+   * the preset's own sidebar values were carrying defects this file had already fixed elsewhere:
+   * `--sidebar-border: oklch(1 0 0 / 10%)` is the translucent border whose composite-against-
+   * whatever-is-behind-it problem is documented under `.dark --border`, and
+   * `--sidebar-primary: oklch(0.488 0.243 264.376)` is a hard-coded blue-violet belonging to no
+   * palette here.
+   */
   --color-chart-5: var(--chart-5);
   --color-chart-4: var(--chart-4);
   --color-chart-3: var(--chart-3);
@@ -157,14 +168,6 @@
   --series-6: oklch(0.52 0.085 198);
   --series-7: oklch(0.48 0.025 280);
   --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
 
   /*
    * Invariant: `--titlebar` steps AWAY from `--card` across `--background`, so an undecorated
@@ -252,14 +255,6 @@
   --series-5: oklch(0.83 0.13 78);
   --series-6: oklch(0.78 0.1 198);
   --series-7: oklch(0.7 0.025 280);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
-  --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
 
   --titlebar: oklch(0.128 0.003 264);
   --titlebar-foreground: oklch(0.72 0.006 264);
@@ -285,8 +280,9 @@
  * Ordering matters and is load-bearing: `[data-theme='…']` and `.dark` have identical
  * specificity (0,1,0), so these blocks must stay *after* `.dark` to win the cascade.
  *
- * `--sidebar-*` is intentionally not re-declared: the shell is five top tabs with no sidebar,
- * so those shadcn tokens have no consumer and re-stating them four times would be dead weight.
+ * The shell's left rail draws from `--card` / `--border` / `--muted`, which every block below
+ * already declares, so a new palette gets a correct rail for free. Do NOT reintroduce
+ * `--sidebar-*`: the reason is recorded in the `@theme` block above.
  *
  * Invariants carried into every block:
  *
