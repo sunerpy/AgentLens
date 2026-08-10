@@ -16,6 +16,7 @@ other three are enabled per host by ticking them on the host card.
 
 ## Table of Contents
 
+- [Screenshots](#screenshots)
 - [Highlights](#highlights)
 - [Install](#install)
 - [Quick Start](#quick-start)
@@ -24,6 +25,37 @@ other three are enabled per host by ticking them on the host card.
 - [Development](#development)
 - [Documentation](#documentation)
 - [License](#license)
+
+## Screenshots
+
+Overview: the three-state rail on the left, then range and granularity, the four
+token buckets, the cost card and the usage trend chart. Cost is layered into
+actual / estimated / missing and never summed, and each layer carries its own
+coverage share and price per million tokens — that unit price is the only number
+on the card it is safe to compare across layers. Hatched spans in the chart are
+buckets with no data coverage, tinted spans are partial coverage, neither is
+treated as a zero, and the footer names the exact host / source pair whose
+collection window is missing.
+
+![Overview page](../../assets/screenshots/overview.png)
+
+The same trend chart grouped by model, in the Deep Ocean theme. Grouping offers
+none / model / agent / tool, and six themes switch in place from the header. The
+rail expands, collapses to a 64px icon strip, or hides entirely.
+
+![Overview grouped by model, Deep Ocean theme](../../assets/screenshots/overview-by-model-dark.png)
+
+Usage analysis: a source → agent → model drilldown that shares range and timezone
+state with the overview. Rows with no price carry a "cost missing" marker instead
+of a fabricated 0, and each share is computed against its own level's token total.
+
+![Three-level drilldown on the usage analysis page](../../assets/screenshots/usage-drilldown.png)
+
+Hosts: the local machine and SSH remotes side by side, with collection sources
+ticked per host card. Only OpenCode is on by default; Claude Code, Codex and
+Hermes have to be enabled explicitly.
+
+![Host management page](../../assets/screenshots/hosts.png)
 
 ## Highlights
 
