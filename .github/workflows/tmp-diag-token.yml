@@ -44,12 +44,12 @@ jobs:
             fi
           }
 
-          try "B draft + target_commitish=SHA（已知 403，本轮抓 header）" \
+          try "B draft + target_commitish=陈旧 SHA 969e303（已知 403）" \
             "{\"tag_name\":\"tmp-diag-b\",\"draft\":true,\"name\":\"diag-b\",\"target_commitish\":\"${RELEASE_SHA}\"}"
-          try "D draft + target_commitish=main（分支名）" \
-            '{"tag_name":"tmp-diag-d","draft":true,"name":"diag-d","target_commitish":"main"}'
-          try "E 非 draft + target_commitish=main（会真的建 tag）" \
-            '{"tag_name":"tmp-diag-e","draft":false,"name":"diag-e","target_commitish":"main"}'
+          try "F draft + target_commitish=当前 main tip 的 SHA" \
+            "{\"tag_name\":\"tmp-diag-f\",\"draft\":true,\"name\":\"diag-f\",\"target_commitish\":\"${GITHUB_SHA}\"}"
+          try "G 非 draft + target_commitish=当前 main tip 的 SHA（真建 tag）" \
+            "{\"tag_name\":\"tmp-diag-g\",\"draft\":false,\"name\":\"diag-g\",\"target_commitish\":\"${GITHUB_SHA}\"}"
 
       - name: 直接试 createRef（建 tag ref）并抓 header
         env:
