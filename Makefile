@@ -2,6 +2,8 @@
 # 依赖：cargo、rustup 组件 rustfmt/clippy、npm、cargo-tauri（cargo install tauri-cli --locked）
 # 打包额外依赖：rustup target x86_64-unknown-linux-musl / aarch64-unknown-linux-musl、
 #              musl-gcc（x86_64）、aarch64 musl C 交叉编译器（见 dist-collector-aarch64）。
+# Windows 交叉编译额外依赖：rustup target x86_64-pc-windows-msvc、cargo-xwin、
+#              lld-link、clang（提供 clang-cl 入口）、makensis、7z（见 dist-windows-toolchain）。
 
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
@@ -35,6 +37,52 @@ DEB_DIR := target/release/bundle/deb
 COLLECTOR_X86_BUILT := target/$(MUSL_X86_TARGET)/release/agentlens-collector
 COLLECTOR_ARM_BUILT := target/$(MUSL_ARM_TARGET)/release/agentlens-collector
 ASKPASS_BUILT := target/release/$(ASKPASS_BIN)
+
+# ---------------------------------------------------------------------------
+# Windows 交叉编译（Linux 主机 → x86_64-pc-windows-msvc，产出 NSIS 安装包）
+#
+# 这是第三条 Windows 路径，三条互不替代：
+#   .github/workflows/ci.yml     原生 windows-latest runner（发布产物的来源）
+#   .aws/buildspec/windows.yml   CodeBuild Windows 容器（发布前的验证场）
+#   dist-windows（本组目标）     Linux 上交叉编译，本机几分钟内验证包内容
+# 交叉链：cargo-xwin 提供 MSVC CRT/SDK（免装 Visual Studio），lld-link 负责链接，
+# clang-cl 编译 C，makensis 生成安装包。
+# ---------------------------------------------------------------------------
+WIN_TARGET := x86_64-pc-windows-msvc
+BUNDLE_CONFIG_WIN := src-tauri/tauri.bundle.windows.json
+NSIS_DIR := target/$(WIN_TARGET)/release/bundle/nsis
+ASKPASS_WIN_BUILT := target/$(WIN_TARGET)/release/$(ASKPASS_BIN).exe
+
+# 包内**安装后**的 sidecar 名字，也就是 dist-windows-verify 要在 NSIS 包里逐个数到的文件。
+# externalBin 的 `-<triple>` 后缀会被 bundler 剥掉，所以这里是 agentlens-askpass.exe；
+# 两个 collector 与 collectors.sha256 走 resources，原名照抄。
+#
+# ★ 刻意写死，不从 bundle 配置反推（实测踩过，见 dist-bundle-windows 的注释）★
+# 若「期望名单」从 $(BUNDLE_CONFIG_WIN) 或 $(STAGE_DIR) 现算，那么归置这一步少放一个
+# 文件时期望值会跟着一起少，护栏就退化成恒真——正是它要防的那种装饰性门禁。
+WIN_PKG_SIDECARS := $(ASKPASS_BIN).exe $(COLLECTOR_X86) $(COLLECTOR_ARM) collectors.sha256
+
+# ---------------------------------------------------------------------------
+# ★★ 这里刻意用 ?= 而不是 := （与 COVERAGE_MIN 恰好相反，理由不同）★★
+# XWIN_CACHE_DIR 是 cargo-xwin 自己的环境变量，被外部环境覆盖是**期望行为**
+# （换机器、复用他处已下好的 SDK）。COVERAGE_MIN 用 := 是因为那是一条不许被环境
+# 静默降低的硬地板；这条是一个位置偏好，语义完全不同。
+#
+# 默认值放 ~/.cache，不放仓库内也不放 $TMPDIR，三个理由：
+#   1. 首次要落约 1.1 GB 的 MSVC CRT + Windows SDK。放 target/ 下会被 `make clean`
+#      （cargo clean）和 dist-clean 连带删掉，等于每次清理都罚一次重新下载。
+#   2. /tmp 在多数发行版是 tmpfs 或被 systemd-tmpfiles 定期回收，重启即失效。
+#   3. ~/.cache 就是 XDG 定义的「可重建缓存」位置，语义正好对上——它确实可重建，
+#      只是重建一次要几百 MB 流量。
+# ---------------------------------------------------------------------------
+XWIN_CACHE_DIR ?= $(HOME)/.cache/agentlens/xwin
+export XWIN_CACHE_DIR
+
+# dist-windows-verify 默认校验刚归集的产物；也可指定任意包（负向验证用）：
+#   make dist-windows-verify WIN_PKG=/path/to/AgentLens_x.y.z_x64-setup.exe
+WIN_PKG ?=
+# 显式指定 zig 可执行文件；留空则从 mise installs 里探测（见 dist-windows-toolchain）。
+ZIG_BIN ?=
 
 # aarch64 musl 的 C 交叉编译器：rusqlite 的 bundled feature 要编译 sqlite3.c，
 # 必须有 musl ABI 的 aarch64 cc。优先用系统 aarch64-linux-musl-gcc，否则退到
@@ -177,6 +225,8 @@ AWS_LOG_SINCE ?= 4h
 	coverage coverage-gate hooks \
 	dist dist-all dist-reset dist-version dist-clean dist-collector-x86_64 dist-collector-aarch64 \
 	dist-askpass dist-stage dist-bundle dist-collect dist-verify \
+	dist-windows dist-windows-verify dist-windows-toolchain \
+	dist-askpass-windows dist-stage-windows dist-bundle-windows dist-collect-windows \
 	aws-source-upload aws-build-linux aws-build-windows aws-build-macos aws-status aws-logs
 
 help: ## 显示可用目标
@@ -440,6 +490,221 @@ dist-verify: ## 校验 sha256sums.txt 与目录内容一致（缺文件 / 哈希
 	    echo '产物目录与清单不一致：'; diff <(echo "$$listed") <(echo "$$present") || true; exit 1; \
 	  fi
 	@echo '[dist] sha256sums.txt 校验通过，且与目录内容完全一致'
+
+# ---------------------------------------------------------------------------
+# Windows 交叉编译流水线（Linux → NSIS）
+#
+# 产物（$(DIST_DIR)/，与 Linux 的 dist 共用同一目录，一次只放一个平台）：
+#   AgentLens_<version>_x64-setup.exe        NSIS 安装包（内含 askpass 与双架构 collector）
+#   agentlens-collector-x86_64-...-musl      独立 collector（供手工分发到远端）
+#   agentlens-collector-aarch64-...-musl     同上
+#   collectors.sha256                        collector 校验清单（与包内同一份）
+#   sha256sums.txt                           覆盖上述全部文件，`sha256sum -c` 可校验
+#
+# 两道校验各管一件事，都要过：
+#   dist-verify         归集目录 ↔ sha256sums.txt 一致（文件级）
+#   dist-windows-verify NSIS 包内 sidecar 齐全（包内容级，见下方「坑一」）
+# ---------------------------------------------------------------------------
+
+dist-windows: ## 交叉编译 Windows NSIS 安装包（Linux → x86_64-pc-windows-msvc）
+	@# 预检刻意在 dist-reset **之前**单独跑一次（下游 dist-stage-windows 也依赖它，重复约 0.5s）：
+	@# 缺工具链时要在 rm -rf $(DIST_DIR) 抹掉上一次产物之前就失败，而不是先清空再报错。
+	@$(MAKE) --no-print-directory dist-windows-toolchain
+	@$(MAKE) --no-print-directory dist-reset
+	@$(MAKE) --no-print-directory dist-collect-windows
+	@$(MAKE) --no-print-directory dist-verify
+	@$(MAKE) --no-print-directory dist-windows-verify
+
+# dist-windows-toolchain 的三条实测注记（写在 recipe 外：recipe 里那一大坨是**一条**
+# 反斜杠续行的 shell 命令，中间插 `@#` 会被当成命令词传给 shell 而报 command not found）：
+#
+# (1) 不用 `rustup target list --installed | grep -qx`。.SHELLFLAGS 带 -o pipefail，
+#     grep -q 命中即退会让上游 rustup 吃到 SIGPIPE，管道退 141，于是「装了」被判成
+#     「没装」——本文件 aws-source-upload 处已记过同一个坑。清单先取到变量再纯 bash 匹配。
+#
+# (2) clang-cl 不是独立二进制，而是 clang 按 argv[0] 进入的 cl.exe 兼容模式。
+#     Debian/Ubuntu 的 clang 包不提供这个名字，靠同名 symlink 触发；cargo-xwin 编译
+#     C 代码时按名字找它，找不到就是一串 MSVC 风格的 cc 报错。
+#
+# (3) ★ zig 常常是个「查得到但跑不起来」的 mise shim（实测踩过）★
+#     `command -v zig` 返回 shim 路径且退 0，但真跑 `zig version` 会报
+#     `mise ERROR No version is set for shim: zig` 并退 1。所以判据必须是**实际执行**，
+#     不是 command -v。修法：把真实二进制 symlink 到一个 mise 不拥有的目录再前置 PATH。
+#     刻意不动用户的全局 mise 配置——`mise use -g` 是用户的选择，不该由构建脚本替他做。
+#     路径不写死版本号，从 installs 目录探测；也可用 ZIG_BIN=<路径> 显式指定。
+dist-windows-toolchain: ## 预检 Windows 交叉工具链，并合成发行版/mise 缺失的 shim
+	@mkdir -p $(TOOLCHAIN_DIR) '$(XWIN_CACHE_DIR)'
+	@fail=0; \
+	say() { printf '[win] %s\n' "$$1"; }; \
+	hint() { printf '[win] 缺少 %s → %s\n' "$$1" "$$2"; fail=1; }; \
+	command -v cargo >/dev/null 2>&1 || hint 'cargo' '安装 Rust 工具链：https://rustup.rs'; \
+	cargo tauri --version >/dev/null 2>&1 \
+	  || hint 'cargo-tauri' 'cargo install tauri-cli --locked'; \
+	command -v cargo-xwin >/dev/null 2>&1 \
+	  || hint 'cargo-xwin' 'cargo install cargo-xwin --locked'; \
+	command -v makensis >/dev/null 2>&1 \
+	  || hint 'makensis' 'sudo apt-get install -y nsis'; \
+	command -v 7z >/dev/null 2>&1 || command -v 7zz >/dev/null 2>&1 || command -v 7za >/dev/null 2>&1 \
+	  || hint '7z / 7zz / 7za' 'sudo apt-get install -y p7zip-full（dist-windows-verify 要读包内容）'; \
+	installed=$$(rustup target list --installed); \
+	case $$'\n'"$$installed"$$'\n' in \
+	  *$$'\n'$(WIN_TARGET)$$'\n'*) ;; \
+	  *) hint '$(WIN_TARGET) 目标' 'rustup target add $(WIN_TARGET)' ;; \
+	esac; \
+	if ! command -v lld-link >/dev/null 2>&1; then \
+	  cand=$$(ls -1 /usr/lib/llvm-*/bin/lld-link 2>/dev/null | sort -V | tail -1 || true); \
+	  if [[ -n "$$cand" ]]; then \
+	    ln -sfn "$$cand" $(TOOLCHAIN_DIR)/lld-link; say "lld-link ← $$cand"; \
+	  else \
+	    hint 'lld-link' 'sudo apt-get install -y lld'; \
+	  fi; \
+	fi; \
+	if ! command -v clang-cl >/dev/null 2>&1; then \
+	  clang=$$(command -v clang 2>/dev/null || true); \
+	  if [[ -n "$$clang" ]]; then \
+	    ln -sfn "$$clang" $(TOOLCHAIN_DIR)/clang-cl; say "clang-cl ← $$clang（clang 的 cl 兼容入口）"; \
+	  else \
+	    hint 'clang-cl' 'sudo apt-get install -y clang'; \
+	  fi; \
+	fi; \
+	if command -v aarch64-linux-musl-gcc >/dev/null 2>&1; then \
+	  say 'aarch64 musl cc：系统 aarch64-linux-musl-gcc'; \
+	elif zig version >/dev/null 2>&1; then \
+	  say "aarch64 musl cc：zig $$(zig version)"; \
+	else \
+	  zigbin='$(ZIG_BIN)'; \
+	  if [[ -z "$$zigbin" ]]; then \
+	    for c in $${MISE_DATA_DIR:-$$HOME/.local/share/mise}/installs/zig/*/zig; do \
+	      if [[ -x "$$c" ]]; then zigbin="$$c"; break; fi; \
+	    done; \
+	  fi; \
+	  if [[ -n "$$zigbin" && -x "$$zigbin" ]]; then \
+	    ln -sfn "$$zigbin" $(TOOLCHAIN_DIR)/zig; \
+	    say "zig ← $$zigbin（绕过未 pin 版本的 mise shim）"; \
+	  else \
+	    hint 'zig 或 aarch64-linux-musl-gcc' \
+	      'mise use -g zig@0.13.0 / apt 装 aarch64 musl 工具链 / 显式指定 ZIG_BIN=<zig 路径>'; \
+	  fi; \
+	fi; \
+	test "$$fail" -eq 0 || { \
+	  echo '[win] 工具链预检未通过：先补齐上面列出的缺失项，再重跑 make dist-windows'; exit 1; }; \
+	say 'PATH shim 目录：$(TOOLCHAIN_DIR)'; \
+	say 'XWIN_CACHE_DIR=$(XWIN_CACHE_DIR)'
+
+dist-askpass-windows: dist-version dist-windows-toolchain ## 交叉编译 Windows 版 SSH_ASKPASS 助手
+	PATH='$(CURDIR)/$(TOOLCHAIN_DIR)':"$$PATH" \
+	  cargo xwin build -p agentlens-askpass --release --target $(WIN_TARGET)
+	@test -f $(ASKPASS_WIN_BUILT) || { echo '缺少 $(ASKPASS_WIN_BUILT)'; exit 1; }
+
+dist-stage-windows: dist-windows-toolchain ## 按 Windows 命名约定归置 4 个 sidecar
+	@# 三个构建走子 make 而不是 prerequisite，是为了让 PATH 里的 shim 目录在**子 make 的
+	@# 解析期**就生效——dist-collector-aarch64 的 `ZIG := $(shell command -v zig)` 是解析期
+	@# 求值，prerequisite 形式会在旧 PATH 下解析，拿到那个跑不起来的 mise shim。
+	PATH='$(CURDIR)/$(TOOLCHAIN_DIR)':"$$PATH" $(MAKE) --no-print-directory \
+	  dist-collector-x86_64 dist-collector-aarch64 dist-askpass-windows
+	rm -rf $(STAGE_DIR)
+	mkdir -p $(STAGE_DIR)
+	cp $(ASKPASS_WIN_BUILT) $(STAGE_DIR)/$(ASKPASS_BIN)-$(WIN_TARGET).exe
+	cp $(COLLECTOR_X86_BUILT) $(STAGE_DIR)/$(COLLECTOR_X86)
+	@# ★ Windows 包里 aarch64 collector 是硬要求，缺席即失败——与 Linux 的 dist 不同 ★
+	@# Linux 侧允许降级，是因为它会重写 bundle 配置删掉那一项，并在 sha256sums.txt 里
+	@# 显式注明缺席。Windows 侧不这么做：一个「少一个 collector」的安装包在装机后才会
+	@# 暴露（aarch64 远端采不到），而且要让 dist-windows-verify 的期望名单跟着变，
+	@# 那道护栏就自我削弱了。交叉编译宿主是 Linux，zig 拿得到，硬要求成本可接受。
+	@test -f $(COLLECTOR_ARM_BUILT) || { \
+	  echo '################################################################'; \
+	  echo '# 错误：缺少 $(COLLECTOR_ARM_BUILT)。'; \
+	  echo '# Windows 安装包必须含双架构 collector，绝不产出少一个 sidecar 的包。'; \
+	  echo '# 上一步 dist-collector-aarch64 的告警里有解除办法（zig 或 aarch64 musl gcc）。'; \
+	  echo '################################################################'; exit 1; }
+	cp $(COLLECTOR_ARM_BUILT) $(STAGE_DIR)/$(COLLECTOR_ARM)
+	chmod 0755 $(STAGE_DIR)/*
+	@# collector 走 resources 而非 externalBin（后者会强行追加 .exe，而运行期按不带后缀的
+	@# 原名查找），所以 stage 里的名字就是安装后的名字，这里不需要像 dist-stage 那样 sed。
+	@cd $(STAGE_DIR) && sha256sum $(COLLECTOR_X86) $(COLLECTOR_ARM) > collectors.sha256 \
+	  && cat collectors.sha256
+	@printf '[win] stage 就绪（%s 个文件）：\n' "$$(ls -1 $(STAGE_DIR) | wc -l)"
+	@ls -l $(STAGE_DIR)
+
+dist-bundle-windows: dist-stage-windows ## 构建前端 + Windows NSIS 安装包（必传 --config）
+	@# ★★ --config 必传，漏掉会静默丢掉全部 sidecar 且构建仍 exit 0（实测踩过）★★
+	@# tauri.conf.json 的 bundle 里 externalBin 与 resources **都不存在**，4 个 sidecar
+	@# 只声明在 $(BUNDLE_CONFIG_WIN) 这个 per-platform overlay 里。不带 --config 时构建
+	@# 照样成功、日志照样打印「Finished 1 bundle」，但包内只有 agentlens-tauri.exe：
+	@# 实测 3,143,958 字节 vs 正确的 4,753,884 字节。退出码和日志都看不出差别，
+	@# 这就是 dist-windows-verify 必须去数包内文件、而不是信构建返回值的原因。
+	@#
+	@# 也刻意不像 dist-bundle 那样先生成降级配置：dist-stage-windows 已保证 4 个文件齐全，
+	@# 所以这里直接用已提交的 overlay，不引入第二份可能漂移的配置。
+	rm -rf $(NSIS_DIR)
+	PATH='$(CURDIR)/$(TOOLCHAIN_DIR)':"$$PATH" \
+	  cargo tauri build --bundles nsis \
+	    --config $(BUNDLE_CONFIG_WIN) \
+	    --runner cargo-xwin --target $(WIN_TARGET)
+
+dist-collect-windows: dist-bundle-windows ## 归集 Windows 产物并生成 sha256sums.txt
+	@rm -rf $(DIST_DIR)
+	@mkdir -p $(DIST_DIR)
+	@# 文件名由 tauri 按 Cargo 包版本自己生成（AgentLens_<version>_x64-setup.exe），
+	@# 所以这里只 glob + 断言含 $(VERSION)，绝不在 Makefile 里写死版本或文件名。
+	@pkg=$$(ls -1t $(NSIS_DIR)/*-setup.exe 2>/dev/null | sed -n 1p || true); \
+	test -n "$$pkg" || { echo '未找到 NSIS 产物（$(NSIS_DIR)/*-setup.exe）'; exit 1; }; \
+	case "$$pkg" in *_$(VERSION)_*) ;; \
+	  *) echo "NSIS 文件名 $$pkg 未包含 workspace 版本 $(VERSION)"; exit 1 ;; \
+	esac; \
+	cp "$$pkg" $(DIST_DIR)/
+	@cp $(COLLECTOR_X86_BUILT) $(DIST_DIR)/$(COLLECTOR_X86)
+	@cp $(COLLECTOR_ARM_BUILT) $(DIST_DIR)/$(COLLECTOR_ARM)
+	@cp $(STAGE_DIR)/collectors.sha256 $(DIST_DIR)/
+	@test -n "$$(ls -1 $(DIST_DIR))" || { echo '产物目录为空，拒绝生成空清单'; exit 1; }
+	@cd $(DIST_DIR) && { \
+	  printf '# AgentLens %s Windows 发布产物校验清单（sha256sum -c 可直接校验）\n' '$(VERSION)'; \
+	  printf '# 构建方式：Linux 交叉编译 → %s；包内 sidecar %s 个，由 make dist-windows-verify 核对\n' \
+	    '$(WIN_TARGET)' '$(words $(WIN_PKG_SIDECARS))'; \
+	  sha256sum $$(ls -1 | grep -v '^sha256sums.txt$$' | sort); \
+	} > sha256sums.txt
+	@echo '[win] 产物清单：'
+	@ls -l $(DIST_DIR)
+	@cat $(DIST_DIR)/sha256sums.txt
+
+# 缺 7z 时刻意不降级为「跳过」：数不到包内文件的护栏就是装饰品，宁可在这里红。
+# 包定位顺序：WIN_PKG 显式指定 → 归集目录 → NSIS 输出目录（未归集时也能校验）。
+dist-windows-verify: ## 校验 NSIS 包内 sidecar 齐全（漏 --config 的护栏，只看退出码抓不到）
+	@sevenzip=''; \
+	for c in 7z 7zz 7za; do \
+	  if command -v "$$c" >/dev/null 2>&1; then sevenzip="$$c"; break; fi; \
+	done; \
+	test -n "$$sevenzip" || { \
+	  echo '[win] 缺少 7z / 7zz / 7za，无法读取 NSIS 包内容。'; \
+	  echo '[win] 安装：sudo apt-get install -y p7zip-full'; exit 1; }; \
+	pkg='$(WIN_PKG)'; \
+	if [[ -z "$$pkg" ]]; then \
+	  pkg=$$(ls -1t $(DIST_DIR)/*-setup.exe 2>/dev/null | sed -n 1p || true); \
+	fi; \
+	if [[ -z "$$pkg" ]]; then \
+	  pkg=$$(ls -1t $(NSIS_DIR)/*-setup.exe 2>/dev/null | sed -n 1p || true); \
+	fi; \
+	test -n "$$pkg" || { \
+	  echo '[win] 未找到 NSIS 安装包：先跑 make dist-windows，或用 WIN_PKG=<路径> 指定'; exit 1; }; \
+	printf '[win] 校验包：%s（%s 字节，7z=%s）\n' "$$pkg" "$$(stat -c %s "$$pkg")" "$$sevenzip"; \
+	names=$$("$$sevenzip" l -- "$$pkg" | awk 'NF > 0 { print $$NF }'); \
+	found=0; missing=''; \
+	for want in $(WIN_PKG_SIDECARS); do \
+	  case $$'\n'"$$names"$$'\n' in \
+	    *$$'\n'"$$want"$$'\n'*) found=$$((found + 1)); printf '[win]   命中 %s\n' "$$want" ;; \
+	    *) missing="$$missing $$want"; printf '[win]   缺失 %s\n' "$$want" ;; \
+	  esac; \
+	done; \
+	printf '[win] sidecar 计数：%s/%s\n' "$$found" '$(words $(WIN_PKG_SIDECARS))'; \
+	if [[ -n "$$missing" ]]; then \
+	  echo '################################################################'; \
+	  echo "# 校验失败：包内缺 sidecar →$$missing"; \
+	  echo '# 最常见成因：cargo tauri build 漏了 --config $(BUNDLE_CONFIG_WIN)。'; \
+	  echo '# 那种情况下构建仍 exit 0、日志仍打印 Finished 1 bundle，只有包内容能看出来。'; \
+	  echo '# 修法：跑 make dist-windows（它必传 --config），不要手工调 cargo tauri build。'; \
+	  echo '################################################################'; exit 1; \
+	fi; \
+	echo '[win] 包内 sidecar 齐全'
 
 clean: ## 清理构建产物
 	cargo clean
