@@ -8,8 +8,9 @@
 
 **简体中文** · [English](docs/readme/README.en.md)
 
-AgentLens 是一个桌面用量看板：把本机与多台远端主机上 AI 编码工具的用量记录采集进一个本地
-SQLite 归档库，再按时区、Agent、模型与项目维度看趋势、查单条明细。
+AgentLens 是一个桌面用量看板：把本机与多台远端主机上 OpenCode、Claude Code、Codex 与
+Hermes 的用量记录采集进一个本地 SQLite 归档库，再按时区、Agent、模型与项目维度看趋势、
+查单条明细。默认只采集 OpenCode，其余三个源在主机卡片上逐个勾选后启用。
 
 ## 目录
 

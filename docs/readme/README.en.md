@@ -8,9 +8,11 @@
 
 [简体中文](../../README.md) · **English**
 
-A desktop dashboard for AI coding-agent token usage. AgentLens collects usage
-records from your local machine and from any number of remote SSH hosts into one
-local SQLite archive, then slices them by timezone, agent, model and project.
+A desktop dashboard for AI coding-agent token usage. AgentLens collects OpenCode,
+Claude Code, Codex and Hermes usage records from your local machine and from any
+number of remote SSH hosts into one local SQLite archive, then slices them by
+timezone, agent, model and project. Only OpenCode is collected by default; the
+other three are enabled per host by ticking them on the host card.
 
 ## Table of Contents
 
