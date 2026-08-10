@@ -2,17 +2,16 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "include-component-in-tag": false,
   "separate-pull-requests": false,
+  "skip-github-release": true,
   "pull-request-title-pattern": "chore: release ${branch}",
   "group-pull-request-title-pattern": "chore(release): 发布 ${version}",
-  "pull-request-header": "本 PR 由 release-please 维护：合并即创建 draft Release；tag 由 GitHub 在 draft 被公开时按 target_commitish 创建。",
+  "pull-request-header": "本 PR 由 release-please 维护：合并后 .github/workflows/release.yml 会自己建 tag 与 draft Release，三平台产物齐全才公开。",
   "packages": {
     ".": {
       "release-type": "simple",
       "changelog-path": "changelog/CHANGELOG-v0.md",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
-      "draft": true,
-      "prerelease": false,
       "extra-files": [
         {
           "type": "toml",

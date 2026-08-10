@@ -1,56 +1,68 @@
 name: release
 
 # ===========================================================================
-# 发布流水线：release-please 驱动，draft-until-all-green。
+# 发布流水线：manifest 版本驱动，draft-until-all-green。
 #
 # 形态：
-#   push main ──▶ release-please  (维护发布 PR；PR 合并的那一次 push 才建 draft)
-#                      │ releases_created == 'true'
-#         ┌────────────┼────────────┬────────────┐
-#         ▼            ▼            ▼            ▼
-#      verify-ci   linux-deb   windows-nsis  macos-dmg   查询 CI 与构建并行
-#         └────────────┴────────────┼────────────┘
-#                                  ▼
-#                        publish  ← CI + 三平台都绿才公开 Release（并由此产生 tag）
+#   push main ──▶ prepare      (manifest 版本 vs 已有 tag，判定是否发布)
+#                    │ should_release == 'true'
+#                    ▼
+#                 create-draft (建 tag 与 draft Release)
+#         ┌──────────┼────────────┬────────────┐
+#         ▼          ▼            ▼            ▼
+#      verify-ci  linux-deb   windows-nsis  macos-dmg   查询 CI 与构建并行
+#         └──────────┴────────────┼────────────┘
+#                                ▼
+#                             publish  ← CI + 三平台都绿才公开 Release
+#
+#   旁路：release-please 只维护发布 PR（版本号 / 变更日志），不建 Release。
 #
 # ---- tag 由谁创建：本仓库权限下唯一可行的那条路 -------------------------
-# GitHub 的 draft Release 是**未发布**状态，创建 draft 不会产生 git tag；tag 是
-# 在 draft 被 publish 的那一刻，由 GitHub 按 Release 记录里的 target_commitish
-# 自动创建的。release-please 的 createRelease 传的正是 `target_commitish:
-# release.sha`（release-please src/github-api.ts），即发布 PR 的合并提交，
-# 所以「先 draft、最后 publish」不会因为 main 往前走而把 tag 打到错误的提交上。
+# 默认 GITHUB_TOKEN 在本仓库能把 tag / Release 指到 main 的**当前 tip**，但不能指
+# 到任意历史提交。这不是猜测，是在本仓库用同一个 token 实测出来的（见
+# .github/workflows 历史里的临时排障 workflow，已删除）：
 #
-# 曾经这里配过 release-please 的 `force-tag-creation: true`，让它在建 draft 之前
-# 先显式补一个 tag ref。那条路在本仓库走不通：
+#   POST /releases  target_commitish 省略（默认 main）        -> 201
+#   POST /releases  target_commitish = main（分支名）          -> 201
+#   POST /releases  target_commitish = 当前 tip 的 SHA        -> 201
+#   POST /releases  target_commitish = 陈旧提交 969e303 的 SHA -> 403
+#   POST /git/refs  sha = 当前 tip                            -> 201
+#   POST /git/refs  sha = 陈旧提交 969e303                     -> 403
+#
+# 403 的响应头是 `x-accepted-github-permissions: contents=write;
+# contents=write,workflows=write` —— 指向任意 SHA 的那一支要求 workflows=write，
+# 而 workflows 根本不是 GITHUB_TOKEN 可申请的权限，无论 job 里怎么写 permissions
+# 都拿不到。仓库侧已逐项排除：Actions 默认权限 write、无分支保护、无 tag 保护、
+# 无 ruleset、非 archived、个人 public 非 fork。
+#
+# release-please 的 createRelease 恒定发送 `target_commitish: release.sha`
+# （release-please src/github-api.ts），而 release.sha 是**发布 PR 的合并提交**。
+# 只要那个提交还是 main 的 tip，它就能发（同账户的 pt-tools 一直如此，所以那边用
+# 默认 token 就能发版）。可一旦发布因别的原因失败、main 又往前走了，这个 SHA 就
+# 永远陈旧，之后每一次重试都必然 403 —— 本仓库的 0.0.1 正是卡死在这里：
+#
 #   ✔ Creating 1 releases for pull #17
 #   ##[error]release-please failed: Resource not accessible by integration
-#             - https://docs.github.com/rest/git/refs#create-a-reference
-# forceTag 分支调用的是 `octokit.git.createRef`，而默认 GITHUB_TOKEN 在本仓库
-# 拿不到这个 endpoint（已逐项排除：Actions 默认权限 write、无分支保护、无 tag
-# 保护、无 ruleset、个人 public 非 fork、job 已声明 contents: write）。它在
-# createRelease **之前**执行，所以整个发布在这一步就断掉，连 draft 都没建出来。
+#             - https://docs.github.com/rest/releases/releases#create-a-release
 #
-# 因此删掉 force-tag-creation，改为不预先造 tag：draft 阶段全程无 tag，publish
-# 翻牌时 tag 与公开 Release 同时诞生。副作用是本文件不能再用 tag 名做检出与
-# CI 定位 —— 那些地方一律改用 release-please 输出的 `sha`（见各 job 的 ref）。
-# 唯一仍按 tag 名寻址的是 gh release 三条命令：gh 的 FetchRelease 在
-# `releases/tags/{tag}` 404 时会走 GraphQL 按 **pending tag name** 找 draft
-# （cli/cli pkg/cmd/release/shared/fetch.go），tagless draft 也能命中。
+# 而且没有任何 release-please 配置能改掉那个 target_commitish。所以本文件把发布权
+# 收回来：release-please 只留 PR / 版本号 / 变更日志（skip-github-release: true），
+# tag 与 draft Release 由 create-draft 显式建在 prepare 选定的提交上。
 #
 # 为什么坚持 draft 而不学 pt-tools 直接建正式 Release：
 #   pt-tools 由 release-please 直接建非 draft Release、产物随后追加。那样 Release
 #   公开的瞬间资产还是空的，要等二十多分钟三平台才补齐 —— 这个窗口里用户会下载到
 #   一个没有安装包的 Release。本项目的取舍相反：宁可晚发布，也不发一个残包。
 #
-# 产物不齐时会发生什么：draft 停在原地，不产生 tag、不产生公开 Release，
-# 缺哪个平台从 Actions 页面一眼可见。修完用 `gh run rerun --failed` 重跑失败 job
-# 即可 —— release-please job 已成功，它的 outputs 会被保留，不会二次建 Release
-# （真要整轮重跑，release-please 会因 tag_name 已存在抛 DuplicateReleaseError，
-# releases_created 不再为 true，这也是它防重复发布的设计）。
+# 产物不齐时会发生什么：Release 停在 draft，不公开、不进 releases/latest，
+# install.sh 取不到它，缺哪个平台从 Actions 页面一眼可见。副产物是一个已存在但
+# 没有公开 Release 的 tag —— 无害，且下一次运行会被 prepare 认成「续做」，锁定同
+# 一个提交继续补齐，不会另起一个版本。修完重跑失败 job 或再推一次都可以。
 #
-# 版本号：唯一事实源是根 Cargo.toml 的 [workspace.package].version，由
-# release-please 通过显式 extra-files 写入（见 release-please-config.json），
-# 本文件从不硬编码第二份版本，只回显 `make dist-version`。
+# 版本号：唯一事实源是 .release-please-manifest.json，release-please 在发布 PR 里
+# 同步写入根 Cargo.toml 的 [workspace.package].version 与 frontend/package.json
+# （见 release-please-config.json 的 extra-files）。本文件只读 manifest 推出 tag，
+# 从不硬编码第二份版本，构建步骤只回显 `make dist-version`。
 #
 # ---- 从 .github/workflows/ci.yml 原样承接的五条硬约束 --------------------
 # (1) 每条 native 命令后跟 Assert-Ok：pwsh 里 native 命令非零退出**不会**中断
@@ -66,10 +78,6 @@ name: release
 #
 # 另外：本文件任何构建/门禁步骤都没有 `|| true`，也没有 continue-on-error。
 # 把失败洗成绿正是本项目已经修过一次的缺陷。
-#
-# 本仓库尚无 git remote，这份 workflow 从未在 GitHub Actions 上执行过 ——
-# 它是 actionlint 干净的、未运行的。三平台构建步骤是 ci.yml 的原样承接，
-# 而 ci.yml 本身翻译自 AWS CodeBuild 上跑绿的 .aws/buildspec/*.yml。
 # ===========================================================================
 
 on:
@@ -110,77 +118,175 @@ env:
   CI: "true"
 
 jobs:
-  # ---- 阶段 1：release-please ---------------------------------------------
-  # 平时它只维护那个长期存在的发布 PR（累积变更 + 预演版本号与变更日志）。
-  # 只有该 PR 被合并进 main 的那一次 push，才会 releases_created == 'true'，
-  # 同时打出 tag 并建出 draft Release。
+  # ---- 阶段 1：判定本次是否需要发布 ---------------------------------------
+  # 版本号唯一事实源是 .release-please-manifest.json（release-please 在发布 PR 里
+  # 写它，同时把同一个版本写进 Cargo.toml 与 frontend/package.json）。本 job 只做
+  # 一件事：把「manifest 声明的版本」与「远端已有的 tag / Release」比对，得出
+  # 本次要不要发布、以及发布哪个提交。
   #
-  # 发布 PR 就是集成点：它和普通 PR 一样跑 ci.yml 的全部门禁，失败时**往同一个
-  # 分支再推修复提交**让 PR 自我修复，绝不另开 PR。
+  # 判定规则（idempotent，可以安全重跑）：
+  #   已有该 tag 的**正式** Release  → should_release=false，什么都不做
+  #   已有该 tag 但只是 draft/裸 tag → should_release=true，sha 取 **tag 指向的提交**
+  #                                    （续做那次没做完的发布，产物与 tag 永远一致）
+  #   没有该 tag                     → should_release=true，sha 取本次 push 的 tip
   #
-  # squash-merge 陷阱：仓库若以 squash 合并，release-please 只看得到 squash
-  # 提交的标题。标题写成 chore:/refactor: 的 PR 会把分支里的 feat:/fix: 折叠掉，
-  # 于是**静默停止升版**。因此仓库 squash 策略必须设为 PR_TITLE，并由
-  # .github/workflows/pr-title.yml 强制 PR 标题符合 Conventional Commits。
-  release-please:
-    name: release-please（维护发布 PR、建 draft Release）
+  # 为什么必须自己判定、而不是用 release-please 的 releases_created：
+  # 见文件头 "tag 由谁创建" 一节 —— release-please 永远把 Release 打在发布 PR 的
+  # 合并提交上，而那个提交一旦不再是 main 的 tip 就再也发不出去，本仓库的 0.0.1
+  # 正是卡在这里。所以 release-please 只保留 PR/版本号/变更日志职责
+  # （release-please-config.json 的 skip-github-release: true），发布权收回本文件。
+  prepare:
+    name: 判定是否需要发布（manifest 版本 vs 已有 tag）
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.decide.outputs.should_release }}
+      version: ${{ steps.decide.outputs.version }}
+      tag_name: ${{ steps.decide.outputs.tag_name }}
+      sha: ${{ steps.decide.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          version="$(jq -er '."."' .release-please-manifest.json)"
+          tag="v${version}"
+          echo "manifest 版本 = ${version}，目标 tag = ${tag}"
+
+          # 两次查询都可能合法地 404（首次发布时 tag 与 Release 都还不存在），
+          # 但只有 404 算「不存在」：其余错误（限流、权限、网络）必须让 job 变红，
+          # 否则会被误判成首次发布而重复建 tag。所以不写 `|| true`，逐一分辨。
+          probe() {
+            if gh api "$1" --jq "$2" > /tmp/probe.out 2>/tmp/probe.err; then
+              cat /tmp/probe.out
+              return 0
+            fi
+            grep -q 'HTTP 404' /tmp/probe.err \
+              || { echo "查询 $1 失败（非 404）：" >&2; cat /tmp/probe.err >&2; exit 1; }
+            return 0
+          }
+
+          tag_sha="$(probe "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" '.object.sha')"
+          published="$(probe "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" \
+            'if .draft then "draft" else "published" end')"
+
+          echo "远端 tag  = ${tag_sha:-<none>}"
+          echo "远端 Release = ${published:-<none>}"
+
+          if [ "$published" = 'published' ]; then
+            echo "${tag} 已是正式 Release，本次无需发布"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$tag_sha" ]; then
+            sha="$tag_sha"
+            echo "续做 ${tag} 未完成的发布，锁定 tag 指向的提交 ${sha}"
+          else
+            sha="$HEAD_SHA"
+            echo "${tag} 尚不存在，将把它建在本次 push 的 tip ${sha}"
+          fi
+
+          {
+            echo "should_release=true"
+            echo "version=${version}"
+            echo "tag_name=${tag}"
+            echo "sha=${sha}"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---- 阶段 1b：建 tag 与 draft Release ------------------------------------
+  # 这是文件头那条权限约束的落点：tag 由**本 job 显式创建**在 prepare 选定的提交
+  # 上，而不是由 release-please 内部创建。默认 GITHUB_TOKEN 能 createRef 到
+  # main 当前 tip，这一点已在本仓库实测（tip → 201，陈旧提交 → 403）。
+  #
+  # 两步都写成「先查，缺了才建」，所以整轮重跑不会因为已存在而失败。
+  create-draft:
+    name: 建 tag 与 draft Release
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
-      pull-requests: write
-      issues: write
-    outputs:
-      # 键名不是猜的：action 的 outputReleases() 里，`releases_created` 是无论
-      # 几个包都会 setOutput 的顶层布尔；其余键经 setPathOutput(path,…) 输出，
-      # 本仓库 packages 只有 "."，而 path === '.' 时该函数**不加前缀**，所以
-      # tag_name / sha 都是裸键（release-please-action src/index.ts）。
-      # pt-tools 用的 `release_created` 是同一处为 path 设的单数别名，二者同时存在。
-      releases_created: ${{ steps.release.outputs.releases_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      # draft 阶段没有 tag，下游 checkout 与 CI 定位只能靠这个 sha。
-      # 它等于发布 PR 的合并提交，也是 Release 记录的 target_commitish。
-      sha: ${{ steps.release.outputs.sha }}
     steps:
-      - id: release
-        uses: googleapis/release-please-action@v4
+      - uses: actions/checkout@v5
         with:
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
-          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
 
-      # 全量回显 action 的 outputs。保留而非诊断完就删：release-please 判定失败时
-      # 只写 warn 到日志、不让 job 变红，唯一能证伪「输出键名/值」猜测的就是这份
-      # JSON。曾有三轮发布因为凭空猜测键名被前缀化而白跑，这一步的成本是 0.1s。
-      - name: 全量回显 release-please 的 outputs（排障锚点）
+      # 已存在同名 tag 时 GitHub 返回 422 already_exists —— 那正是 prepare 判定的
+      # 续做场景，视为满足前置条件；其余非 201 一律失败，不做任何吞错。
+      - name: 确保 tag 存在于选定提交
         env:
-          OUTPUTS_JSON: ${{ toJSON(steps.release.outputs) }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
-          printf '%s\n' "$OUTPUTS_JSON"
+          code="$(curl -sS -o /tmp/ref.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -d "{\"ref\":\"refs/tags/${TAG_NAME}\",\"sha\":\"${RELEASE_SHA}\"}")"
+          cat /tmp/ref.json
+          case "$code" in
+            201)
+              echo "已创建 refs/tags/${TAG_NAME} -> ${RELEASE_SHA}"
+              ;;
+            422)
+              jq -e '.message | test("already exists"; "i")' /tmp/ref.json >/dev/null \
+                || { echo "422 但不是 already exists，拒绝继续"; exit 1; }
+              echo "refs/tags/${TAG_NAME} 已存在，续做发布"
+              ;;
+            *)
+              echo "createRef 返回 HTTP ${code}，拒绝继续"
+              exit 1
+              ;;
+          esac
 
-      - name: 回显本次判定（是否切出了新版本）
+          actual="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" --jq '.object.sha')"
+          if [ "$actual" != "$RELEASE_SHA" ]; then
+            echo "tag 指向 ${actual}，与选定提交 ${RELEASE_SHA} 不一致"
+            exit 1
+          fi
+
+      # --verify-tag 让 gh 在 tag 不存在时直接拒绝，避免它替我们隐式造 tag。
+      # 正文此刻只放占位：真正的 Release 正文由 publish 用 git-cliff 生成后写入，
+      # 保证「对外可见的正文」只在三平台齐全后出现一次。
+      - name: 确保 draft Release 存在
         env:
-          RELEASES_CREATED: ${{ steps.release.outputs.releases_created }}
-          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
-          TAG_NAME: ${{ steps.release.outputs.tag_name }}
-          RELEASE_SHA: ${{ steps.release.outputs.sha }}
-          IS_DRAFT: ${{ steps.release.outputs.draft }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          echo "releases_created = ${RELEASES_CREATED:-false}"
-          echo "release_created  = ${RELEASE_CREATED:-false}"
-          echo "tag_name         = ${TAG_NAME:-<none>}"
-          echo "sha              = ${RELEASE_SHA:-<none>}"
-          echo "draft            = ${IS_DRAFT:-<none>}"
+          if gh release view "$TAG_NAME" --json isDraft --jq '.isDraft' > /tmp/state.txt 2>/dev/null; then
+            grep -qx 'true' /tmp/state.txt \
+              || { echo "${TAG_NAME} 已存在且不是 draft，拒绝在未知状态上继续"; exit 1; }
+            echo "复用已有 draft ${TAG_NAME}"
+          else
+            gh release create "$TAG_NAME" \
+              --draft \
+              --verify-tag \
+              --title "$VERSION" \
+              --notes "构建中：三平台产物齐全后本正文会被 git-cliff 生成的变更日志替换。"
+            echo "已创建 draft ${TAG_NAME}"
+          fi
+          gh release view "$TAG_NAME" --json isDraft,tagName,targetCommitish
 
   # ---- 阶段 2：查询发布提交对应的 CI 结论 ---------------------------------
   # 这里只读 Actions API，不重复 cargo/npm。它与三个构建 job 并行；唯一会把 draft
   # 公开的 publish 同时 needs 本 job 和三个构建，因此 CI 不成功时绝无公开 Release。
-  # 定位对象是 release-please 输出的 sha（发布 PR 的合并提交），不是 tag ——
-  # 此刻 tag 还不存在，任何 `commits/{tag}` 解析都会 404。
+  # 定位对象是 prepare 选定的提交，也就是 tag 实际指向、三平台实际构建的那一个。
   verify-ci:
     name: 确认发布提交的 CI Success
-    needs: release-please
-    if: needs.release-please.outputs.releases_created == 'true'
+    needs: [prepare, create-draft]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 125
     permissions:
@@ -190,12 +296,12 @@ jobs:
       - name: 轮询同一 commit 的 CI Success（超时或非 success 即失败）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-          RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           tag_sha="${RELEASE_SHA}"
-          test -n "$tag_sha" || { echo "release-please 未输出 sha，无法定位 CI run"; exit 1; }
+          test -n "$tag_sha" || { echo "prepare 未输出 sha，无法定位 CI run"; exit 1; }
           echo "待发布 ${TAG_NAME} -> ${tag_sha}"
 
           run_id=''
@@ -252,8 +358,8 @@ jobs:
   # 绝不静默产出单架构包。
   linux-deb:
     name: Linux deb + 双架构 musl collector
-    needs: release-please
-    if: needs.release-please.outputs.releases_created == 'true'
+    needs: [prepare, create-draft]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -264,7 +370,7 @@ jobs:
           # 钉 sha 而不是 tag：此刻 tag 尚未创建（publish 翻牌时才由 GitHub 建），
           # 用 tag 名会直接检出失败。sha 是发布 PR 的合并提交，即 Cargo.toml 被
           # release-please 写成目标版本的那一次提交，也不会随 main 前进而漂移。
-          ref: ${{ needs.release-please.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.sha }}
 
       # 与 ci.yml / linux.yml 同一份包名清单。
       # libayatana-appindicator3-dev 必须有：src-tauri 打开了 tray-icon feature。
@@ -371,14 +477,14 @@ jobs:
       - name: 上传资产到 draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
         run: gh release upload "$TAG_NAME" upload/* --clobber
 
   # ---- 阶段 2b：Windows ---------------------------------------------------
   windows-nsis:
     name: Windows NSIS 安装包
-    needs: release-please
-    if: needs.release-please.outputs.releases_created == 'true'
+    needs: [prepare, create-draft]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: windows-latest
     timeout-minutes: 120
     permissions:
@@ -395,7 +501,7 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.release-please.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: 安装 Rust stable 与双 musl 目标
         run: |
@@ -561,7 +667,7 @@ jobs:
       - name: 上传资产到 draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
         run: gh release upload "$TAG_NAME" upload/* --clobber
 
   # ---- 阶段 2c：macOS -----------------------------------------------------
@@ -571,8 +677,8 @@ jobs:
   # secret，刻意不加需要不存在的 secret 的步骤。
   macos-dmg:
     name: macOS dmg（未签名，aarch64）
-    needs: release-please
-    if: needs.release-please.outputs.releases_created == 'true'
+    needs: [prepare, create-draft]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: macos-latest
     timeout-minutes: 120
     permissions:
@@ -580,7 +686,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.release-please.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: 安装 Rust stable 与双 musl 目标
         run: |
@@ -681,7 +787,7 @@ jobs:
       - name: 上传资产到 draft Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
         run: gh release upload "$TAG_NAME" upload/* --clobber
 
   # ---- 阶段 3：publish ----------------------------------------------------
@@ -690,20 +796,22 @@ jobs:
   publish:
     name: 三平台全绿后发布 Release
     needs:
-      - release-please
+      - prepare
+      - create-draft
       - verify-ci
       - linux-deb
       - windows-nsis
       - macos-dmg
-    if: needs.release-please.outputs.releases_created == 'true'
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: ${{ needs.release-please.outputs.sha }}
+          ref: ${{ needs.prepare.outputs.sha }}
           # git-cliff 需要完整历史（含已有 tag）才能算出本次版本的提交区间。
           fetch-depth: 0
 
@@ -720,17 +828,15 @@ jobs:
       # --strip all 去掉 header/footer，只留本次版本的分组条目，正好当 Release 正文。
       # 空正文视为失败：宁可停在 draft，也不发一个没有说明的 Release。
       #
-      # 用 `--unreleased --tag` 而非 `--latest`：此刻 tag 还没创建，--latest 找不到
-      # 任何 tag 会退化成 unreleased 并把标题渲染成 `## [unreleased]`（本地对本仓库
-      # 实测：两种写法正文逐字节相同，只有标题行差别）。--unreleased 取「不属于任何
-      # tag 的提交」= 上一个 tag 到 HEAD，HEAD 已被上面钉在发布提交上，所以区间正确；
-      # --tag 把这一段标注成即将发布的版本号，标题才是 `## [0.0.1]`。
+      # 用 `--latest` 而非 `--unreleased --tag`：tag 在 create-draft 阶段就已建在
+      # 本次发布提交上，`--latest` 因此正好取到它那一段。反过来用 --unreleased 会
+      # 一条不剩（没有提交落在 tag 之外），只吐出一行标题 —— 本地实测 --latest 得
+      # 29 行完整分组，--unreleased --tag 只有 25 字节的标题。
       - name: 用 git-cliff 生成 Release 正文
         env:
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
         run: |
-          git-cliff --config cliff.toml --unreleased --tag "$TAG_NAME" \
-            --strip all --output /tmp/release-notes.md
+          git-cliff --config cliff.toml --latest --strip all --output /tmp/release-notes.md
           if [ ! -s /tmp/release-notes.md ]; then
             echo "git-cliff 产出空正文，拒绝发布 ${TAG_NAME}"
             exit 1
@@ -744,7 +850,7 @@ jobs:
       - name: 复核 draft 资产齐全（deb / setup.exe / dmg）
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
         run: |
           gh release view "$TAG_NAME" --json isDraft,assets > /tmp/release.json
           jq -r '.isDraft' /tmp/release.json | grep -qx 'true' \
@@ -760,7 +866,7 @@ jobs:
       - name: 翻转 draft 为正式 Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
         run: |
           gh release edit "$TAG_NAME" \
             --notes-file /tmp/release-notes.md \
@@ -775,11 +881,11 @@ jobs:
       # tag 是 publish 的副产物而非前提，所以必须显式验证它真的诞生了，并且指向
       # release-please 声明的那个提交 —— 否则 Release 页面看着正常，git tag 却缺失
       # 或指错，install.sh 按 tag 取产物就会全线失败。
-      - name: 断言 tag 已由 GitHub 创建且指向发布提交
+      - name: 断言 tag 仍指向发布提交
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG_NAME: ${{ needs.release-please.outputs.tag_name }}
-          RELEASE_SHA: ${{ needs.release-please.outputs.sha }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
           tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG_NAME}" --jq '.object.sha')"
           echo "refs/tags/${TAG_NAME} -> ${tag_sha}"
@@ -787,3 +893,65 @@ jobs:
             echo "tag 指向 ${tag_sha}，与发布提交 ${RELEASE_SHA} 不一致"
             exit 1
           fi
+
+      # 收尾 release-please 的状态机：它自己不再建 Release（skip-github-release），
+      # 所以 `autorelease: pending` 这个标签得由真正完成发布的一方翻成 tagged，
+      # 否则那个已合并的发布 PR 会永远显示「待发布」。
+      # 找不到 pending PR 不是错误：手动 workflow_dispatch 触发的发布本就没有 PR。
+      - name: 把发布 PR 的 autorelease 标签翻成 tagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+        run: |
+          gh pr list --state merged --label 'autorelease: pending' \
+            --limit 20 --json number --jq '.[].number' > /tmp/pending.txt
+          if [ ! -s /tmp/pending.txt ]; then
+            echo "没有 autorelease: pending 的已合并 PR，跳过标签收尾"
+            exit 0
+          fi
+          while read -r num; do
+            echo "PR #${num}: pending -> tagged"
+            gh pr edit "$num" \
+              --add-label 'autorelease: tagged' \
+              --remove-label 'autorelease: pending'
+          done < /tmp/pending.txt
+
+  # ---- 旁路：release-please 只维护发布 PR ---------------------------------
+  # 它不再创建 Release（release-please-config.json 的 skip-github-release: true），
+  # 职责收窄为：累积变更、算下一个版本号、把版本写进 manifest / Cargo.toml /
+  # frontend/package.json、生成 changelog/CHANGELOG-v0.md，并把这些放进一个长期
+  # 存在的发布 PR。合并该 PR 会让 manifest 版本领先于已有 tag，prepare 因此在同一次
+  # push 上判定 should_release=true —— 这就是本文件的发布触发方式。
+  #
+  # 发布 PR 就是集成点：它和普通 PR 一样跑 ci.yml 的全部门禁，失败时**往同一个
+  # 分支再推修复提交**让 PR 自我修复，绝不另开 PR。
+  #
+  # squash-merge 陷阱：仓库若以 squash 合并，release-please 只看得到 squash
+  # 提交的标题。标题写成 chore:/refactor: 的 PR 会把分支里的 feat:/fix: 折叠掉，
+  # 于是**静默停止升版**。因此仓库 squash 策略必须设为 PR_TITLE，并由
+  # .github/workflows/pr-title.yml 强制 PR 标题符合 Conventional Commits。
+  #
+  # 它与发布链路完全解耦：本 job 失败不影响已在进行的发布，反之亦然。
+  release-please:
+    name: release-please（只维护发布 PR）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 全量回显 outputs。保留而非诊断完就删：release-please 判定失败时只写 warn
+      # 到日志、不让 job 变红，唯一能证伪「输出键名/值」猜测的就是这份 JSON。
+      - name: 全量回显 release-please 的 outputs（排障锚点）
+        env:
+          OUTPUTS_JSON: ${{ toJSON(steps.release.outputs) }}
+        run: |
+          printf '%s\n' "$OUTPUTS_JSON"
