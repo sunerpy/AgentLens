@@ -406,10 +406,13 @@ jobs:
           save-if: "false"
 
       # zig 只作为 musl 的 C 交叉编译器（rusqlite 的 bundled feature 要编 sqlite3.c）。
+      # use-cache 关掉的理由见 ci.yml 同名步骤：cancelled run 会存下残缺的全局 zig 缓存，
+      # 之后每个 job 恢复它并在链接期死掉；而实测保存耗时与安装同量级，本就不省时间。
       - name: 安装 zig（aarch64/x86_64 musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+          use-cache: "false"
 
       - uses: actions/setup-node@v6
         with:
@@ -522,10 +525,12 @@ jobs:
           cache-bin: "false"
           save-if: "false"
 
+      # use-cache 关掉的理由见 ci.yml 同名步骤（cancelled run 会存下残缺的全局 zig 缓存）。
       - name: 安装 zig（musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+          use-cache: "false"
 
       - uses: actions/setup-node@v6
         with:
@@ -707,10 +712,12 @@ jobs:
           cache-bin: "false"
           save-if: "false"
 
+      # use-cache 关掉的理由见 ci.yml 同名步骤（cancelled run 会存下残缺的全局 zig 缓存）。
       - name: 安装 zig（musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+          use-cache: "false"
 
       - uses: actions/setup-node@v6
         with:

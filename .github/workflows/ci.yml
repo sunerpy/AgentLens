@@ -233,10 +233,21 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # use-cache 关掉：一个 cancelled run 就能永久卡住 Windows CI，而这缓存并不省时间。
+      #   风险：cancel-in-progress 取消 job 时 post 步骤仍可能把**写了一半**的全局 zig
+      #   缓存（ZIG_GLOBAL_CACHE_DIR，libubsan_rt.a 等 compiler-rt 就编在这里）存上去；
+      #   此后每个 job 都恢复它并在 cargo zigbuild 链接期死掉，实测连续复现两次，删掉
+      #   setup-zig-cache-* 条目才转绿。同期 release.yml 的 Windows job 没恢复它而照常
+      #   通过 —— 坏的是缓存内容，不是代码。
+      #   收益：实测 run 31377540123，安装与 post 保存同量级 —— Windows 18s+16s、
+      #   macOS 61s+65s、Linux 6s+1s。
+      # 只关这一个：rust-cache 与 tauri-cli 预编译实测把 CI 从 32.8 压到 23.9 分钟，留着。
+      # zig 安装包自身的下载缓存走另一条按版本内容寻址的路径，不受本开关影响。
       - name: 安装 zig（aarch64/x86_64 musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+          use-cache: "false"
 
       - uses: actions/setup-node@v6
         with:
