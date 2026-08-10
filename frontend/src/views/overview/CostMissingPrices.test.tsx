@@ -276,6 +276,148 @@ describe('SummaryCards 的成本卡片', () => {
   })
 })
 
+/**
+ * 用户第三次问「实际 $83.5228 和估算 $312,235.4418 为什么差那么多」。
+ *
+ * 这不是计算缺陷：单价是 $4.12/M 与 $4.47/M，同一量级；差额全来自覆盖量。上两轮补的覆盖量
+ * 小字没救回来，因为并排等重的两个大金额本身就在邀请相减。所以这一组断言锁的是**呈现结构**：
+ * 每层自带覆盖占比与单价，且不管三态怎么组合，都有一句写明这两个数不可比的说明。
+ */
+describe('成本卡的不可比呈现', () => {
+  /** 用户报的那组真实数字。 */
+  function reported(unavailableCount = 0): Summary {
+    const base = summary(unavailableCount)
+    base.cost.actualSum = 83.5228
+    base.cost.estimatedSum = 312_235.4418
+    base.costCoverage = {
+      actual: { recordCount: 117, billableTokens: 20_278_199 },
+      estimated: { recordCount: 287_747, billableTokens: 69_900_000_000 },
+      unavailable: { recordCount: unavailableCount, billableTokens: unavailableCount * 1_000 },
+    }
+    return base
+  }
+
+  it('每层都带覆盖占比，读者不必自己做除法就能看出差距来自覆盖量', () => {
+    render(<SummaryCards summary={reported()} />)
+
+    expect(screen.getByTestId('summary-cost-actual-share').textContent).toBe(
+      zh.overview.summary.costTierShare('0.03%'),
+    )
+    expect(screen.getByTestId('summary-cost-estimated-share').textContent).toBe(
+      zh.overview.summary.costTierShare('99.97%'),
+    )
+  })
+
+  it('单价是可比的那一个，两层单价同量级', () => {
+    render(<SummaryCards summary={reported()} />)
+
+    expect(screen.getByTestId('summary-cost-actual-unit-price').textContent).toBe('$4.1188')
+    expect(screen.getByTestId('summary-cost-estimated-unit-price').textContent).toBe('$4.4669')
+  })
+
+  it('两层都有覆盖时明确写出「不要相减」并指向单价', () => {
+    render(<SummaryCards summary={reported()} />)
+
+    const note = screen.getByTestId('summary-cost-comparability')
+    expect(note.getAttribute('data-comparability')).toBe('incomparable')
+    expect(note.textContent).toContain(
+      zh.overview.summary.costIncomparable('117', '287,747').slice(0, 20),
+    )
+    expect(note.textContent).toContain(zh.overview.summary.costUnitPriceHint)
+  })
+
+  // 两个金额竖排各占整行，而不是并排两格 —— 并排的对称本身就是「可以比较」的暗示。
+  it('两层竖排成各自独立的块，而不是等重并排', () => {
+    render(<SummaryCards summary={reported()} />)
+
+    const actual = screen.getByTestId('summary-cost-tier-actual')
+    const estimated = screen.getByTestId('summary-cost-tier-estimated')
+    expect(actual.getAttribute('data-coverage-records')).toBe('117')
+    expect(estimated.getAttribute('data-coverage-records')).toBe('287747')
+    expect(actual.parentElement).toBe(estimated.parentElement)
+    expect(actual.className).toContain('flex-col')
+  })
+
+  it('estimated 覆盖为 0 时说明 $0 是「没有记录」而不是「估算出来是 0」', () => {
+    const onlyActual = reported()
+    onlyActual.cost.estimatedSum = 0
+    onlyActual.costCoverage.estimated = { recordCount: 0, billableTokens: 0 }
+
+    render(<SummaryCards summary={onlyActual} />)
+
+    const note = screen.getByTestId('summary-cost-comparability')
+    expect(note.getAttribute('data-comparability')).toBe('actualOnly')
+    expect(note.textContent).toContain(zh.overview.summary.costActualOnly)
+    expect(screen.getByTestId('summary-cost-estimated').textContent).toBe('$0.0000')
+    // 没有可计费 Token 的层没有单价可言；写 $0 会被读成「不要钱」。
+    expect(screen.getByTestId('summary-cost-estimated-unit-price').textContent).toBe(
+      zh.overview.summary.costUnitPriceUndefined,
+    )
+  })
+
+  it('actual 覆盖为 0 时说明 $0 是「没有真实金额」而不是「实际花了 0」', () => {
+    const onlyEstimated = reported()
+    onlyEstimated.cost.actualSum = 0
+    onlyEstimated.costCoverage.actual = { recordCount: 0, billableTokens: 0 }
+
+    render(<SummaryCards summary={onlyEstimated} />)
+
+    const note = screen.getByTestId('summary-cost-comparability')
+    expect(note.getAttribute('data-comparability')).toBe('estimatedOnly')
+    expect(note.textContent).toContain(zh.overview.summary.costEstimatedOnly)
+    expect(screen.getByTestId('summary-cost-actual-unit-price').textContent).toBe(
+      zh.overview.summary.costUnitPriceUndefined,
+    )
+    expect(screen.getByTestId('summary-cost-estimated-share').textContent).toBe(
+      zh.overview.summary.costTierShare('100.00%'),
+    )
+  })
+
+  it('两层都没有覆盖时说明两个 $0 都是「没有数据」', () => {
+    const empty = reported()
+    empty.cost.actualSum = 0
+    empty.cost.estimatedSum = 0
+    empty.costCoverage = {
+      actual: { recordCount: 0, billableTokens: 0 },
+      estimated: { recordCount: 0, billableTokens: 0 },
+      unavailable: { recordCount: 0, billableTokens: 0 },
+    }
+
+    render(<SummaryCards summary={empty} />)
+
+    const note = screen.getByTestId('summary-cost-comparability')
+    expect(note.getAttribute('data-comparability')).toBe('empty')
+    expect(note.textContent).toContain(zh.overview.summary.costNoCoverage)
+    // 没有任何可计费 Token 时占比无定义，不能写 0.00%（那等于宣称「占了 0%」）。
+    expect(screen.getByTestId('summary-cost-actual-share').textContent).toBe(
+      zh.overview.summary.costTierShareUnknown,
+    )
+  })
+
+  // 三态永不相加：卡片里不得出现 actual + estimated 的和。
+  it('卡片里不出现两个金额的和', () => {
+    render(<SummaryCards summary={reported(2)} />)
+
+    const card = screen.getByTestId('summary-cost-card')
+    const sum = 83.5228 + 312_235.4418
+    expect(card.textContent).not.toContain(
+      sum.toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 }),
+    )
+    expect(card.textContent).toContain('$83.5228')
+    expect(card.textContent).toContain('$312,235.4418')
+  })
+
+  it('无可信成本那层仍然不给单价，只报记录数与覆盖量', () => {
+    render(<SummaryCards summary={reported(7)} />)
+
+    expect(screen.getByTestId('summary-cost-unavailable').textContent).toBe('7')
+    expect(screen.getByTestId('summary-cost-unavailable-coverage').textContent).toBe(
+      zh.overview.summary.costCoverage('7', '7K'),
+    )
+    expect(screen.queryByTestId('summary-cost-unavailable-unit-price')).toBeNull()
+  })
+})
+
 // ---------------------------------------------------------------------------
 // 区间口径：清单必须是表头总数的分解
 // ---------------------------------------------------------------------------

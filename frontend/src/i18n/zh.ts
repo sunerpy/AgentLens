@@ -183,6 +183,33 @@ export const zh = {
       costDescription: '实际 / 估算 / 缺失分层，永不相加',
       costCoverage: (records: string, tokens: string) =>
         `${records} 条记录 · ${tokens} 可计费 Token`,
+
+      /**
+       * 用户第三次问「实际 $83.5228 和估算 $312,235.4418 为什么差那么多」，前两轮补的覆盖量
+       * 标注没救回来。原因不在算法：实测单价是 $4.12/M 与 $4.47/M，同一量级；3700 倍的差额
+       * **全部**来自覆盖量（记录数差 2459 倍）。四个源里只有 OpenCode 带 `CostSource::Actual`，
+       * 且只有 117 条真有金额，所以这两个金额不是「同一批用量的两种算法」，而是**两批完全
+       * 不同的记录**。
+       *
+       * 上一轮失败的原因是：把两个等重的大金额并排放在同一视觉层级，本身就在邀请用户相减，
+       * 补在下面的小字只是这场比较的脚注。所以这轮改的是结构——竖排分层、给出覆盖占比与
+       * 单价（读者不必自己做除法），并显式写出「不要相减」。
+       */
+      costSplitLabel: '覆盖分布（按可计费 Token）',
+      costTierShare: (share: string) => `覆盖 ${share}`,
+      costTierShareUnknown: '本区间没有可计费 Token',
+      costUnitPriceLabel: '单价（每百万可计费 Token）',
+      /** 该层没有可计费 Token 时单价无定义；写「—」而不是 $0，$0 会被读成「不要钱」。 */
+      costUnitPriceUndefined: '—',
+      costUnitPriceHint: '单价已除掉覆盖量差异，是这张卡里唯一可以横向比较的数',
+      costIncomparable: (actualRecords: string, estimatedRecords: string) =>
+        `这两个金额覆盖的是不同的记录：实际 ${actualRecords} 条，估算 ${estimatedRecords} 条。金额差主要来自覆盖量，不是算法差异，所以两个金额不要相减也不要互相比较；要比就比上面的单价。`,
+      costActualOnly:
+        '本区间只有实际成本有覆盖：估算那格的 $0 是「没有记录落在估算层」，不是「估算出来是 0」。',
+      costEstimatedOnly:
+        '本区间只有估算成本有覆盖：实际那格的 $0 是「没有记录带真实金额」，不是「实际花了 0」。',
+      costNoCoverage:
+        '本区间没有任何记录带成本覆盖，两格的 $0 都是「没有数据」，不是「没有花钱」。',
       costUnavailableLabel: '无可信成本',
       costUnavailableUnit: '条',
       costUnavailableHint: '这些记录不计入任何金额，也不当 0',

@@ -81,6 +81,45 @@ test('summary cards render the seeded aggregate literals', async ({ page }) => {
   await expect(page.getByTestId('summary-active-session-count')).toHaveText('14')
 })
 
+/**
+ * 用户第三次问「实际和估算为什么差那么多」（$83.5228 对 $312,235.4418）。
+ *
+ * 不是算法问题：单价 $4.12/M 对 $4.47/M，同一量级；差额全来自覆盖量。前两轮补的小字标注没用，
+ * 因为并排等重的两个大金额本身就在邀请读者相减。所以这里断言的是**读者不做除法也能看懂**：
+ * 每层自带覆盖占比与单价，且明确写出「不要相减」。
+ *
+ * 种子数据的覆盖是 538,000 / 118,550 / 2,100 可计费 Token（合计 658,650），
+ * 所以实际层 81.68%、估算层 18.00%。
+ */
+test('成本卡把「实际 vs 估算」呈现为不可比，而不是并排让人相减', async ({ page }) => {
+  await openOverview(page)
+
+  const card = page.getByTestId('summary-cost-card')
+
+  // 覆盖占比：读者一眼看出两层覆盖的不是同一批记录。
+  await expect(page.getByTestId('summary-cost-actual-share')).toHaveText(
+    zh.overview.summary.costTierShare('81.68%'),
+  )
+  await expect(page.getByTestId('summary-cost-estimated-share')).toHaveText(
+    zh.overview.summary.costTierShare('18.00%'),
+  )
+
+  // 单价是唯一可横向比较的数：$0.0484 / 0.538M ≈ $0.09，$0.0075 / 0.11855M ≈ $0.063。
+  await expect(page.getByTestId('summary-cost-actual-unit-price')).toHaveText('$0.0900')
+  await expect(page.getByTestId('summary-cost-estimated-unit-price')).toHaveText('$0.0633')
+
+  const note = page.getByTestId('summary-cost-comparability')
+  await expect(note).toBeVisible()
+  await expect(note).toHaveAttribute('data-comparability', 'incomparable')
+  await expect(note).toContainText('不要相减')
+  await expect(note).toContainText(zh.overview.summary.costUnitPriceHint)
+
+  // 三态永不相加：卡片里不得出现 0.0484 + 0.0075 = 0.0559。
+  await expect(card).not.toContainText('$0.0559')
+
+  await qaScreenshot(page, 'cost-incomparable.png')
+})
+
 test('the 部分缺失 badge marks the mixed-cost day and never merges cost buckets', async ({
   page,
 }) => {

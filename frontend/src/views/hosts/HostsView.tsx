@@ -9,11 +9,11 @@
  * shared error panel instead of several partial ones, and so the list and the scheduler
  * status can never disagree about which hosts exist.
  */
-import { useCallback, useState } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ErrorState, LoadingState } from '@/components/app-state'
-import type { RefreshEvent, SourceStatus } from '@/generated'
+import type { Host, RefreshEvent, SourceStatus } from '@/generated'
 import { zh } from '@/i18n/zh'
 import { getRefreshStatus, hostsList, hostsSupportedSources } from '@/lib/ipc'
 
@@ -37,6 +37,21 @@ function upsertStatus(statuses: SourceStatus[], status: SourceStatus): SourceSta
   return statuses.map((candidate, index) => (index === existing ? status : candidate))
 }
 
+/**
+ * Frozen empty fallbacks.
+ *
+ * `?? []` would allocate a new array on every render, and `HostList`'s rows are memoised on the
+ * identity of exactly these values — a fresh literal per render silently re-renders every row
+ * while a refresh round is in flight, which is the scroll stutter this file is guarding against.
+ */
+const NO_HOSTS: readonly Host[] = []
+const NO_STATUSES: readonly SourceStatus[] = []
+const NO_SOURCES: readonly string[] = []
+
+/**
+ * `upsertStatus` preserves the identity of every entry it does not replace, so this rebuild only
+ * invalidates the one slot the event describes. `HostRow`'s comparator reads exactly that.
+ */
 function applyRefreshEvent(statuses: SourceStatus[], event: RefreshEvent): SourceStatus[] {
   switch (event.event) {
     case 'started':
@@ -84,7 +99,10 @@ export function HostsView() {
   )
 
   const failure = hosts.error ?? statuses.error
-  const rows = joinHostStatus(hosts.data ?? [], statuses.data ?? [])
+  const rows = useMemo(
+    () => joinHostStatus(hosts.data ?? NO_HOSTS, statuses.data ?? NO_STATUSES),
+    [hosts.data, statuses.data],
+  )
 
   return (
     <section data-testid="view-hosts" className="flex flex-col gap-4">
@@ -111,7 +129,7 @@ export function HostsView() {
           ) : (
             <HostList
               rows={rows}
-              supportedSources={supportedSources.data ?? []}
+              supportedSources={supportedSources.data ?? NO_SOURCES}
               selectedHostId={selectedHostId}
               onSelect={setSelectedHostId}
               onRefreshEvent={onRefreshEvent}

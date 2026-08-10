@@ -10,14 +10,38 @@
  *
  * Tone discipline matches the other four views — red is reserved for a genuine failure.
  * `alreadyRunning`, `idle` and "never succeeded" are ordinary states and stay neutral.
+ *
+ * ### Why every row is memoised
+ *
+ * A refresh round emits one `RefreshEvent` per `(host_id, source)` slot, and each event rewrites
+ * the refresh-status cache entry — after which `joinHostStatus` hands this list brand-new wrapper
+ * objects and brand-new status arrays for **every** host, even the ones the event never touched.
+ * Rendered plainly that means one slot going `running` re-renders every row's whole subtree
+ * (headline badges, per-source list, and the source picker with its two `useMutation` hooks), so
+ * scrolling during a refresh competed with React reconciliation for the main thread. That is the
+ * "刷新时滚动条卡顿" report: the collection itself already runs on a Rust worker thread.
+ *
+ * So rows take `host` + `statuses` rather than the wrapper, and {@link sameRowProps} compares the
+ * status array **element-wise by identity**: the join's fresh array is transparent, while the one
+ * `SourceStatus` the scheduler actually replaced is not. Row counts here are single digits to a
+ * few dozen, so this is the whole fix — no virtualisation, which would add a dependency (banned)
+ * and buy nothing at this scale.
+ *
+ * Two consequences worth stating, because breaking either silently undoes the fix:
+ *  1. Every prop a row receives must be reference-stable across renders. `HostsView` owns that
+ *     for `supportedSources` / `onSelect` / `onRefreshEvent`; do not inline a fresh array or
+ *     lambda at a call site.
+ *  2. `rowStateKey` / `hostStateKey` are called **directly, never through `useMemo`**. Both are
+ *     a `.some()` over a handful of statuses — memoising them would cost more than it saves —
+ *     and `HostList.render.test.tsx` counts renders through them, which a memo hit would hide.
  */
-import { useState } from 'react'
+import { memo, useCallback, useMemo, useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { useReportRange } from '@/app/reportRange'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import type { Host, RefreshEvent, TriggerRefreshResult } from '@/generated'
+import type { Host, RefreshEvent, SourceStatus, TriggerRefreshResult } from '@/generated'
 import { zh } from '@/i18n/zh'
 import { invalidateArchiveQueries } from '@/lib/archiveQueries'
 import { hostsDelete, hostsUpdate, triggerRefresh } from '@/lib/ipc'
@@ -59,12 +83,25 @@ async function refreshEveryHost(
   return { rounds, failures }
 }
 
-/** One scheduler slot: its source name, state and — when it failed — the backend remediation. */
-function SourceRow({ row, source }: { row: HostRowModel; source: string }) {
-  const status = row.statuses.find((candidate) => candidate.source === source)
+/**
+ * One scheduler slot: its source name, state and — when it failed — the backend remediation.
+ *
+ * Takes the already-resolved `status` instead of scanning `row.statuses` itself, so the slot the
+ * refresh event replaced is the only one whose props change. `undefined` stays a legal value: a
+ * source the host has enabled but the scheduler has not registered yet renders as 状态未知.
+ */
+const SourceRow = memo(function SourceRow({
+  hostId,
+  source,
+  status,
+}: {
+  hostId: string
+  source: string
+  status: SourceStatus | undefined
+}) {
   const state = hostStateKey(status)
   const errorText = hostErrorText(status)
-  const testId = `host-source-${row.host.hostId}-${source}`
+  const testId = `host-source-${hostId}-${source}`
 
   return (
     <li
@@ -102,7 +139,7 @@ function SourceRow({ row, source }: { row: HostRowModel; source: string }) {
       ) : null}
     </li>
   )
-}
+})
 
 /**
  * The per-host source picker.
@@ -116,7 +153,7 @@ function SourceRow({ row, source }: { row: HostRowModel; source: string }) {
  * host has enabled but that the export no longer contains is still rendered — dropping it would
  * silently disable it on the next save.
  */
-function SourceEditor({
+const SourceEditor = memo(function SourceEditor({
   host,
   available,
   onRefreshEvent,
@@ -130,7 +167,11 @@ function SourceEditor({
   const [validation, setValidation] = useState<string | null>(null)
 
   const selected = draft ?? host.enabledSources
-  const options = [...new Set([...available, ...host.enabledSources])]
+  // Two `Set` allocations per render otherwise, on a list that only changes when the host does.
+  const options = useMemo(
+    () => [...new Set([...available, ...host.enabledSources])],
+    [available, host.enabledSources],
+  )
 
   const firstScan = useMutation<TriggerRefreshResult[], unknown, void>({
     mutationFn: () => triggerRefresh(host.hostId, onRefreshEvent),
@@ -161,6 +202,7 @@ function SourceEditor({
       if (added.length > 0) firstScan.mutate()
     },
   })
+  const { mutate: saveMutate, reset: saveReset } = save
 
   const scanOutcomes = firstScan.data
   const scanStatus = firstScan.isPending
@@ -176,12 +218,24 @@ function SourceEditor({
     (draft.length !== host.enabledSources.length ||
       draft.some((source) => !host.enabledSources.includes(source)))
 
-  function toggle(source: string, checked: boolean) {
-    const next = checked ? [...selected, source] : selected.filter((each) => each !== source)
-    setDraft(options.filter((candidate) => next.includes(candidate)))
+  const toggle = useCallback(
+    (source: string, checked: boolean) => {
+      const next = checked ? [...selected, source] : selected.filter((each) => each !== source)
+      setDraft(options.filter((candidate) => next.includes(candidate)))
+      setValidation(null)
+      saveReset()
+    },
+    [options, saveReset, selected],
+  )
+
+  const submit = useCallback(() => {
+    if (selected.length === 0) {
+      setValidation(zh.hosts.list.sourcesRequireOne)
+      return
+    }
     setValidation(null)
-    save.reset()
-  }
+    saveMutate(selected)
+  }, [saveMutate, selected])
 
   if (options.length === 0) return null
 
@@ -218,14 +272,7 @@ function SourceEditor({
           variant="outline"
           data-testid={`host-sources-save-${host.hostId}`}
           disabled={!dirty || save.isPending}
-          onClick={() => {
-            if (selected.length === 0) {
-              setValidation(zh.hosts.list.sourcesRequireOne)
-              return
-            }
-            setValidation(null)
-            save.mutate(selected)
-          }}
+          onClick={submit}
         >
           {save.isPending ? zh.hosts.list.sourcesSaving : zh.hosts.list.sourcesSave}
         </Button>
@@ -270,41 +317,79 @@ function SourceEditor({
       ) : null}
     </div>
   )
-}
+})
 
-function HostRow({
-  row,
-  supportedSources,
-  selected,
-  timezone,
-  onSelect,
-  onRefreshEvent,
-}: {
-  row: HostRowModel
+interface HostRowProps {
+  host: Host
+  statuses: readonly SourceStatus[]
   supportedSources: readonly string[]
   selected: boolean
   timezone: string
   onSelect: (hostId: string) => void
   onRefreshEvent: (event: RefreshEvent) => void
-}) {
+}
+
+/**
+ * Element-wise on `statuses` and identity on everything else.
+ *
+ * `joinHostStatus` allocates a fresh array per host on every refresh event, so the default
+ * shallow comparison would report a change for every row while only one slot actually moved.
+ * The individual `SourceStatus` objects are the honest signal: the scheduler replaces exactly the
+ * one it updated and TanStack's structural sharing preserves the rest.
+ */
+function sameRowProps(previous: HostRowProps, next: HostRowProps): boolean {
+  return (
+    previous.host === next.host &&
+    previous.supportedSources === next.supportedSources &&
+    previous.selected === next.selected &&
+    previous.timezone === next.timezone &&
+    previous.onSelect === next.onSelect &&
+    previous.onRefreshEvent === next.onRefreshEvent &&
+    previous.statuses.length === next.statuses.length &&
+    previous.statuses.every((status, index) => status === next.statuses[index])
+  )
+}
+
+const HostRow = memo(function HostRow({
+  host,
+  statuses,
+  supportedSources,
+  selected,
+  timezone,
+  onSelect,
+  onRefreshEvent,
+}: HostRowProps) {
   const queryClient = useQueryClient()
-  const { host } = row
-  const state = rowStateKey(row.statuses)
-  const lastSuccess = formatTimestampInZone(hostLastSuccessUtc(row), timezone)
+  const state = rowStateKey(statuses)
+  const lastSuccess = useMemo(
+    () => formatTimestampInZone(hostLastSuccessUtc({ host, statuses }), timezone),
+    [host, statuses, timezone],
+  )
 
   /**
    * `enabledSources` is what the host is configured to collect; the scheduler may not have
    * registered a slot yet. Rendering the union means a configured-but-unregistered source
    * shows as "状态未知" instead of vanishing.
+   *
+   * Resolved to `(source, status)` pairs here rather than per-`SourceRow` so the lookup happens
+   * once per row instead of once per slot, and so each slot's props change only when its own
+   * status does.
    */
-  const sources = [
-    ...new Set([...host.enabledSources, ...row.statuses.map((status) => status.source)]),
-  ]
+  const slots = useMemo(
+    () =>
+      [...new Set([...host.enabledSources, ...statuses.map((status) => status.source)])].map(
+        (source) => ({
+          source,
+          status: statuses.find((candidate) => candidate.source === source),
+        }),
+      ),
+    [host.enabledSources, statuses],
+  )
 
-  const invalidate = async () => {
+  const invalidate = useCallback(async () => {
     await queryClient.invalidateQueries({ queryKey: HOSTS_QUERY_KEY })
     await queryClient.invalidateQueries({ queryKey: REFRESH_STATUS_QUERY_KEY })
-  }
+  }, [queryClient])
 
   const refresh = useMutation<TriggerRefreshResult[], unknown, void>({
     mutationFn: () => triggerRefresh(host.hostId, onRefreshEvent),
@@ -316,6 +401,17 @@ function HostRow({
     mutationFn: () => hostsDelete(host.hostId),
     onSuccess: invalidate,
   })
+  const { mutate: refreshMutate } = refresh
+  const { mutate: removeMutate } = remove
+
+  /**
+   * `mutate` — not the whole mutation result — is the dependency: TanStack keeps `mutate` stable
+   * across renders while the result object is rebuilt every time, so depending on the latter
+   * would hand every child a fresh callback and defeat the memoisation above.
+   */
+  const handleSelect = useCallback(() => onSelect(host.hostId), [host.hostId, onSelect])
+  const handleRefresh = useCallback(() => refreshMutate(), [refreshMutate])
+  const handleDelete = useCallback(() => removeMutate(), [removeMutate])
 
   /**
    * `alreadyRunning` only when *every* dispatched round said so. Any started round means the
@@ -364,7 +460,7 @@ function HostRow({
               size="sm"
               variant="ghost"
               data-testid={`host-credentials-${host.hostId}`}
-              onClick={() => onSelect(host.hostId)}
+              onClick={handleSelect}
             >
               {zh.hosts.list.manageCredentials}
             </Button>
@@ -374,7 +470,7 @@ function HostRow({
             variant="outline"
             data-testid={`host-refresh-${host.hostId}`}
             disabled={refresh.isPending}
-            onClick={() => refresh.mutate()}
+            onClick={handleRefresh}
           >
             {refresh.isPending ? zh.hosts.list.refreshing : zh.hosts.list.refresh}
           </Button>
@@ -383,7 +479,7 @@ function HostRow({
             variant="ghost"
             data-testid={`host-delete-${host.hostId}`}
             disabled={remove.isPending}
-            onClick={() => remove.mutate()}
+            onClick={handleDelete}
           >
             {remove.isPending ? zh.hosts.list.deleting : zh.hosts.list.delete}
           </Button>
@@ -406,7 +502,7 @@ function HostRow({
         <span className="text-xs text-muted-foreground select-none">
           {zh.hosts.list.columnSources}
         </span>
-        {sources.length === 0 ? (
+        {slots.length === 0 ? (
           <span
             data-testid={`host-sources-empty-${host.hostId}`}
             className="text-xs text-muted-foreground"
@@ -415,8 +511,13 @@ function HostRow({
           </span>
         ) : (
           <ul data-testid={`host-sources-${host.hostId}`} className="flex flex-col gap-1">
-            {sources.map((source) => (
-              <SourceRow key={source} row={row} source={source} />
+            {slots.map((slot) => (
+              <SourceRow
+                key={slot.source}
+                hostId={host.hostId}
+                source={slot.source}
+                status={slot.status}
+              />
             ))}
           </ul>
         )}
@@ -431,7 +532,7 @@ function HostRow({
       ) : null}
     </li>
   )
-}
+}, sameRowProps)
 
 export function HostList({
   rows,
@@ -459,6 +560,8 @@ export function HostList({
       await invalidateArchiveQueries(queryClient)
     },
   })
+  const { mutate: refreshAllMutate } = refreshAll
+  const handleRefreshAll = useCallback(() => refreshAllMutate(), [refreshAllMutate])
 
   const result = refreshAll.data
 
@@ -482,7 +585,7 @@ export function HostList({
             size="sm"
             data-testid="host-refresh-all"
             disabled={refreshAll.isPending || rows.length === 0}
-            onClick={() => refreshAll.mutate()}
+            onClick={handleRefreshAll}
           >
             {refreshAll.isPending ? zh.hosts.list.refreshingAll : zh.hosts.list.refreshAll}
           </Button>
@@ -507,7 +610,8 @@ export function HostList({
             {rows.map((row) => (
               <HostRow
                 key={row.host.hostId}
-                row={row}
+                host={row.host}
+                statuses={row.statuses}
                 supportedSources={supportedSources}
                 selected={row.host.hostId === selectedHostId}
                 timezone={timezone}

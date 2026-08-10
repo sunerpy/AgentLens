@@ -12,7 +12,9 @@ import { zh } from '@/i18n/zh'
 import { cn } from '@/lib/utils'
 import type { MissingPriceEntry } from '@/views/overview/costMissing'
 import { CostMissingPrices } from '@/views/overview/CostMissingPrices'
-import { formatCompact, formatCount, formatMoney } from '@/views/overview/format'
+import type { CostTiersView, CostTierView } from '@/views/overview/costTiers'
+import { costTiers } from '@/views/overview/costTiers'
+import { formatCompact, formatCount, formatMoney, formatShare } from '@/views/overview/format'
 import { cacheTokens } from '@/views/overview/trendModel'
 
 /**
@@ -141,6 +143,113 @@ function TokenCard({ summary }: { summary: Summary }) {
 }
 
 /**
+ * One costed coverage layer: how much of the range it covers, what it came to, and — the only
+ * cross-tier comparable figure — what that works out to per million billable tokens.
+ *
+ * Stacked, not columned. The previous layout put the two amounts in two equal grid cells, and
+ * that symmetry is itself a claim: it says "these two numbers are the same kind of thing, compare
+ * them". They are not — see `costTiers.ts`. A full-width row per tier, each carrying its own
+ * coverage share, reads as two slices of the range instead of two takes on one number.
+ */
+function CostTierRow({
+  label,
+  tier,
+  amount,
+  amountTestId,
+}: {
+  label: string
+  tier: CostTierView
+  amount: number
+  amountTestId: string
+}) {
+  const share = tier.tokenShare
+  return (
+    <div
+      data-testid={`summary-cost-tier-${tier.key}`}
+      data-coverage-records={tier.recordCount}
+      className="flex flex-col gap-1.5 rounded-lg border border-border bg-muted/20 px-3 py-2.5"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium tracking-wide text-muted-foreground">{label}</span>
+          <span
+            data-testid={`summary-cost-${tier.key}-share`}
+            className="rounded-full bg-foreground/5 px-2 py-0.5 text-[0.7rem] font-medium tabular-nums ring-1 ring-border"
+          >
+            {share === null
+              ? zh.overview.summary.costTierShareUnknown
+              : zh.overview.summary.costTierShare(formatShare(share))}
+          </span>
+        </div>
+        <span
+          data-testid={amountTestId}
+          title={formatMoney(amount)}
+          className="font-heading max-w-full text-xl leading-tight font-semibold tabular-nums [overflow-wrap:anywhere]"
+        >
+          {formatMoney(amount)}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[0.7rem] text-muted-foreground">
+        <span>{zh.overview.summary.costUnitPriceLabel}</span>
+        <span
+          data-testid={`summary-cost-${tier.key}-unit-price`}
+          className="font-medium tabular-nums text-foreground"
+        >
+          {tier.unitPricePerMillion === null
+            ? zh.overview.summary.costUnitPriceUndefined
+            : formatMoney(tier.unitPricePerMillion)}
+        </span>
+      </div>
+      <span
+        data-testid={`summary-cost-${tier.key}-coverage`}
+        className="text-[0.7rem] leading-relaxed text-muted-foreground"
+      >
+        {zh.overview.summary.costCoverage(
+          formatCount(tier.recordCount),
+          formatCompact(tier.billableTokens),
+        )}
+      </span>
+    </div>
+  )
+}
+
+/**
+ * The sentence that answers "为什么差那么多" without the reader doing any arithmetic.
+ *
+ * Always rendered, in all four coverage shapes. The single-tier shapes matter as much as the
+ * mixed one: an empty tier's `$0.0000` is the absence of coverage, and letting it stand
+ * unqualified beside a real amount is the same misreading in a different costume.
+ */
+function CostComparabilityNote({ tiers }: { tiers: CostTiersView }) {
+  const text =
+    tiers.comparability === 'incomparable'
+      ? zh.overview.summary.costIncomparable(
+          formatCount(tiers.actual.recordCount),
+          formatCount(tiers.estimated.recordCount),
+        )
+      : tiers.comparability === 'actualOnly'
+        ? zh.overview.summary.costActualOnly
+        : tiers.comparability === 'estimatedOnly'
+          ? zh.overview.summary.costEstimatedOnly
+          : zh.overview.summary.costNoCoverage
+  return (
+    <div
+      data-testid="summary-cost-comparability"
+      data-comparability={tiers.comparability}
+      role="note"
+      className="flex flex-col gap-1 rounded-lg border border-border border-dashed bg-muted/30 px-3 py-2"
+    >
+      <p className="text-[0.7rem] leading-relaxed text-muted-foreground">{text}</p>
+      {tiers.comparability === 'incomparable' ? (
+        <p className="text-[0.7rem] leading-relaxed text-muted-foreground">
+          {zh.overview.summary.costUnitPriceHint}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+/**
  * The 无可信成本 block is gated on a non-zero count, not merely styled differently at zero.
  *
  * Its second line — "这些记录不计入任何金额，也不当 0" — explains a discrepancy between the two
@@ -159,6 +268,7 @@ function CostCard({
 }) {
   const { cost } = summary
   const { costCoverage } = summary
+  const tiers = costTiers(cost, costCoverage)
   const hasUnavailable = cost.unavailableCount > 0
   return (
     <Card className="lg:col-span-2" data-testid="summary-cost-card">
@@ -168,45 +278,23 @@ function CostCard({
         </CardTitle>
         <CardDescription>{zh.overview.summary.costDescription}</CardDescription>
       </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <div className="grid grid-cols-2 gap-x-6 gap-y-4">
-          <div className="flex min-w-0 flex-col gap-1.5">
-            <Metric
-              label={zh.common.cost.actual}
-              value={formatMoney(cost.actualSum)}
-              testId="summary-cost-actual"
-              emphasis
-              allowWrap
-            />
-            <span
-              data-testid="summary-cost-actual-coverage"
-              className="text-[0.7rem] leading-relaxed text-muted-foreground"
-            >
-              {zh.overview.summary.costCoverage(
-                formatCount(costCoverage.actual.recordCount),
-                formatCompact(costCoverage.actual.billableTokens),
-              )}
-            </span>
-          </div>
-          <div className="flex min-w-0 flex-col gap-1.5">
-            <Metric
-              label={zh.common.cost.estimated}
-              value={formatMoney(cost.estimatedSum)}
-              testId="summary-cost-estimated"
-              emphasis
-              allowWrap
-            />
-            <span
-              data-testid="summary-cost-estimated-coverage"
-              className="text-[0.7rem] leading-relaxed text-muted-foreground"
-            >
-              {zh.overview.summary.costCoverage(
-                formatCount(costCoverage.estimated.recordCount),
-                formatCompact(costCoverage.estimated.billableTokens),
-              )}
-            </span>
-          </div>
-        </div>
+      <CardContent className="flex flex-col gap-3">
+        <span className="text-[0.7rem] font-medium tracking-wide text-muted-foreground select-none">
+          {zh.overview.summary.costSplitLabel}
+        </span>
+        <CostTierRow
+          label={zh.common.cost.actual}
+          tier={tiers.actual}
+          amount={cost.actualSum}
+          amountTestId="summary-cost-actual"
+        />
+        <CostTierRow
+          label={zh.common.cost.estimated}
+          tier={tiers.estimated}
+          amount={cost.estimatedSum}
+          amountTestId="summary-cost-estimated"
+        />
+        <CostComparabilityNote tiers={tiers} />
         {hasUnavailable ? (
           <>
             <div
