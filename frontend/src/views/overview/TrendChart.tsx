@@ -32,15 +32,16 @@ import {
 
 import { Button } from '@/components/ui/button'
 import { EmptyState, LoadingState } from '@/components/app-state'
-import type { CoverageNote, CoverageStatus } from '@/generated'
+import type { CoverageNote, CoverageShortfall, CoverageStatus } from '@/generated'
 import { zh } from '@/i18n/zh'
 import { cn } from '@/lib/utils'
 import { CostPartialBadge } from '@/views/overview/CostPartialBadge'
 import {
-  coverageReasonFor,
+  coverageExplanationFor,
   coverageReasonIndex,
-  coverageReasonPairs,
-  type CoverageReason,
+  hasCoverageGap,
+  isBucketInProgress,
+  type CoverageExplanation,
   type CoverageReasonIndex,
 } from '@/views/overview/coverageReason'
 import {
@@ -233,6 +234,7 @@ interface TrendTooltipProps {
   rows?: TrendRow[]
   metric?: TrendMetric
   reasons?: CoverageReasonIndex
+  nowMs?: number
 }
 
 function TooltipRow({ label, value, testId }: { label: string; value: string; testId?: string }) {
@@ -244,16 +246,16 @@ function TooltipRow({ label, value, testId }: { label: string; value: string; te
   )
 }
 
-function TrendTooltip({ active, label, rows, metric, reasons }: TrendTooltipProps) {
+function TrendTooltip({ active, label, rows, metric, reasons, nowMs }: TrendTooltipProps) {
   if (active !== true || typeof label !== 'string' || rows === undefined || metric === undefined) {
     return null
   }
   const row = rows.find((candidate) => candidate.label === label)
   if (row === undefined) return null
-  const reason =
-    row.coverage === 'full' || reasons === undefined
+  const explanation =
+    row.coverage === 'full' || reasons === undefined || nowMs === undefined
       ? undefined
-      : coverageReasonFor(reasons, row.label)
+      : coverageExplanationFor(reasons, row, nowMs)
 
   const missing = row.coverage === 'none'
   // Rendered only when non-zero, unlike the unconditional cost rows above: this row exists to
@@ -289,7 +291,7 @@ function TrendTooltip({ active, label, rows, metric, reasons }: TrendTooltipProp
           <p data-testid="trend-tooltip-gap-note" className="pt-2 text-muted-foreground">
             {zh.overview.trend.tooltipNoCoverage}
           </p>
-          {reason === undefined ? null : <CoverageReasonNote reason={reason} />}
+          {explanation === undefined ? null : <CoverageReasonNote explanation={explanation} />}
         </>
       ) : (
         <div className="flex flex-col gap-1 pt-2">
@@ -347,7 +349,7 @@ function TrendTooltip({ active, label, rows, metric, reasons }: TrendTooltipProp
               {zh.overview.trend.tooltipZeroUsage}
             </p>
           ) : null}
-          {reason === undefined ? null : <CoverageReasonNote reason={reason} />}
+          {explanation === undefined ? null : <CoverageReasonNote explanation={explanation} />}
         </div>
       )}
     </div>
@@ -362,10 +364,10 @@ function TrendTooltip({ active, label, rows, metric, reasons }: TrendTooltipProp
  * a source that was never collected on that host. Collapsing them into one sentence would leave
  * the reader unable to tell which of the two they are looking at.
  */
-function CoverageReasonPairs({ reason }: { reason: CoverageReason }) {
+function CoverageReasonPairs({ pairs }: { pairs: readonly CoverageShortfall[] }) {
   return (
     <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-      {coverageReasonPairs(reason).map((shortfall) => (
+      {pairs.map((shortfall) => (
         <span
           key={`${shortfall.hostId}/${shortfall.source}`}
           data-testid="coverage-reason-pair"
@@ -388,23 +390,44 @@ function CoverageReasonPairs({ reason }: { reason: CoverageReason }) {
   )
 }
 
-function CoverageReasonNote({ reason }: { reason: CoverageReason | null }) {
+/**
+ * An unfinished bucket keeps its badge but swaps the pair list for one sentence: the pairs are the
+ * inevitable consequence of collecting up to `now`, so listing them reads as a defect report on
+ * every refresh. Pairs still appear when something survives that filter — see
+ * `coverageExplanationFor`.
+ */
+function CoverageReasonNote({ explanation }: { explanation: CoverageExplanation }) {
   return (
     <div
       data-testid="coverage-reason"
+      data-in-progress={explanation.inProgress ? 'true' : 'false'}
       className="mt-1 flex flex-col gap-1 border-t border-border pt-2"
     >
-      <span className="font-medium">{zh.overview.trend.coverageReasonTitle}</span>
-      {reason === null ? (
+      <span className="font-medium">
+        {explanation.inProgress
+          ? zh.overview.trend.coverageInProgressTitle
+          : zh.overview.trend.coverageReasonTitle}
+      </span>
+      {explanation.inProgress ? (
+        <span data-testid="coverage-reason-in-progress" className="text-muted-foreground">
+          {zh.overview.trend.coverageInProgressNote}
+        </span>
+      ) : null}
+      {explanation.unknown ? (
         <span data-testid="coverage-reason-unknown" className="text-muted-foreground">
           {zh.overview.trend.coverageReasonUnknown}
         </span>
-      ) : (
+      ) : null}
+      {explanation.pairs.length > 0 ? (
         <>
-          <span className="text-muted-foreground">{zh.overview.trend.coverageReasonIntro}</span>
-          <CoverageReasonPairs reason={reason} />
+          <span className="text-muted-foreground">
+            {explanation.inProgress
+              ? zh.overview.trend.coverageInProgressMissingIntro
+              : zh.overview.trend.coverageReasonIntro}
+          </span>
+          <CoverageReasonPairs pairs={explanation.pairs} />
         </>
-      )}
+      ) : null}
     </div>
   )
 }
@@ -412,10 +435,27 @@ function CoverageReasonNote({ reason }: { reason: CoverageReason | null }) {
 /**
  * Always-visible counterpart to the tooltip copy. The tooltip only exists while the pointer is
  * over a bucket, so on a touch screen — and in any screenshot — the reason would otherwise be
- * unreachable. Rendered only when at least one bucket is non-`full`.
+ * unreachable.
+ *
+ * Rendered only for buckets with a gap left to report. An unfinished bucket whose every shortfall
+ * is explained by "the period has not ended" is dropped: it is guaranteed non-`full` on every
+ * refresh of every day, so listing it here turned the panel into a permanent false alarm that hid
+ * the finished buckets whose gaps are real. Its band, its chip in `TrendNotes` and its tooltip all
+ * still say 部分覆盖 — the data is genuinely incomplete, only the diagnosis is withdrawn.
  */
-function CoverageReasons({ rows, reasons }: { rows: TrendRow[]; reasons: CoverageReasonIndex }) {
-  const flagged = rows.filter((row) => row.coverage !== 'full')
+function CoverageReasons({
+  rows,
+  reasons,
+  nowMs,
+}: {
+  rows: TrendRow[]
+  reasons: CoverageReasonIndex
+  nowMs: number
+}) {
+  const flagged = rows
+    .filter((row) => row.coverage !== 'full')
+    .map((row) => ({ row, explanation: coverageExplanationFor(reasons, row, nowMs) }))
+    .filter((entry) => hasCoverageGap(entry.explanation))
   if (flagged.length === 0) return null
   return (
     <section
@@ -425,28 +465,34 @@ function CoverageReasons({ rows, reasons }: { rows: TrendRow[]; reasons: Coverag
       <span className="font-medium tracking-wide">{zh.overview.trend.coverageReasonTitle}</span>
       <span className="text-muted-foreground">{zh.overview.trend.coverageReasonIntro}</span>
       <ul className="flex flex-col gap-1.5">
-        {flagged.map((row) => {
-          const reason = coverageReasonFor(reasons, row.label)
-          return (
-            <li
-              key={row.label}
-              data-testid="trend-coverage-reason-row"
-              data-bucket={row.label}
-              data-coverage={row.coverage}
-              className="flex flex-wrap items-baseline gap-x-3 gap-y-1"
-            >
-              <span className="shrink-0 font-medium tabular-nums">{axisTick(row.label)}</span>
-              <span className="shrink-0 text-muted-foreground">{COVERAGE_LABEL[row.coverage]}</span>
-              {reason === null ? (
-                <span data-testid="coverage-reason-unknown" className="text-muted-foreground">
-                  {zh.overview.trend.coverageReasonUnknown}
-                </span>
-              ) : (
-                <CoverageReasonPairs reason={reason} />
-              )}
-            </li>
-          )
-        })}
+        {flagged.map(({ row, explanation }) => (
+          <li
+            key={row.label}
+            data-testid="trend-coverage-reason-row"
+            data-bucket={row.label}
+            data-coverage={row.coverage}
+            data-in-progress={explanation.inProgress ? 'true' : 'false'}
+            className="flex flex-wrap items-baseline gap-x-3 gap-y-1"
+          >
+            <span className="shrink-0 font-medium tabular-nums">{axisTick(row.label)}</span>
+            <span className="shrink-0 text-muted-foreground">{COVERAGE_LABEL[row.coverage]}</span>
+            {explanation.inProgress ? (
+              <span
+                data-testid="coverage-reason-in-progress-tag"
+                className="shrink-0 text-muted-foreground"
+              >
+                {zh.overview.trend.coverageInProgressTag}
+              </span>
+            ) : null}
+            {explanation.unknown ? (
+              <span data-testid="coverage-reason-unknown" className="text-muted-foreground">
+                {zh.overview.trend.coverageReasonUnknown}
+              </span>
+            ) : (
+              <CoverageReasonPairs pairs={explanation.pairs} />
+            )}
+          </li>
+        ))}
       </ul>
       <span className="text-[0.7rem] text-muted-foreground">
         {zh.overview.trend.coverageReasonHint}
@@ -533,7 +579,11 @@ function HatchPatterns() {
   )
 }
 
-function TrendNotes({ rows }: { rows: TrendRow[] }) {
+/**
+ * The unfinished bucket's chip carries 进行中 so the always-visible surface still answers "why is
+ * it not full" in three characters, now that the diagnosis panel no longer lists its pairs.
+ */
+function TrendNotes({ rows, nowMs }: { rows: TrendRow[]; nowMs: number }) {
   const flagged = rows.filter((row) => row.coverage !== 'full' || unavailableCount(row) > 0)
   if (flagged.length === 0) return null
   return (
@@ -541,21 +591,30 @@ function TrendNotes({ rows }: { rows: TrendRow[] }) {
       data-testid="trend-notes"
       className="flex flex-wrap items-center gap-2 border-t border-border pt-3"
     >
-      {flagged.map((row) => (
-        <span
-          key={row.label}
-          data-testid="trend-note"
-          data-bucket={row.label}
-          data-coverage={row.coverage}
-          className="inline-flex items-center gap-2 rounded-md bg-muted/60 px-2 py-1 text-xs"
-        >
-          <span className="font-medium tabular-nums">{axisTick(row.label)}</span>
-          {row.coverage === 'full' ? null : (
-            <span className="text-muted-foreground">{COVERAGE_LABEL[row.coverage]}</span>
-          )}
-          {unavailableCount(row) > 0 ? <CostPartialBadge /> : null}
-        </span>
-      ))}
+      {flagged.map((row) => {
+        const inProgress = row.coverage !== 'full' && isBucketInProgress(row, nowMs)
+        return (
+          <span
+            key={row.label}
+            data-testid="trend-note"
+            data-bucket={row.label}
+            data-coverage={row.coverage}
+            data-in-progress={inProgress ? 'true' : 'false'}
+            className="inline-flex items-center gap-2 rounded-md bg-muted/60 px-2 py-1 text-xs"
+          >
+            <span className="font-medium tabular-nums">{axisTick(row.label)}</span>
+            {row.coverage === 'full' ? null : (
+              <span className="text-muted-foreground">{COVERAGE_LABEL[row.coverage]}</span>
+            )}
+            {inProgress ? (
+              <span data-testid="trend-note-in-progress" className="text-muted-foreground">
+                {zh.overview.trend.coverageInProgressTag}
+              </span>
+            ) : null}
+            {unavailableCount(row) > 0 ? <CostPartialBadge /> : null}
+          </span>
+        )
+      })}
     </div>
   )
 }
@@ -698,12 +757,14 @@ function TotalChart({
   seriesKeys,
   axisMax,
   reasons,
+  nowMs,
 }: {
   rows: TrendRow[]
   metric: TrendMetric
   seriesKeys: TrendSeriesKey[]
   axisMax: number
   reasons: CoverageReasonIndex
+  nowMs: number
 }) {
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -740,7 +801,7 @@ function TotalChart({
         <Tooltip
           isAnimationActive={false}
           cursor={{ stroke: CHART_TOKENS.axis, strokeOpacity: 0.25 }}
-          content={<TrendTooltip rows={rows} metric={metric} reasons={reasons} />}
+          content={<TrendTooltip rows={rows} metric={metric} reasons={reasons} nowMs={nowMs} />}
         />
       </ComposedChart>
     </ResponsiveContainer>
@@ -762,6 +823,7 @@ function GroupedTooltip({
   metric,
   totals,
   reasons,
+  nowMs,
 }: {
   active?: boolean
   label?: string | number
@@ -770,6 +832,7 @@ function GroupedTooltip({
   metric?: TrendMetric
   totals?: TrendRow[]
   reasons?: CoverageReasonIndex
+  nowMs?: number
 }) {
   if (
     active !== true ||
@@ -784,10 +847,12 @@ function GroupedTooltip({
   if (row === undefined) return null
   const total = totals?.find((candidate) => candidate.label === label)
   const missing = row.coverage === 'none'
-  const reason =
-    row.coverage === 'full' || reasons === undefined
+  // `GroupedTrendRow` carries no bucket edges — coverage is a property of the window, not of the
+  // grouping, so the phase test reads the same ungrouped total row the coverage state came from.
+  const explanation =
+    row.coverage === 'full' || reasons === undefined || nowMs === undefined || total === undefined
       ? undefined
-      : coverageReasonFor(reasons, row.label)
+      : coverageExplanationFor(reasons, total, nowMs)
 
   return (
     <div
@@ -818,7 +883,7 @@ function GroupedTooltip({
           <p data-testid="trend-group-tooltip-gap-note" className="pt-2 text-muted-foreground">
             {zh.overview.trend.tooltipNoCoverage}
           </p>
-          {reason === undefined ? null : <CoverageReasonNote reason={reason} />}
+          {explanation === undefined ? null : <CoverageReasonNote explanation={explanation} />}
         </>
       ) : (
         <div className="flex flex-col gap-1 pt-2">
@@ -855,7 +920,7 @@ function GroupedTooltip({
               {total.cost.unavailableCount > 0 ? <CostPartialBadge className="self-start" /> : null}
             </div>
           ) : null}
-          {reason === undefined ? null : <CoverageReasonNote reason={reason} />}
+          {explanation === undefined ? null : <CoverageReasonNote explanation={explanation} />}
         </div>
       )}
     </div>
@@ -972,6 +1037,7 @@ function GroupedChart({
   axisMax,
   totals,
   reasons,
+  nowMs,
 }: {
   rows: GroupedTrendRow[]
   series: GroupedSeries[]
@@ -979,6 +1045,7 @@ function GroupedChart({
   axisMax: number
   totals: TrendRow[]
   reasons: CoverageReasonIndex
+  nowMs: number
 }) {
   return (
     <ResponsiveContainer width="100%" height="100%">
@@ -1023,6 +1090,7 @@ function GroupedChart({
               metric={metric}
               totals={totals}
               reasons={reasons}
+              nowMs={nowMs}
             />
           }
         />
@@ -1064,6 +1132,10 @@ export function TrendChart({
 }) {
   const [metric, setMetric] = useState<TrendMetric>('tokens')
   const [selection, setSelection] = useState<LegendSelection | null>(null)
+  // Read per render rather than memoised: a memo would freeze the instant and keep calling a
+  // long-since-ended bucket "in progress". Staleness between renders is bounded by the data's own
+  // staleness — a bucket that ends while the window sits idle is reclassified on the next refresh.
+  const nowMs = Date.now()
   const reasons = useMemo(() => coverageReasonIndex(coverageNotes), [coverageNotes])
   const seriesKeys = useMemo(() => seriesKeysFor(metric), [metric])
   const axisMax = useMemo(() => valueAxisMax(rows, metric), [rows, metric])
@@ -1142,6 +1214,7 @@ export function TrendChart({
                 seriesKeys={seriesKeys}
                 axisMax={axisMax}
                 reasons={reasons}
+                nowMs={nowMs}
               />
             ) : (
               <GroupedChart
@@ -1151,6 +1224,7 @@ export function TrendChart({
                 axisMax={grouped.axisMax}
                 totals={rows}
                 reasons={reasons}
+                nowMs={nowMs}
               />
             )}
           </div>
@@ -1196,8 +1270,8 @@ export function TrendChart({
         </>
       )}
 
-      <TrendNotes rows={rows} />
-      <CoverageReasons rows={rows} reasons={reasons} />
+      <TrendNotes rows={rows} nowMs={nowMs} />
+      <CoverageReasons rows={rows} reasons={reasons} nowMs={nowMs} />
     </div>
   )
 }

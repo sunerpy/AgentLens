@@ -22,6 +22,12 @@ export type TrendSeriesKey = 'tokens' | 'actual' | 'estimated'
 export interface TrendRow {
   label: string
   startUtcMs: number
+  /**
+   * Bucket right edge, exclusive — carried so the UI can tell an *unfinished* bucket from a
+   * historical one without ever computing a boundary itself. Rust already resolved both edges
+   * with `chrono_tz` for the report timezone; these are absolute epoch instants.
+   */
+  endUtcMs: number
   coverage: SeriesPoint['coverage']
   tokens: TokenValues | null
   cost: CostTotals | null
@@ -59,6 +65,7 @@ export function toTrendRows(points: SeriesPoint[]): TrendRow[] {
     return {
       label: point.bucket.label,
       startUtcMs: point.bucket.startUtcMs,
+      endUtcMs: point.bucket.endUtcMs,
       coverage: point.coverage,
       tokens: point.tokens,
       cost: point.cost,

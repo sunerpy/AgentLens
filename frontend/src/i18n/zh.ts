@@ -328,7 +328,26 @@ export const zh = {
       coverageReasonMissing: '完全没有采集区间',
       coverageReasonPair: (hostId: string, source: string) => `${hostId} / ${source}`,
       coverageReasonUnknown: '归档里没有留下能解释该时间桶的采集区间记录',
-      coverageReasonHint: '覆盖按 (主机, 源) 逐对判定：任一对缺区间，整桶即为部分覆盖',
+      coverageReasonHint:
+        '覆盖按 (主机, 源) 逐对判定：任一对缺区间，整桶即为部分覆盖；仍在进行中的时间桶不在此列',
+
+      /**
+       * 尚未结束的时间桶。采集区间是 `[since, now]`，而 Full 要求区间完整压住整个桶 ——
+       * 所以「当前时刻所在的那个桶」永远不可能完整覆盖，跟采集健不健康无关。把它的 (主机, 源)
+       * 当缺口列出来，等于每天每次刷新都刷屏，还会把真正漏采的历史桶埋掉。
+       *
+       * 因此：斜纹带与「部分覆盖」徽章保留（数据确实不全，不该看起来和历史桶一样可信），
+       * 但理由换成「还没结束」，且不进缺口清单。
+       *
+       * `coverageInProgressMissingIntro` 是例外口子：某个 (主机, 源) 在这个桶里**完全**没有
+       * 采集区间，说明它这一整段都没采到过，这跟「桶还没结束」无关，仍要报。
+       */
+      coverageInProgressTitle: '这个时间桶还没结束',
+      coverageInProgressNote:
+        '采集区间最多只能到当前时刻，所以还不是完整覆盖 —— 这是预期结果，不是漏采',
+      coverageInProgressMissingIntro:
+        '下列「主机 / 源」在该时间桶完全没有采集区间，这与「还没结束」无关：',
+      coverageInProgressTag: '进行中',
     },
   },
 

@@ -36,7 +36,7 @@ async function openOverview(page: Page): Promise<void> {
  * than from a hard-coded pixel, and `barCategoryGap={0}` makes every category band exactly
  * `plotWidth / BUCKET_COUNT` wide, so the centre is computed, not guessed.
  */
-async function hoverBucket(page: Page, index: number): Promise<void> {
+async function hoverBucketOf(page: Page, index: number, count: number): Promise<void> {
   const grid = page.locator('.recharts-cartesian-grid').first()
   await expect(grid).toBeVisible()
   // `mouse.move` takes viewport coordinates and does not scroll; the chart sits below the
@@ -45,8 +45,12 @@ async function hoverBucket(page: Page, index: number): Promise<void> {
   const box = await grid.boundingBox()
   expect(box).not.toBeNull()
   if (box === null) return
-  const band = box.width / BUCKET_COUNT
+  const band = box.width / count
   await page.mouse.move(box.x + band * (index + 0.5), box.y + box.height / 2)
+}
+
+async function hoverBucket(page: Page, index: number): Promise<void> {
+  await hoverBucketOf(page, index, BUCKET_COUNT)
 }
 
 function dots(page: Page): Locator {
@@ -750,4 +754,200 @@ test('an undiagnosable partial bucket says so instead of showing nothing', async
   await expect(reasons).toBeVisible()
   await expect(reasons.getByTestId('coverage-reason-unknown')).toBeVisible()
   await expect(reasons.getByTestId('coverage-reason-pair')).toHaveCount(0)
+})
+
+/**
+ * 进行中的时间桶（round-11 用户反馈：「2026-08-10 部分覆盖 / 六个 (主机, 源) 全是只覆盖了一部分
+ * …… 没必要展示这些内容，当天用户也清楚只统计了一部分」）。
+ *
+ * 采集区间是 `[since, now]`，而后端的 Full 判定要求区间完整压住整个桶，所以「当前时刻所在的
+ * 那个桶」永远是 Partial —— 与采集是否健康无关。把它的 (主机, 源) 当缺口逐条列出，等于每天
+ * 每次刷新都刷屏，还会把真正漏采的历史桶埋掉。
+ *
+ * 因此 fixture 用真实的「今天 / 昨天」边界：桶边界照旧由数据提供（前端不做日历推导），
+ * 只有「当前时刻落在哪个桶」这一步是前端按绝对时刻比较出来的。
+ */
+const DAY_MS = 86_400_000
+
+function utcDayStart(offsetDays: number): number {
+  return Math.floor(Date.now() / DAY_MS) * DAY_MS + offsetDays * DAY_MS
+}
+
+function dayLabel(startUtcMs: number): string {
+  return new Date(startUtcMs).toISOString().slice(0, 10)
+}
+
+function dayPoint(startUtcMs: number, coverage: 'partial' | 'full') {
+  return {
+    bucket: { startUtcMs, endUtcMs: startUtcMs + DAY_MS, label: dayLabel(startUtcMs) },
+    coverage,
+    tokens: {
+      tokInput: 120,
+      tokOutput: 40,
+      tokReasoning: 0,
+      tokCacheRead: 0,
+      tokCacheWrite: 0,
+      totalInput: 120,
+    },
+    cost: { actualSum: 0.25, estimatedSum: 0, unavailableCount: 0 },
+    messageCount: 6,
+    sessionRecordCount: 0,
+  }
+}
+
+const TODAY_START = utcDayStart(0)
+const YESTERDAY_START = utcDayStart(-1)
+const TODAY_LABEL = dayLabel(TODAY_START)
+const YESTERDAY_LABEL = dayLabel(YESTERDAY_START)
+
+/** 六个「只覆盖了一部分」的对，就是用户截图里那一屏。 */
+const SIX_PARTIAL_PAIRS = [
+  { hostId: 'local', source: 'opencode', partial: true },
+  { hostId: 'local', source: 'codex', partial: true },
+  { hostId: 'local', source: 'claude-code', partial: true },
+  { hostId: 'build-box', source: 'opencode', partial: true },
+  { hostId: 'build-box', source: 'codex', partial: true },
+  { hostId: 'build-box', source: 'hermes', partial: true },
+]
+
+test('进行中的当天桶不进缺口诊断，已结束的历史桶仍逐对列出', async ({ page }) => {
+  await openShell(page, {
+    dataset: {
+      trend: {
+        total: [dayPoint(YESTERDAY_START, 'partial'), dayPoint(TODAY_START, 'partial')],
+        groups: [],
+        coverageNotes: [
+          {
+            label: YESTERDAY_LABEL,
+            shortfalls: [
+              { hostId: 'local', source: 'opencode', partial: true },
+              { hostId: 'build-box', source: 'codex', partial: false },
+            ],
+          },
+          { label: TODAY_LABEL, shortfalls: SIX_PARTIAL_PAIRS },
+        ],
+      },
+    },
+  })
+
+  const reasons = page.getByTestId('trend-coverage-reasons')
+  await reasons.scrollIntoViewIfNeeded()
+  await expect(reasons).toBeVisible()
+
+  // 当天桶一行都不出现，六个对更不出现。
+  await expect(
+    page.locator(`[data-testid="trend-coverage-reason-row"][data-bucket="${TODAY_LABEL}"]`),
+  ).toHaveCount(0)
+  await expect(reasons).not.toContainText('claude-code')
+
+  // 昨天真有缺口，照旧两种成因分开列。
+  const historical = page.locator(
+    `[data-testid="trend-coverage-reason-row"][data-bucket="${YESTERDAY_LABEL}"]`,
+  )
+  await expect(historical).toHaveCount(1)
+  await expect(historical).toHaveAttribute('data-in-progress', 'false')
+  await expect(historical.locator('[data-testid="coverage-reason-pair"]')).toHaveCount(2)
+  await expect(
+    historical.locator('[data-testid="coverage-reason-pair"][data-partial="true"]'),
+  ).toContainText(zh.overview.trend.coverageReasonPartial)
+  await expect(
+    historical.locator('[data-testid="coverage-reason-pair"][data-partial="false"]'),
+  ).toContainText(zh.overview.trend.coverageReasonMissing)
+  await expect(page.getByTestId('trend-coverage-reason-row')).toHaveCount(1)
+
+  // 徽章与斜纹带都保留：数据确实不完整，只是理由换成「进行中」。
+  const todayNote = page.locator(`[data-testid="trend-note"][data-bucket="${TODAY_LABEL}"]`)
+  await expect(todayNote).toContainText(zh.common.coverage.partial)
+  await expect(todayNote).toHaveAttribute('data-in-progress', 'true')
+  await expect(todayNote.getByTestId('trend-note-in-progress')).toHaveText(
+    zh.overview.trend.coverageInProgressTag,
+  )
+  await expect(
+    page.locator(`[data-testid="coverage-band"][data-bucket="${TODAY_LABEL}"]`),
+  ).toHaveCount(1)
+
+  await qaScreenshot(page, 'trend-coverage-historical-gap.png')
+})
+
+test('只有进行中的桶不完整时，整块缺口诊断消失', async ({ page }) => {
+  await openShell(page, {
+    dataset: {
+      trend: {
+        total: [dayPoint(TODAY_START, 'partial')],
+        groups: [],
+        coverageNotes: [{ label: TODAY_LABEL, shortfalls: SIX_PARTIAL_PAIRS }],
+      },
+    },
+  })
+
+  await expect(page.getByTestId('overview-trend')).toBeVisible()
+  await expect(page.getByTestId('trend-coverage-reasons')).toHaveCount(0)
+  // 但仍能看出这个桶不完整：斜纹带 + 徽章 + 进行中。
+  await expect(page.locator('[data-testid="coverage-band"]')).toHaveCount(1)
+  const note = page.locator(`[data-testid="trend-note"][data-bucket="${TODAY_LABEL}"]`)
+  await expect(note).toContainText(zh.common.coverage.partial)
+  await expect(note.getByTestId('trend-note-in-progress')).toBeVisible()
+
+  await qaScreenshot(page, 'trend-coverage-in-progress.png')
+})
+
+/** 「这个桶里完全没有它的采集区间」不是「桶还没结束」能解释的，必须继续报。 */
+test('进行中的桶里完全没采到的源仍然被列出', async ({ page }) => {
+  await openShell(page, {
+    dataset: {
+      trend: {
+        total: [dayPoint(TODAY_START, 'partial')],
+        groups: [],
+        coverageNotes: [
+          {
+            label: TODAY_LABEL,
+            shortfalls: [
+              { hostId: 'local', source: 'opencode', partial: true },
+              { hostId: 'build-box', source: 'codex', partial: false },
+            ],
+          },
+        ],
+      },
+    },
+  })
+
+  const row = page.locator(
+    `[data-testid="trend-coverage-reason-row"][data-bucket="${TODAY_LABEL}"]`,
+  )
+  await row.scrollIntoViewIfNeeded()
+  await expect(row).toHaveCount(1)
+  await expect(row).toHaveAttribute('data-in-progress', 'true')
+  await expect(row.getByTestId('coverage-reason-in-progress-tag')).toBeVisible()
+  const pairs = row.locator('[data-testid="coverage-reason-pair"]')
+  await expect(pairs).toHaveCount(1)
+  await expect(pairs).toHaveAttribute('data-partial', 'false')
+  await expect(pairs).toHaveAttribute('data-host-id', 'build-box')
+})
+
+test('进行中的桶的悬浮提示说「还没结束」，不列出任何对', async ({ page }) => {
+  await openShell(page, {
+    dataset: {
+      trend: {
+        total: [dayPoint(YESTERDAY_START, 'full'), dayPoint(TODAY_START, 'partial')],
+        groups: [],
+        coverageNotes: [{ label: TODAY_LABEL, shortfalls: SIX_PARTIAL_PAIRS }],
+      },
+    },
+  })
+  await expect(page.getByTestId('overview-trend')).toBeVisible()
+  await hoverBucketOf(page, 1, 2)
+
+  const tooltip = page.getByTestId('trend-tooltip')
+  await expect(tooltip).toBeVisible()
+  await expect(tooltip).toHaveAttribute('data-bucket', TODAY_LABEL)
+  // 徽章仍是「部分覆盖」，理由换成「还没结束」。
+  await expect(tooltip.getByTestId('trend-tooltip-coverage')).toHaveText(zh.common.coverage.partial)
+  const reason = tooltip.getByTestId('coverage-reason')
+  await expect(reason).toHaveAttribute('data-in-progress', 'true')
+  await expect(reason).toContainText(zh.overview.trend.coverageInProgressTitle)
+  await expect(reason.getByTestId('coverage-reason-in-progress')).toContainText(
+    zh.overview.trend.coverageInProgressNote,
+  )
+  await expect(reason.locator('[data-testid="coverage-reason-pair"]')).toHaveCount(0)
+  await expect(reason.getByTestId('coverage-reason-unknown')).toHaveCount(0)
 })
