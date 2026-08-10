@@ -23,7 +23,7 @@ jobs:
         run: |
           try() {
             label="$1"; payload="$2"
-            code="$(curl -sS -o /tmp/body.json -w '%{http_code}' \
+            code="$(curl -sS -D /tmp/hdr.txt -o /tmp/body.json -w '%{http_code}' \
               -X POST \
               -H "Authorization: token ${GH_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
@@ -33,6 +33,7 @@ jobs:
             echo "=== ${label} -> HTTP ${code}"
             cat /tmp/body.json
             echo
+            grep -i 'x-accepted-github-permissions' /tmp/hdr.txt || echo "(无 x-accepted header)"
             if [ "$code" = "201" ]; then
               id="$(jq -r '.id' /tmp/body.json)"
               curl -sS -o /dev/null -X DELETE \
@@ -43,12 +44,33 @@ jobs:
             fi
           }
 
-          try "A 裸 draft（已知 201）" \
-            '{"tag_name":"tmp-diag-a","draft":true,"name":"diag-a"}'
-          try "B draft + target_commitish=发布提交" \
+          try "B draft + target_commitish=SHA（已知 403，本轮抓 header）" \
             "{\"tag_name\":\"tmp-diag-b\",\"draft\":true,\"name\":\"diag-b\",\"target_commitish\":\"${RELEASE_SHA}\"}"
-          try "C release-please 的完整 payload（tag=v0.0.1）" \
-            "{\"tag_name\":\"v0.0.1\",\"draft\":true,\"prerelease\":false,\"name\":\"v0.0.1\",\"body\":\"diag\",\"target_commitish\":\"${RELEASE_SHA}\"}"
+          try "D draft + target_commitish=main（分支名）" \
+            '{"tag_name":"tmp-diag-d","draft":true,"name":"diag-d","target_commitish":"main"}'
+          try "E 非 draft + target_commitish=main（会真的建 tag）" \
+            '{"tag_name":"tmp-diag-e","draft":false,"name":"diag-e","target_commitish":"main"}'
+
+      - name: 直接试 createRef（建 tag ref）并抓 header
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: 969e303e754baf1c1d18c517fd4dee5ac4e47cef
+        run: |
+          code="$(curl -sS -D /tmp/h.txt -o /tmp/body.json -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs" \
+            -d "{\"ref\":\"refs/tags/tmp-diag-ref\",\"sha\":\"${RELEASE_SHA}\"}")"
+          echo "createRef -> HTTP ${code}"
+          cat /tmp/body.json
+          grep -i 'x-accepted-github-permissions' /tmp/h.txt || echo "(无 x-accepted-github-permissions)"
+          if [ "$code" = "201" ]; then
+            curl -sS -o /dev/null -X DELETE \
+              -H "Authorization: token ${GH_TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/tmp-diag-ref"
+            echo "cleaned ref"
+          fi
 
       - name: 回显 token 可见的 installation 权限
         env:
