@@ -70,6 +70,9 @@ env:
   NODE_VERSION: "22"
   # 与 ci.yml 及三份 buildspec 同一枚举：0.14.0 是实测跑绿的那个。
   ZIG_VERSION: "0.14.0"
+  # 必须与 ci.yml 的 TAURI_CLI_VERSION 逐字一致：发布产物与门禁产物要出自同一个
+  # bundler。装的是官方预编译二进制，URL 含版本号，所以只能钉死具体版本。
+  TAURI_CLI_VERSION: "2.11.4"
   MACOS_TARGET: aarch64-apple-darwin
   MACOS_BUNDLE_CONFIG: src-tauri/tauri.bundle.macos.json
   # git-cliff 只用来生成 Release 正文，钉死版本避免新版改模板渲染。
@@ -229,6 +232,17 @@ jobs:
           rustc --version
           cargo --version
 
+      # 纯只读地借用 ci.yml 存下的缓存：shared-key 必须与那边逐字相同（本 job 名与
+      # gate 不同，不共用 shared-key 就永远命中不了），save-if: false 则保证发布链路
+      # 一次都不写缓存 —— 发布是低频事件，写进去只会挤掉主干那三份热缓存。
+      # 命不中也只是回到今天的全量编译，不影响正确性。
+      - name: 只读复用 CI 的 Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: agentlens-gate
+          cache-bin: "false"
+          save-if: "false"
+
       # zig 只作为 musl 的 C 交叉编译器（rusqlite 的 bundled feature 要编 sqlite3.c）。
       - name: 安装 zig（aarch64/x86_64 musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
@@ -244,10 +258,23 @@ jobs:
       - name: 安装前端依赖（npm ci，lockfile 权威）
         run: npm --prefix frontend ci
 
-      - name: 安装 tauri-cli v2
+      # 官方 release 的 cargo-tauri 二进制落进 ~/.cargo/bin，`cargo tauri build` 的调用
+      # 方式与原先完全一致（Makefile 的 dist-bundle 直接依赖它）。解包后是扁平的四个
+      # 文件（LICENSE x2 + README + 二进制），只取那个二进制。
+      - name: 安装 tauri-cli v2（官方预编译，替代源码编译）
         run: |
-          cargo install tauri-cli --locked --version "^2"
-          cargo tauri --version
+          asset=cargo-tauri-x86_64-unknown-linux-gnu.tgz
+          test "$RUNNER_ARCH" = 'X64' \
+            || { echo "tauri-cli 没有 Linux-${RUNNER_ARCH} 的官方预编译资产"; exit 1; }
+          work="$(mktemp -d)"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$work/$asset" \
+            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${asset}"
+          tar xzf "$work/$asset" -C "$work" cargo-tauri
+          install -m 0755 "$work/cargo-tauri" "$HOME/.cargo/bin/cargo-tauri"
+          cargo tauri --version | tee "$work/version.txt"
+          grep -qF "tauri-cli ${TAURI_CLI_VERSION}" "$work/version.txt" \
+            || { echo "tauri-cli 实测版本与钉死的 ${TAURI_CLI_VERSION} 不符"; exit 1; }
+          rm -rf "$work"
 
       - name: 回显版本号（单一事实源自检）
         run: make dist-version
@@ -322,6 +349,17 @@ jobs:
           rustc --version
           cargo --version
 
+      # 纯只读地借用 ci.yml 存下的缓存：shared-key 必须与那边逐字相同（本 job 名与
+      # gate 不同，不共用 shared-key 就永远命中不了），save-if: false 则保证发布链路
+      # 一次都不写缓存 —— 发布是低频事件，写进去只会挤掉主干那三份热缓存。
+      # 命不中也只是回到今天的全量编译，不影响正确性。
+      - name: 只读复用 CI 的 Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: agentlens-gate
+          cache-bin: "false"
+          save-if: "false"
+
       - name: 安装 zig（musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
         with:
@@ -336,15 +374,42 @@ jobs:
       - name: 安装前端依赖（npm ci，lockfile 权威）
         run: npm --prefix frontend ci
 
-      - name: 安装 tauri-cli v2
+      # 与 ci.yml 的 Windows 分支逐条对应：Git bash 的 tar 是 GNU tar（读不了 zip）、
+      # 也不保证有 unzip，所以走 pwsh 的 Expand-Archive。
+      # 严格 ASCII-only —— 约束 (2)。Assert-Ok —— 约束 (1)。块内无 2>&1 —— 约束 (4)。
+      # 不回读 cargo 输出做版本断言：版本已由下载 URL 唯一确定。
+      - name: 安装 tauri-cli v2（官方预编译，替代源码编译）
+        shell: pwsh
         run: |
-          cargo install tauri-cli --locked --version "^2"
+          function Assert-Ok([string]$what) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "GATE FAILED: $what exited with code $LASTEXITCODE"
+            }
+            Write-Host "gate ok: $what"
+          }
+
+          $asset = "cargo-tauri-x86_64-pc-windows-msvc.zip"
+          $url = "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v$($env:TAURI_CLI_VERSION)/$asset"
+          $work = Join-Path $env:RUNNER_TEMP "tauri-cli"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile (Join-Path $work $asset)
+          Expand-Archive -Path (Join-Path $work $asset) -DestinationPath $work -Force
+
+          $exe = Join-Path $work "cargo-tauri.exe"
+          if (-not (Test-Path $exe)) {
+            throw "prebuilt archive did not contain cargo-tauri.exe"
+          }
+          Copy-Item $exe (Join-Path $env:USERPROFILE ".cargo\bin\cargo-tauri.exe") -Force
           cargo tauri --version
+          Assert-Ok "cargo tauri --version"
 
       # Windows 没有 musl cc，两个 Linux collector sidecar 只能靠 zig 自带的
-      # musl sysroot 交叉编译。
-      - name: 安装 cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+      # musl sysroot 交叉编译。install-action 的 manifest 收录了 cargo-zigbuild 并带
+      # SHA256 校验；刻意不钉版本，与原先 `cargo install --locked` 的取最新语义一致。
+      - name: 安装 cargo-zigbuild（预编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       # sidecar 归置约定（src-tauri/tauri.bundle.windows.json 已提交，本文件不改它）：
       #   externalBin: agentlens-askpass -> 源文件名须带 -<triple>.exe，装机时去后缀
@@ -469,6 +534,17 @@ jobs:
           rustc --version
           cargo --version
 
+      # 纯只读地借用 ci.yml 存下的缓存：shared-key 必须与那边逐字相同（本 job 名与
+      # gate 不同，不共用 shared-key 就永远命中不了），save-if: false 则保证发布链路
+      # 一次都不写缓存 —— 发布是低频事件，写进去只会挤掉主干那三份热缓存。
+      # 命不中也只是回到今天的全量编译，不影响正确性。
+      - name: 只读复用 CI 的 Rust 编译缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: agentlens-gate
+          cache-bin: "false"
+          save-if: "false"
+
       - name: 安装 zig（musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
         with:
@@ -483,13 +559,32 @@ jobs:
       - name: 安装前端依赖（npm ci，lockfile 权威）
         run: npm --prefix frontend ci
 
-      - name: 安装 tauri-cli v2
+      # 资产名由 RUNNER_ARCH 推导：macOS 的 arm64 与 x64 资产都存在，GitHub 若换掉
+      # macos-latest 的架构，这里会自动跟上而不是装错架构的二进制。
+      - name: 安装 tauri-cli v2（官方预编译，替代源码编译）
         run: |
-          cargo install tauri-cli --locked --version "^2"
-          cargo tauri --version
+          case "$RUNNER_ARCH" in
+            ARM64) asset=cargo-tauri-aarch64-apple-darwin.zip ;;
+            X64)   asset=cargo-tauri-x86_64-apple-darwin.zip ;;
+            *)
+              echo "tauri-cli 没有 macOS-${RUNNER_ARCH} 的官方预编译资产"
+              exit 1
+              ;;
+          esac
+          work="$(mktemp -d)"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$work/$asset" \
+            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${asset}"
+          unzip -q -j "$work/$asset" cargo-tauri -d "$work"
+          install -m 0755 "$work/cargo-tauri" "$HOME/.cargo/bin/cargo-tauri"
+          cargo tauri --version | tee "$work/version.txt"
+          grep -qF "tauri-cli ${TAURI_CLI_VERSION}" "$work/version.txt" \
+            || { echo "tauri-cli 实测版本与钉死的 ${TAURI_CLI_VERSION} 不符"; exit 1; }
+          rm -rf "$work"
 
-      - name: 安装 cargo-zigbuild
-        run: cargo install cargo-zigbuild --locked
+      - name: 安装 cargo-zigbuild（预编译）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: 回显版本号（单一事实源自检）
         run: make dist-version

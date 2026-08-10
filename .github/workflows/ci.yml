@@ -130,6 +130,10 @@ env:
   # zig 只作为 musl 的 C 交叉编译器（rusqlite 的 bundled feature 要编 sqlite3.c）。
   # 版本与三份 buildspec 一致：0.14.0 是实测跑绿的那个。
   ZIG_VERSION: "0.14.0"
+  # 必须钉死具体版本：下面装的是官方预编译二进制，下载 URL 里就含版本号，"^2" 无法表达。
+  # 换掉的是 `cargo install tauri-cli --locked --version "^2"`（从源码编译，实测 Windows
+  # runner 上单这一步 10.1 分钟，占该 job 31.2 分钟的三分之一）。
+  TAURI_CLI_VERSION: "2.11.4"
   MACOS_TARGET: aarch64-apple-darwin
   MACOS_BUNDLE_CONFIG: src-tauri/tauri.bundle.macos.json
   # 防线 (5)：显式钉住，不依赖 runner 默认值。
@@ -203,6 +207,32 @@ jobs:
         if: runner.os == 'Linux'
         run: rustup component add llvm-tools-preview
 
+      # 位置不可上移：key 含 `rustc -vV`，装 toolchain 之前跑会算出错的 key。
+      #
+      # 为什么不会假绿：精确 key 含 Cargo.lock 里带 source/checksum 的全部 [[package]]
+      # 与各 member Cargo.toml 的哈希，依赖一变即 miss；退化成前缀匹配时恢复的只是旧
+      # target，正确性仍由 cargo fingerprint 判定。且四个 workspace crate 自己的产物
+      # 默认不入缓存（cache-workspace-crates 默认 false），src-tauri 的 build.rs 生成物
+      # 同理 —— 「复用了上一次编译的自家代码」这条路径在结构上不存在。
+      #
+      # shared-key 写死而不用默认 job 名：release.yml 三个 job 名与 gate 不同，只有共用
+      # 它才能读到本 job 的缓存（那边 save-if: false，纯只读）。平台维度不必写进 key，
+      # action 自己追加 os.type()-os.arch()。
+      #
+      # save-if 限定 main：配额 10 GB 且按 last-access LRU 驱逐，若每个 PR 都写就会互相
+      # 驱逐（cache thrashing）到谁都命中不了。PR 只读，收益不变而配额恒为三份；顺带
+      # 让 PR 完全不进 save 路径，规避 Windows post 阶段极慢的已知问题（rust-cache#169）。
+      #
+      # cache-bin 关掉：下面三个 cargo 工具都来自钉死版本的预编译下载（秒级），把
+      # ~/.cargo/bin 纳入缓存不省时间，只会让缓存里的旧二进制与本次下载抢同一个路径。
+      - name: 恢复 Rust 编译缓存（registry + target，key 含 rustc 与 Cargo.lock）
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: agentlens-gate
+          cache-bin: "false"
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: 安装 zig（aarch64/x86_64 musl 的 C 交叉编译器）
         uses: mlugg/setup-zig@v2
         with:
@@ -232,16 +262,78 @@ jobs:
             | tar xzf - -C "$HOME/.cargo/bin"
           cargo llvm-cov --version
 
-      - name: 安装 tauri-cli v2
+      # 装的是 tauri-apps/tauri 官方 release 的 cargo-tauri 二进制，落到 ~/.cargo/bin 后
+      # `cargo tauri build` 与原先完全一致 —— 因此 Makefile 的 dist-* 目标、windows 的
+      # NSIS 步骤、macOS 的 dmg 步骤一个字都不用改。资产按平台分裂成 .tgz / .zip，
+      # 且解包后是扁平的 4 个文件（LICENSE x2 + README + 二进制），所以只取那个二进制。
+      # 资产名由 RUNNER_ARCH 推导而非写死：macOS 的 x64 与 arm64 资产都存在，
+      # 一旦 GitHub 换掉 macos-latest 的架构，这里会自动跟上而不是装错架构的二进制。
+      - name: 安装 tauri-cli v2（官方预编译，替代源码编译）
+        if: runner.os != 'Windows'
         run: |
-          cargo install tauri-cli --locked --version "^2"
+          case "${RUNNER_OS}-${RUNNER_ARCH}" in
+            Linux-X64)   asset=cargo-tauri-x86_64-unknown-linux-gnu.tgz ;;
+            macOS-ARM64) asset=cargo-tauri-aarch64-apple-darwin.zip ;;
+            macOS-X64)   asset=cargo-tauri-x86_64-apple-darwin.zip ;;
+            *)
+              echo "tauri-cli 没有 ${RUNNER_OS}-${RUNNER_ARCH} 的官方预编译资产"
+              exit 1
+              ;;
+          esac
+          work="$(mktemp -d)"
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$work/$asset" \
+            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${asset}"
+          case "$asset" in
+            *.tgz) tar xzf "$work/$asset" -C "$work" cargo-tauri ;;
+            *.zip) unzip -q -j "$work/$asset" cargo-tauri -d "$work" ;;
+          esac
+          install -m 0755 "$work/cargo-tauri" "$HOME/.cargo/bin/cargo-tauri"
+          cargo tauri --version | tee "$work/version.txt"
+          grep -qF "tauri-cli ${TAURI_CLI_VERSION}" "$work/version.txt" \
+            || { echo "tauri-cli 实测版本与钉死的 ${TAURI_CLI_VERSION} 不符"; exit 1; }
+          rm -rf "$work"
+
+      # 与上一步同源同版本，只是 Windows 上 Git bash 的 tar 是 GNU tar（读不了 zip）、
+      # 也不保证有 unzip，所以走 pwsh 的 Expand-Archive。
+      # 严格 ASCII-only —— 防线 (2)。Assert-Ok 逐条断言 —— 防线 (1)。块内无 2>&1 —— 防线 (4)。
+      # 这里不像 bash 分支那样回读 `cargo tauri --version` 的输出做版本断言：捕获 cargo
+      # 的输出在 GitHub 强制前置的 Stop 下多一层风险，而版本已由下载 URL 唯一确定。
+      - name: 安装 tauri-cli v2（官方预编译，Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          function Assert-Ok([string]$what) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "GATE FAILED: $what exited with code $LASTEXITCODE"
+            }
+            Write-Host "gate ok: $what"
+          }
+
+          $asset = "cargo-tauri-x86_64-pc-windows-msvc.zip"
+          $url = "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v$($env:TAURI_CLI_VERSION)/$asset"
+          $work = Join-Path $env:RUNNER_TEMP "tauri-cli"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile (Join-Path $work $asset)
+          Expand-Archive -Path (Join-Path $work $asset) -DestinationPath $work -Force
+
+          $exe = Join-Path $work "cargo-tauri.exe"
+          if (-not (Test-Path $exe)) {
+            throw "prebuilt archive did not contain cargo-tauri.exe"
+          }
+          Copy-Item $exe (Join-Path $env:USERPROFILE ".cargo\bin\cargo-tauri.exe") -Force
           cargo tauri --version
+          Assert-Ok "cargo tauri --version"
 
       # Windows / macOS 都没有 musl cc，两个 Linux collector sidecar 只能靠 zig
       # 自带的 musl sysroot 交叉编译。Linux 侧由 Makefile 直接处理，不需要它。
-      - name: 安装 cargo-zigbuild（Windows / macOS 交叉编译 musl collector）
+      # install-action 的 manifest 收录了 cargo-zigbuild 并带 SHA256 校验，比源码编译
+      # 快一个数量级（实测这一步原先 1.1 分钟）。刻意不钉版本：与原先的
+      # `cargo install cargo-zigbuild --locked` 保持同样的「取最新」语义，只改速度。
+      - name: 安装 cargo-zigbuild（预编译，Windows / macOS 交叉编译 musl collector）
         if: runner.os != 'Linux'
-        run: cargo install cargo-zigbuild --locked
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       # ts-rs 漂移门禁会在 frontend/ 里调 npx prettier 与 npx tsc，所以 node_modules
       # 必须先于 Rust 门禁存在。
