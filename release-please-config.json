@@ -4,7 +4,7 @@
   "separate-pull-requests": false,
   "pull-request-title-pattern": "chore: release ${branch}",
   "group-pull-request-title-pattern": "chore(release): 发布 ${version}",
-  "pull-request-header": "本 PR 由 release-please 维护：合并即打 tag 并创建 draft Release。",
+  "pull-request-header": "本 PR 由 release-please 维护：合并即创建 draft Release；tag 由 GitHub 在 draft 被公开时按 target_commitish 创建。",
   "packages": {
     ".": {
       "release-type": "simple",
@@ -12,7 +12,6 @@
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "draft": true,
-      "force-tag-creation": true,
       "prerelease": false,
       "extra-files": [
         {
