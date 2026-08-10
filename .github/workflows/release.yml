@@ -112,6 +112,15 @@ jobs:
           manifest-file: .release-please-manifest.json
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # 全量回显 action 的 outputs。保留而非诊断完就删：release-please 判定失败时
+      # 只写 warn 到日志、不让 job 变红，唯一能证伪「输出键名/值」猜测的就是这份
+      # JSON。曾有三轮发布因为凭空猜测键名被前缀化而白跑，这一步的成本是 0.1s。
+      - name: 全量回显 release-please 的 outputs（排障锚点）
+        env:
+          OUTPUTS_JSON: ${{ toJSON(steps.release.outputs) }}
+        run: |
+          printf '%s\n' "$OUTPUTS_JSON"
+
       - name: 回显本次判定（是否切出了新版本）
         env:
           RELEASES_CREATED: ${{ steps.release.outputs.releases_created }}
