@@ -44,32 +44,35 @@ jobs:
             fi
           }
 
-          try "B draft + target_commitish=陈旧 SHA 969e303（已知 403）" \
-            "{\"tag_name\":\"tmp-diag-b\",\"draft\":true,\"name\":\"diag-b\",\"target_commitish\":\"${RELEASE_SHA}\"}"
-          try "F draft + target_commitish=当前 main tip 的 SHA" \
-            "{\"tag_name\":\"tmp-diag-f\",\"draft\":true,\"name\":\"diag-f\",\"target_commitish\":\"${GITHUB_SHA}\"}"
-          try "G 非 draft + target_commitish=当前 main tip 的 SHA（真建 tag）" \
-            "{\"tag_name\":\"tmp-diag-g\",\"draft\":false,\"name\":\"diag-g\",\"target_commitish\":\"${GITHUB_SHA}\"}"
+          echo "（本轮跳过 B/F/G，已定论：陈旧 SHA 403、tip SHA 201）"
 
-      - name: 直接试 createRef（建 tag ref）并抓 header
+      - name: H createRef 在 tip SHA / I 真 tag 的 draft 能否 publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_SHA: 969e303e754baf1c1d18c517fd4dee5ac4e47cef
         run: |
-          code="$(curl -sS -D /tmp/h.txt -o /tmp/body.json -w '%{http_code}' \
+          echo "=== H createRef refs/tags/tmp-diag-h @ tip ${GITHUB_SHA}"
+          h="$(curl -sS -D /tmp/h.txt -o /tmp/hb.json -w '%{http_code}' \
             -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs" \
-            -d "{\"ref\":\"refs/tags/tmp-diag-ref\",\"sha\":\"${RELEASE_SHA}\"}")"
-          echo "createRef -> HTTP ${code}"
-          cat /tmp/body.json
-          grep -i 'x-accepted-github-permissions' /tmp/h.txt || echo "(无 x-accepted-github-permissions)"
-          if [ "$code" = "201" ]; then
+            -d "{\"ref\":\"refs/tags/tmp-diag-h\",\"sha\":\"${GITHUB_SHA}\"}")"
+          echo "createRef@tip -> HTTP ${h}"
+          cat /tmp/hb.json
+          grep -i 'x-accepted-github-permissions' /tmp/h.txt || true
+
+          if [ "$h" = "201" ]; then
+            echo "=== I 为已存在的 tag 建 draft，再 publish"
+            gh release create tmp-diag-h --draft --title diag-h --notes diag >/dev/null
+            gh release view tmp-diag-h --json isDraft,tagName --jq '"draft=\(.isDraft) tag=\(.tagName)"'
+            gh release edit tmp-diag-h --draft=false
+            gh release view tmp-diag-h --json isDraft --jq '"publish 后 draft=\(.isDraft)"'
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/tmp-diag-h" --jq '"tag -> \(.object.sha)"'
+            gh release delete tmp-diag-h --yes
             curl -sS -o /dev/null -X DELETE \
               -H "Authorization: token ${GH_TOKEN}" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/tmp-diag-ref"
-            echo "cleaned ref"
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/tmp-diag-h"
+            echo "cleaned H/I"
           fi
 
       - name: 回显 token 可见的 installation 权限
