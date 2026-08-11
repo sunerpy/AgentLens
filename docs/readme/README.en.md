@@ -8,11 +8,11 @@
 
 [简体中文](../../README.md) · **English**
 
-A desktop dashboard for AI coding-agent token usage. AgentLens collects OpenCode,
-Claude Code, Codex and Hermes usage records from your local machine and from any
-number of remote SSH hosts into one local SQLite archive, then slices them by
-timezone, agent, model and project. Only OpenCode is collected by default; the
-other three are enabled per host by ticking them on the host card.
+A desktop dashboard for AI coding-agent token usage. AgentLens pulls OpenCode,
+Claude Code, Codex and Hermes records off your own machine and off any number of
+remote SSH hosts into one local SQLite archive, then slices them by timezone,
+agent, model and project, down to a single record if you want. Only OpenCode is
+collected out of the box. The other three get ticked on per host.
 
 ## Table of Contents
 
@@ -28,65 +28,73 @@ other three are enabled per host by ticking them on the host card.
 
 ## Screenshots
 
-Overview: the three-state rail on the left, then range and granularity, the four
-token buckets, the cost card and the usage trend chart. The cost card leads with a
-single number: a local estimate, this machine's price table times billable tokens,
-next to the share of records it covers and the price per million billable tokens.
-That unit price is the only number on the card it is safe to compare. Records that
-carry an upstream amount of their own sit behind a fold, and records whose model is
-absent from the price catalog are listed apart; neither is folded into the estimate.
-Hatched spans in the chart are buckets with no data coverage, tinted spans are
-partial coverage, neither is treated as a zero.
+The three-state rail sits on the left. On the right, top to bottom: range and
+granularity, the four token buckets, the cost card, the usage trend chart. The
+thing worth explaining here is why the cost card shows one number and not three.
+What it shows is a local estimate, this machine's price table times billable
+tokens. The alternatives aren't comparable: records carrying an upstream amount
+were priced by someone else's table, and records whose model is missing from the
+catalog don't even have a complete base. Both sit behind a fold, and neither is
+folded into the estimate. The one figure on the card that's safe to compare is the
+price per million billable tokens, and the line next to it, how many records the
+estimate covers, is there to tell you how much to trust it. In the chart, hatched
+spans are buckets with no data coverage and tinted spans are partial coverage.
+Neither is a zero.
 
 ![Overview page](../../assets/screenshots/overview.png)
 
 The same trend chart grouped by model, in the Deep Ocean theme. Grouping offers
-none / model / agent / tool, and six themes switch in place from the header. The
-rail expands, collapses to a 64px icon strip, or hides entirely.
+none / model / agent / tool, six themes switch in place from the header, and
+neither is buried in Settings. The rail expands, collapses to a 64px icon strip,
+or hides entirely.
 
 ![Overview grouped by model, Deep Ocean theme](../../assets/screenshots/overview-by-model-dark.png)
 
-Usage analysis: a source → agent → model drilldown that shares range and timezone
-state with the overview. Rows with no price carry a "cost missing" marker instead
-of a fabricated 0, and each share is computed against its own level's token total.
+Usage analysis is a source → agent → model drilldown sharing one range-and-timezone
+state with the overview. The part that needs explaining is a row with no price: it
+gets a "cost missing" marker, not a 0. A 0 would read as free. Shares are computed
+against the token total of their own level too, never borrowed from a level above.
 
 ![Three-level drilldown on the usage analysis page](../../assets/screenshots/usage-drilldown.png)
 
-Hosts: the local machine and SSH remotes side by side, with collection sources
-ticked per host card. Only OpenCode is on by default; Claude Code, Codex and
-Hermes have to be enabled explicitly.
+Hosts puts the local machine and the SSH remotes side by side. The source toggles
+live on each host card rather than in Settings, because whether a source is on for
+one host and off for another are two separate questions. Only OpenCode starts
+ticked.
 
 ![Host management page](../../assets/screenshots/hosts.png)
 
 ## Highlights
 
-- **The archive is authoritative history, never pruned.** Source-log rotation,
-  deleted backups or a wiped remote data directory cannot make an archived
-  record disappear.
-- **Remote collection is read-only.** A statically linked musl collector is
-  pushed to the remote, sha256-verified, executed in place and cleaned up on
-  exit. It never writes to the remote tool's data.
-- **Credentials live in the OS keychain** (Linux Secret Service, Windows
-  Credential Manager). No passwords in config files, none returned over IPC.
-- **Calendar bucketing has one implementation, and it is in Rust.** The frontend
-  carries no `date-fns` / `dayjs` / `moment`. Every raw epoch is
-  bucketed in the report timezone, and labels the backend already formatted are
-  not converted a second time in the frontend.
-- **Typed IPC.** TypeScript contracts are generated from the Rust types by
-  `ts-rs`, so the boundary cannot silently drift.
-- **Pricing falls back across providers.** When the same model is reached through
-  different gateways, the price entry usually only exists under the owning
-  provider, so matching is allowed to fall back across providers. Measured over
-  251737 records, the priceable share went from 0.1% to 99.4%. Manual overrides
-  stay strict: they match `(provider, model)` exactly and never bleed across
-  providers. Rules: [../measurement.md](../measurement.md) (Chinese).
+- **The archive is authoritative history, never pruned.** Rotate the source logs,
+  delete the backups, wipe the remote data directory: what's archived is still
+  there.
+- Remote collection is read-only start to finish. A statically linked musl
+  collector gets pushed to the remote, sha256-verified, run in place, and cleans
+  itself up on exit. It touches none of the remote tool's data.
+- Credentials go into the OS keychain and nowhere else: Secret Service on Linux,
+  Credential Manager on Windows. No passwords in config files, none handed back
+  over IPC.
+- **Calendar bucketing has one implementation, and it lives in Rust.** The
+  frontend ships no date library at all. No `date-fns`, no `dayjs`, no `moment`.
+  Raw epochs are bucketed in the report timezone on the backend, so the labels the
+  frontend receives are already final and never get converted into some other
+  timezone on the way to the screen.
+- TypeScript contracts are generated from the Rust types by `ts-rs` rather than
+  hand-written, so the boundary can't silently drift.
+- **Pricing is allowed to fall back across providers.** When one model is reached
+  through several gateways, its price entry usually only exists under the owning
+  provider, and strict `(provider, model)` matching leaves large stretches
+  unpriced. Measured over 251737 records, the priceable share went from 0.1% to
+  99.4%. Manual overrides are the exception: still exact, still no bleed.
+  Rules: [../measurement.md](../measurement.md) (Chinese).
 
 ## Install
 
-Prebuilt packages: `.deb` (Linux x86_64), NSIS installer (Windows x64), `.dmg`
-(macOS aarch64). The one-line installers detect the platform, **verify the
-SHA-256 against the published manifest**, and never escalate privileges on their
-own.
+Three prebuilt packages: `.deb` (Linux x86_64), an NSIS installer (Windows x64),
+`.dmg` (macOS aarch64). The one-line installers work out the platform themselves,
+**verify the SHA-256 against the published manifest**, and never escalate
+privileges on their own.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sunerpy/AgentLens/main/scripts/install.sh | bash
@@ -136,9 +144,10 @@ Where the archive, price overrides and secrets live on each platform:
 | Desktop shell | `src-tauri/` | Tauri 2 host, IPC commands, tray |
 | Frontend | `frontend/` | React 18.3.1 + Vite 8 + Tailwind v4 |
 
-The archive is SQLite with de-duplication and per-source watermarks. The SSH
-transport uses a constant remote command with the payload passed as a positional
-argument. Details: [../architecture.md](../architecture.md).
+The archive is SQLite, with de-duplication and per-source watermarks. On the SSH
+side the remote command is constant; the only thing that varies is the payload,
+passed in as a positional argument, so the command itself is never assembled from
+strings. Details: [../architecture.md](../architecture.md).
 
 ## Testing and Quality
 
@@ -151,10 +160,12 @@ argument. Details: [../architecture.md](../architecture.md).
 | Line coverage | 92.72% measured; the 90% floor is enforced by `make coverage-gate` | `make coverage-gate` |
 
 The GitHub Actions matrix (ubuntu / windows / macos) is green on `main`, and all
-three platforms have produced real installers on AWS CodeBuild. But **a green
-build proves the defect did not manifest, not that the product works**, so Windows
-got a separate real-machine acceptance run: on EC2 Windows Server the package was
-installed, the app launched, and all 25 machine-decidable GUI assertions passed.
+three platforms have produced real installers on AWS CodeBuild. **A green build
+proves the defect did not manifest, not that the product works.** Windows got a
+separate real-machine acceptance run on top of it: on EC2 Windows Server the
+package was installed, the app launched, and all 25 machine-decidable GUI
+assertions passed. Linux and macOS have only got as far as producing packages.
+Neither has been through the same launch-on-real-hardware check.
 
 How the coverage floor is enforced, the per-platform build IDs, artifact byte
 counts, and the acceptance assertions one by one:
