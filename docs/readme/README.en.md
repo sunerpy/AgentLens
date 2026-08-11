@@ -29,13 +29,14 @@ other three are enabled per host by ticking them on the host card.
 ## Screenshots
 
 Overview: the three-state rail on the left, then range and granularity, the four
-token buckets, the cost card and the usage trend chart. Cost is layered into
-actual / estimated / missing and never summed, and each layer carries its own
-coverage share and price per million tokens — that unit price is the only number
-on the card it is safe to compare across layers. Hatched spans in the chart are
-buckets with no data coverage, tinted spans are partial coverage, neither is
-treated as a zero, and the footer names the exact host / source pair whose
-collection window is missing.
+token buckets, the cost card and the usage trend chart. The cost card leads with a
+single number: a local estimate, this machine's price table times billable tokens,
+next to the share of records it covers and the price per million billable tokens.
+That unit price is the only number on the card it is safe to compare. Records that
+carry an upstream amount of their own sit behind a fold, and records whose model is
+absent from the price catalog are listed apart; neither is folded into the estimate.
+Hatched spans in the chart are buckets with no data coverage, tinted spans are
+partial coverage, neither is treated as a zero.
 
 ![Overview page](../../assets/screenshots/overview.png)
 
