@@ -221,7 +221,7 @@ FOLLOW ?=
 AWS_LOG_SINCE ?= 4h
 
 .DEFAULT_GOAL := help
-.PHONY: help fmt fmt-check lint test test-unit test-e2e test-e2e-real build dev clean \
+.PHONY: help fmt fmt-check lint check-release-lock test test-unit test-e2e test-e2e-real build dev clean \
 	coverage coverage-gate hooks \
 	dist dist-all dist-reset dist-version dist-clean dist-collector-x86_64 dist-collector-aarch64 \
 	dist-askpass dist-stage dist-bundle dist-collect dist-verify \
@@ -250,12 +250,27 @@ fmt-check: ## 校验格式（CI 用，不修改文件）
 	  echo '[fmt-check] $(OXFMT_HINT)'; \
 	fi
 
-lint: fmt-check ## Rust clippy 零告警 + 前端格式 / lint / 类型检查 / 中文字典门禁
+lint: fmt-check check-release-lock ## Rust clippy 零告警 + 前端格式 / lint / 类型检查 / 中文字典 / 发版名单门禁
 	cargo clippy --workspace --all-targets -- -D warnings
 	$(NPM) run format:check
 	$(NPM) run lint
 	$(NPM) run typecheck
 	node scripts/check-i18n.mjs
+
+# ---------------------------------------------------------------------------
+# 发版名单护栏：release-please-config.json 里 Cargo.lock 那条 extra-files 的
+# jsonpath 用**显式 crate 名单**匹配（`[...].includes(@.name.value)`），新增
+# workspace 成员时必须手工加进名单。漏加的失效模式是静默的：release-please 只
+# warn `No entries modified` 就 exit 0，CI 全绿，而 Cargo.lock 从此每次发版落后
+# 一个版本，之后随便一条 cargo 命令都会把它改回来、让干净工作树凭空变脏。
+# 本护栏把那份沉默变成硬失败——名单 / cargo metadata 的 workspace 成员 /
+# Cargo.lock 里的 [[package]] 三方必须完全一致。
+#
+# 只挂在 lint（Linux 权威 job）上，不在 Windows / macOS 重跑：它校验的是平台无关
+# 的配置文件，跑三遍纯属重复——与 ci.yml 对 oxfmt 的处理同一条理由。
+# ---------------------------------------------------------------------------
+check-release-lock: ## 校验 release-please 的 Cargo.lock crate 名单与 workspace 成员一致
+	node scripts/check-release-lock.mjs
 
 test: ## 运行 Rust 测试
 	cargo test --workspace

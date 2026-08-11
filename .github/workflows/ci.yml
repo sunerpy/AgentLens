@@ -357,11 +357,15 @@ jobs:
         if: runner.os != 'Windows'
         run: make dist-version
 
-      # ---- 门禁 1：格式 + clippy + 前端静态检查 + 中文文案 -----------------
+      # ---- 门禁 1：格式 + clippy + 前端静态检查 + 中文文案 + 发版名单 -------
       # Linux 用一个 make 目标，与 linux.yml 的 `make lint` 逐字一致：
-      #   fmt-check(rustfmt + oxfmt) -> clippy -D warnings
+      #   fmt-check(rustfmt + oxfmt) -> check-release-lock -> clippy -D warnings
       #   -> 前端 format:check / lint / typecheck -> node scripts/check-i18n.mjs
-      - name: 门禁 make lint（rustfmt + oxfmt + clippy -D warnings + 前端 + i18n）
+      #
+      # check-release-lock 只在这里跑：它校验 release-please-config.json 的
+      # Cargo.lock crate 名单是否覆盖全部 workspace 成员，是平台无关的配置检查，
+      # 跑三遍纯属重复——与下面 oxfmt 不在另两个平台重跑同一条理由。
+      - name: 门禁 make lint（rustfmt + oxfmt + clippy -D warnings + 前端 + i18n + 发版名单）
         if: runner.os == 'Linux'
         run: make lint
 
