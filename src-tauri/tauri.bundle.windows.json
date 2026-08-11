@@ -1,6 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
+    "targets": ["nsis", "msi"],
+    "windows": {
+      "wix": {
+        "upgradeCode": "57809f90-bf2f-51e0-84e6-6d2c6f2aed0e"
+      }
+    },
     "externalBin": ["../target/dist/binaries/agentlens-askpass"],
     "resources": {
       "../target/dist/binaries/agentlens-collector-x86_64-unknown-linux-musl": "",
