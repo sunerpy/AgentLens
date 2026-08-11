@@ -19,6 +19,11 @@
           "jsonpath": "$.workspace.package.version"
         },
         {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(['agentlens-core','agentlens-tauri','agentlens-collector','agentlens-askpass'].includes(@.name.value))].version"
+        },
+        {
           "type": "json",
           "path": "frontend/package.json",
           "jsonpath": "$.version"
