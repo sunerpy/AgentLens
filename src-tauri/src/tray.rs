@@ -88,6 +88,17 @@ fn tray_click_action(button: MouseButton, button_state: MouseButtonState) -> Tra
     }
 }
 
+fn tray_icon_event_action(event: &TrayIconEvent) -> TrayIconAction {
+    match event {
+        TrayIconEvent::Click {
+            button,
+            button_state,
+            ..
+        } => tray_click_action(*button, *button_state),
+        _ => TrayIconAction::Ignore,
+    }
+}
+
 // Native tray menu labels live here rather than in `frontend/src/i18n/zh.ts`: the menu is an
 // OS-level widget built by Rust, so it cannot read the frontend dictionary. `check-i18n` only
 // governs `frontend/src/**`, which is where every browser-rendered string still comes from.
@@ -124,16 +135,9 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             // DoubleClick, so handling DoubleClick as well would only repeat this idempotent action.
             // Linux AppIndicator does not emit tray icon events at all; its right-click menu and
             // explicit "Open AgentLens" item remain the supported fallback there.
-            if let TrayIconEvent::Click {
-                button,
-                button_state,
-                ..
-            } = event
-            {
-                match tray_click_action(button, button_state) {
-                    TrayIconAction::Open => show_main_window(tray.app_handle()),
-                    TrayIconAction::Ignore => {}
-                }
+            match tray_icon_event_action(&event) {
+                TrayIconAction::Open => show_main_window(tray.app_handle()),
+                TrayIconAction::Ignore => {}
             }
         });
     if let Some(icon) = app.default_window_icon() {
@@ -654,6 +658,48 @@ mod tests {
         assert_eq!(
             tray_click_action(MouseButton::Middle, MouseButtonState::Down),
             TrayIconAction::Ignore
+        );
+    }
+
+    #[test]
+    fn real_tray_events_open_once_and_ignore_windows_double_click_replay() {
+        use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent, TrayIconId};
+
+        let click = |button, button_state| TrayIconEvent::Click {
+            id: TrayIconId::new("test-tray"),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect::default(),
+            button,
+            button_state,
+        };
+
+        assert_eq!(
+            tray_icon_event_action(&click(MouseButton::Left, MouseButtonState::Down)),
+            TrayIconAction::Open
+        );
+        assert_eq!(
+            tray_icon_event_action(&click(MouseButton::Left, MouseButtonState::Up)),
+            TrayIconAction::Ignore
+        );
+        assert_eq!(
+            tray_icon_event_action(&click(MouseButton::Right, MouseButtonState::Down)),
+            TrayIconAction::Ignore
+        );
+        assert_eq!(
+            tray_icon_event_action(&click(MouseButton::Middle, MouseButtonState::Down)),
+            TrayIconAction::Ignore
+        );
+
+        let double_click = TrayIconEvent::DoubleClick {
+            id: TrayIconId::new("test-tray"),
+            position: tauri::PhysicalPosition::new(0.0, 0.0),
+            rect: tauri::Rect::default(),
+            button: MouseButton::Left,
+        };
+        assert_eq!(
+            tray_icon_event_action(&double_click),
+            TrayIconAction::Ignore,
+            "Windows double-click already opens through its first Click"
         );
     }
 
