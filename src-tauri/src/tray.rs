@@ -27,7 +27,7 @@ use agentlens_core::hostsource::{
     DEFAULT_REMOTE_INTERVAL_MS, MIN_AUTO_REFRESH_INTERVAL_MS,
 };
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Window, WindowEvent};
 
 use crate::state::AppState;
@@ -75,6 +75,19 @@ fn tray_menu_action(menu_id: &str) -> TrayMenuAction {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrayIconAction {
+    Open,
+    Ignore,
+}
+
+fn tray_click_action(button: MouseButton, button_state: MouseButtonState) -> TrayIconAction {
+    match (button, button_state) {
+        (MouseButton::Left, MouseButtonState::Down) => TrayIconAction::Open,
+        _ => TrayIconAction::Ignore,
+    }
+}
+
 // Native tray menu labels live here rather than in `frontend/src/i18n/zh.ts`: the menu is an
 // OS-level widget built by Rust, so it cannot read the frontend dictionary. `check-i18n` only
 // governs `frontend/src/**`, which is where every browser-rendered string still comes from.
@@ -104,6 +117,24 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             TrayMenuAction::Refresh => refresh_all_hosts(app),
             TrayMenuAction::Quit => app.exit(0),
             TrayMenuAction::Ignore => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            // Tauri emits Click for both button down and button up. Opening on down makes one
+            // physical click one action. On Windows, a double click emits the first Click and then
+            // DoubleClick, so handling DoubleClick as well would only repeat this idempotent action.
+            // Linux AppIndicator does not emit tray icon events at all; its right-click menu and
+            // explicit "Open AgentLens" item remain the supported fallback there.
+            if let TrayIconEvent::Click {
+                button,
+                button_state,
+                ..
+            } = event
+            {
+                match tray_click_action(button, button_state) {
+                    TrayIconAction::Open => show_main_window(tray.app_handle()),
+                    TrayIconAction::Ignore => {}
+                }
+            }
         });
     if let Some(icon) = app.default_window_icon() {
         builder = builder.icon(icon.clone());
@@ -603,6 +634,27 @@ mod tests {
         assert_eq!(tray_menu_action(MENU_ID_REFRESH), TrayMenuAction::Refresh);
         assert_eq!(tray_menu_action(MENU_ID_QUIT), TrayMenuAction::Quit);
         assert_eq!(tray_menu_action("future-menu-item"), TrayMenuAction::Ignore);
+    }
+
+    #[test]
+    fn one_left_tray_click_dispatches_open_exactly_once() {
+        use tauri::tray::{MouseButton, MouseButtonState};
+
+        let open_actions = [MouseButtonState::Down, MouseButtonState::Up]
+            .into_iter()
+            .filter(|state| tray_click_action(MouseButton::Left, *state) == TrayIconAction::Open)
+            .count();
+
+        assert_eq!(open_actions, 1, "button down/up is one physical click");
+        assert_eq!(
+            tray_click_action(MouseButton::Right, MouseButtonState::Down),
+            TrayIconAction::Ignore,
+            "right click remains reserved for the native tray menu"
+        );
+        assert_eq!(
+            tray_click_action(MouseButton::Middle, MouseButtonState::Down),
+            TrayIconAction::Ignore
+        );
     }
 
     #[test]
