@@ -81,6 +81,8 @@ test('both granularities appear side by side, with a visible explanation, once s
 
   // Tokens cover both granularities, so they exceed the message-level-only seed's totals.
   await expect(page.getByTestId('summary-token-input')).toHaveAttribute('title', '450,150')
+  // 来源自带的金额在折叠披露里（默认收起），所以核对它之前要先展开。
+  await page.getByTestId('summary-cost-source-toggle').click()
   await expect(page.getByTestId('summary-cost-actual')).toHaveText('$0.0611')
   // Cost is still explicitly partial: the unavailable count survives the overlay.
   await expect(page.getByTestId('summary-cost-unavailable')).toHaveText('1')

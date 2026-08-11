@@ -112,13 +112,27 @@ export const zh = {
       totalInput: '总输入',
     },
 
-    /** 成本三态标签（actual / estimated / unavailable 永不折叠成一个数）。 */
+    /**
+     * 成本三态标签（actual / estimated / unavailable 永不折叠成一个数）。
+     *
+     * **这三个词是按「谁算的」命名的，不是按「准不准」命名的。** 上一版把 `actual` 叫「实际」，
+     * 那是错的：`CostSource::Actual` 的来源是 OpenCode 消息记录里自带的 `cost` 字段
+     * （`crates/agentlens-core/src/source/opencode.rs`），那个数是 OpenCode 用它自己的定价表
+     * 算出来的，**不是云厂商账单**。它与我们的估算本质同类，区别只是谁算的：上游算的 vs 本地算的。
+     * 叫「实际」会让用户把它读成「你真的花了这么多」，于是反复追问两个金额为什么差几千倍——
+     * 真正的答案是「只有 117 条记录的上游附带了自己的估算值」。
+     *
+     * Rust 侧枚举名保持 `CostSource::Actual` 不改：那个判别值以字符串 `"actual"` 落在归档库里
+     * （`query.rs` 的 `"actual" => Ok(CostSource::Actual)`），改名要么破坏已归档的每一行，要么
+     * 让 Rust 标识符与线上取值分叉，两者都比现状更糟；而 `Actual` 在代码里指「来源自带的值」
+     * 这个语义本来就清楚。误导只发生在用户看到的中文上，所以只改这里。
+     */
     cost: {
       label: '成本',
-      actual: '实际',
-      estimated: '估算',
+      actual: '来源自带',
+      estimated: '本地估算',
       partial: '部分缺失',
-      unavailable: '成本不可用',
+      unavailable: '目录无价',
     },
 
     /** 覆盖三态（none 必须渲染为断裂，不是 0）。 */
@@ -180,39 +194,51 @@ export const zh = {
       tokenCache: '缓存',
       tokenTotalHint: '总输入 = 输入 + 缓存读取 + 缓存写入',
       costTitle: '成本',
-      costDescription: '实际 / 估算 / 缺失分层，永不相加',
+      /**
+       * 上一版这里写的是「实际 / 估算 / 缺失分层，永不相加」。「永不相加」是写给实现者的
+       * 内部约束（约束本身不变，见 `costTiers.ts`），用户不需要知道我们内部怎么防串味；
+       * 他需要知道眼前这个数是谁算的、算的是哪一批记录。
+       */
+      costDescription: '按本机价目表估算；上游自带的金额与目录里没有价格的记录分开列',
       costCoverage: (records: string, tokens: string) =>
         `${records} 条记录 · ${tokens} 可计费 Token`,
 
       /**
-       * 用户第三次问「实际 $83.5228 和估算 $312,235.4418 为什么差那么多」，前两轮补的覆盖量
-       * 标注没救回来。原因不在算法：实测单价是 $4.12/M 与 $4.47/M，同一量级；3700 倍的差额
-       * **全部**来自覆盖量（记录数差 2459 倍）。四个源里只有 OpenCode 带 `CostSource::Actual`，
-       * 且只有 117 条真有金额，所以这两个金额不是「同一批用量的两种算法」，而是**两批完全
-       * 不同的记录**。
+       * 用户第三次问「实际 $83.5228 和估算 $312,235.4418 为什么差那么多」。前两轮分别补了
+       * 覆盖量标注、改成竖排分层加单价对比，都没救回来——因为两轮都在回答「怎么解释这两个
+       * 数字的差异」，而真正的缺陷有两条：
        *
-       * 上一轮失败的原因是：把两个等重的大金额并排放在同一视觉层级，本身就在邀请用户相减，
-       * 补在下面的小字只是这场比较的脚注。所以这轮改的是结构——竖排分层、给出覆盖占比与
-       * 单价（读者不必自己做除法），并显式写出「不要相减」。
+       * 1. **其中一个数字的名字是错的。** 详见 `common.cost` 的说明：`actual` 是上游自带的
+       *    估算值，不是账单。叫「实际」时，任何差异解释都会被读成「实际值才对，估算错了」。
+       * 2. **它不该占主视觉。** 实测 289,834 条记录里只有 117 条（0.03%）带上游金额，
+       *    99.97% 走本地估算。把覆盖 0.03% 的数与覆盖 99.97% 的并排等重摆放，就是在邀请相减。
+       *
+       * 所以这一版：本地估算是唯一的主数字；来源自带降为默认折叠的次要披露，非零时才出现
+       * （零覆盖时连折叠入口都没有，那个 $0 从此不会出现在任何视觉层级上）。
        */
-      costSplitLabel: '覆盖分布（按可计费 Token）',
+      costPrimaryHint: '本机价目表 × 可计费 Token 算出的估算值，不是账单',
       costTierShare: (share: string) => `覆盖 ${share}`,
       costTierShareUnknown: '本区间没有可计费 Token',
       costUnitPriceLabel: '单价（每百万可计费 Token）',
       /** 该层没有可计费 Token 时单价无定义；写「—」而不是 $0，$0 会被读成「不要钱」。 */
       costUnitPriceUndefined: '—',
       costUnitPriceHint: '单价已除掉覆盖量差异，是这张卡里唯一可以横向比较的数',
-      costIncomparable: (actualRecords: string, estimatedRecords: string) =>
-        `这两个金额覆盖的是不同的记录：实际 ${actualRecords} 条，估算 ${estimatedRecords} 条。金额差主要来自覆盖量，不是算法差异，所以两个金额不要相减也不要互相比较；要比就比上面的单价。`,
-      costActualOnly:
-        '本区间只有实际成本有覆盖：估算那格的 $0 是「没有记录落在估算层」，不是「估算出来是 0」。',
-      costEstimatedOnly:
-        '本区间只有估算成本有覆盖：实际那格的 $0 是「没有记录带真实金额」，不是「实际花了 0」。',
-      costNoCoverage:
-        '本区间没有任何记录带成本覆盖，两格的 $0 都是「没有数据」，不是「没有花钱」。',
-      costUnavailableLabel: '无可信成本',
+      costSourceShow: (records: string) => `另有 ${records} 条记录自带上游金额`,
+      costSourceHide: '收起上游自带金额',
+      costSourceExplain:
+        '这个金额来自 OpenCode 记录里自带的 cost 字段，由 OpenCode 用它自己的价目表算出，同样不是云厂商账单。',
+      costSourceIncomparable: (actualRecords: string, estimatedRecords: string) =>
+        `它只覆盖 ${actualRecords} 条记录，本地估算覆盖 ${estimatedRecords} 条，两者是两批完全不同的记录：金额既不能相加也不能相减，要比就比单价。`,
+      costEstimatedNoCoverage:
+        '本区间没有记录走本地估算，上面的 $0 是「没有记录」，不是「估算出来是 0」。',
+      costNoCoverage: '本区间没有任何记录带成本，$0 是「没有数据」，不是「没有花钱」。',
+      costUnavailableLabel: '目录无价',
       costUnavailableUnit: '条',
-      costUnavailableHint: '这些记录不计入任何金额，也不当 0',
+      /**
+       * 上一版写的是「这些记录不计入任何金额，也不当 0」——那是实现视角，描述的是我们的
+       * 数据结构而不是用户的处境。用户要知道的是「为什么这些用量没金额」。
+       */
+      costUnavailableHint: '这些模型在价目表里查不到价格，所以它们的用量算不出金额',
       /**
        * 「部分缺失」原来只报一个数，用户看不出**什么**没有价格；补上清单后又出现第二个问题：
        * 表头的「本范围内 21,947 条」与清单合计 50,923 条对不上，用户以为算错了。

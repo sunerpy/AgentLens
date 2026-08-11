@@ -77,8 +77,11 @@ test('summary cards render the seeded aggregate literals', async ({ page }) => {
   await expect(page.getByTestId('summary-token-cache-write')).toHaveText('11,750')
   await expect(page.getByTestId('summary-token-total-input')).toHaveText('629,100')
 
-  await expect(page.getByTestId('summary-cost-actual')).toHaveText('$0.0484')
+  // 本地估算是唯一的主数字；来源自带的金额在折叠披露里，展开后才有。
   await expect(page.getByTestId('summary-cost-estimated')).toHaveText('$0.0075')
+  await expect(page.getByTestId('summary-cost-actual')).toHaveCount(0)
+  await page.getByTestId('summary-cost-source-toggle').click()
+  await expect(page.getByTestId('summary-cost-actual')).toHaveText('$0.0484')
   await expect(page.getByTestId('summary-cost-unavailable')).toHaveText('1')
 
   await expect(page.getByTestId('summary-message-count')).toHaveText('109')
@@ -86,21 +89,37 @@ test('summary cards render the seeded aggregate literals', async ({ page }) => {
 })
 
 /**
- * 用户第三次问「实际和估算为什么差那么多」（$83.5228 对 $312,235.4418）。
+ * 用户第三次问「实际和估算为什么差那么多」（$83.5228 对 $312,235.4418），前两轮（补覆盖量标注、
+ * 改竖排分层加单价）都没救回来。
  *
- * 不是算法问题：单价 $4.12/M 对 $4.47/M，同一量级；差额全来自覆盖量。前两轮补的小字标注没用，
- * 因为并排等重的两个大金额本身就在邀请读者相减。所以这里断言的是**读者不做除法也能看懂**：
- * 每层自带覆盖占比与单价，且明确写出「不要相减」。
+ * 因为缺陷有两条，两轮都没碰到：`actual` 的中文名是错的（那是 OpenCode 自带的估算值，不是账单），
+ * 而且它覆盖 0.03% 却与覆盖 99.97% 的估算等重并排。所以这里断言的是**主次分层**：默认视图只有
+ * 本地估算一个金额，来源自带在折叠披露里，展开后才连同「不是账单」「不要相加相减」一起出现。
  *
  * 种子数据的覆盖是 538,000 / 118,550 / 2,100 可计费 Token（合计 658,650），
- * 所以实际层 81.68%、估算层 18.00%。
+ * 所以来源自带层 81.68%、本地估算层 18.00%。
  */
-test('成本卡把「实际 vs 估算」呈现为不可比，而不是并排让人相减', async ({ page }) => {
+test('成本卡以本地估算为主数字，来源自带降为折叠披露', async ({ page }) => {
   await openOverview(page)
 
   const card = page.getByTestId('summary-cost-card')
 
-  // 覆盖占比：读者一眼看出两层覆盖的不是同一批记录。
+  // 默认视图：只有一个金额，不再有两个大数邀请相减。
+  await expect(page.getByTestId('summary-cost-tier-estimated')).toHaveAttribute(
+    'data-emphasis',
+    'primary',
+  )
+  await expect(page.getByTestId('summary-cost-estimated')).toHaveText('$0.0075')
+  await expect(page.getByTestId('summary-cost-tier-actual')).toHaveCount(0)
+  await expect(card).not.toContainText('$0.0484')
+  await expect(card).toContainText(zh.overview.summary.costPrimaryHint)
+
+  // 折叠入口用记录数说明这一层覆盖了多少。种子里带上游金额的是 90 条。
+  const toggle = page.getByTestId('summary-cost-source-toggle')
+  await expect(toggle).toHaveText(zh.overview.summary.costSourceShow('90'))
+  await toggle.click()
+
+  // 覆盖占比：展开后读者一眼看出两层覆盖的不是同一批记录。
   await expect(page.getByTestId('summary-cost-actual-share')).toHaveText(
     zh.overview.summary.costTierShare('81.68%'),
   )
@@ -112,14 +131,19 @@ test('成本卡把「实际 vs 估算」呈现为不可比，而不是并排让�
   await expect(page.getByTestId('summary-cost-actual-unit-price')).toHaveText('$0.0900')
   await expect(page.getByTestId('summary-cost-estimated-unit-price')).toHaveText('$0.0633')
 
-  const note = page.getByTestId('summary-cost-comparability')
+  const note = page.getByTestId('summary-cost-source-explain')
   await expect(note).toBeVisible()
   await expect(note).toHaveAttribute('data-comparability', 'incomparable')
-  await expect(note).toContainText('不要相减')
+  await expect(note).toContainText(zh.overview.summary.costSourceExplain)
+  await expect(note).toContainText('不能相减')
   await expect(note).toContainText(zh.overview.summary.costUnitPriceHint)
 
   // 三态永不相加：卡片里不得出现 0.0484 + 0.0075 = 0.0559。
   await expect(card).not.toContainText('$0.0559')
+
+  // 「永不相加」是实现约束，不是给用户的信息 —— 卡内不得出现。
+  await expect(card).not.toContainText('永不相加')
+  await expect(card).not.toContainText('缺失分层')
 
   await qaScreenshot(page, 'cost-incomparable.png')
 })
@@ -431,16 +455,23 @@ test('an all-zero summary renders zeros, never an empty state', async ({ page })
   })
 
   await expect(page.getByTestId('summary-token-input')).toHaveText('0')
-  await expect(page.getByTestId('summary-cost-actual')).toHaveText('$0.0000')
   await expect(page.getByTestId('summary-cost-estimated')).toHaveText('$0.0000')
   await expect(page.getByTestId('summary-message-count')).toHaveText('0')
   await expect(page.getByTestId('summary-cost-card')).toBeVisible()
   await expect(page.getByTestId('empty-state')).toHaveCount(0)
   await expect(page.locator('[data-testid="summary-cost-card"] .cost-badge-partial')).toHaveCount(0)
   /**
-   * 无可信成本为 0 条时整段不渲染（round-8 用户反馈：「成本也没有任何显示 无可信成本 0 条
+   * 全零边界：主数字的 $0.0000 照常渲染（它是真实合计），但必须挂上「这是没有数据，不是没花钱」
+   * 的说明；来源自带零覆盖时连折叠入口都不出现，那个 $0 从此不在任何视觉层级上。
+   */
+  const primaryNote = page.getByTestId('summary-cost-primary-note')
+  await expect(primaryNote).toHaveAttribute('data-primary-note', 'noCoverage')
+  await expect(primaryNote).toHaveText(zh.overview.summary.costNoCoverage)
+  await expect(page.getByTestId('summary-cost-source-toggle')).toHaveCount(0)
+  await expect(page.getByTestId('summary-cost-actual')).toHaveCount(0)
+  /**
+   * 目录无价为 0 条时整段不渲染（round-8 用户反馈：「成本也没有任何显示 无可信成本 0 条
    * 这些记录不计入任何金额，也不当 0」）。那句是解释性文案，0 条时没有要解释的对象。
-   * 金额与消息数的 0 仍然照常渲染 —— 它们是真实合计，与「没有金额」不是一回事。
    */
   await expect(page.getByTestId('summary-cost-unavailable-block')).toHaveCount(0)
   await expect(page.getByTestId('summary-cost-unavailable')).toHaveCount(0)

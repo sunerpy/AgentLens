@@ -6,6 +6,9 @@
  * deliberately returns five atomic buckets and never pre-merges, so the merge happens here
  * and only for presentation; both atomic cache values stay visible in the footer.
  */
+import { useState } from 'react'
+
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import type { Summary } from '@/generated'
 import { zh } from '@/i18n/zh'
@@ -146,32 +149,45 @@ function TokenCard({ summary }: { summary: Summary }) {
  * One costed coverage layer: how much of the range it covers, what it came to, and — the only
  * cross-tier comparable figure — what that works out to per million billable tokens.
  *
- * Stacked, not columned. The previous layout put the two amounts in two equal grid cells, and
- * that symmetry is itself a claim: it says "these two numbers are the same kind of thing, compare
- * them". They are not — see `costTiers.ts`. A full-width row per tier, each carrying its own
- * coverage share, reads as two slices of the range instead of two takes on one number.
+ * `emphasis` is the whole point of this round. Exactly one tier gets it: the local estimate, which
+ * covers 99.97% of this project's records. The source-provided tier renders through the same
+ * component at reduced weight inside a disclosure, so the two are never peers on screen — see
+ * `costTiers.ts` for why equal weight was the defect rather than the copy around it.
  */
 function CostTierRow({
   label,
   tier,
   amount,
   amountTestId,
+  emphasis = false,
 }: {
   label: string
   tier: CostTierView
   amount: number
   amountTestId: string
+  emphasis?: boolean
 }) {
   const share = tier.tokenShare
   return (
     <div
       data-testid={`summary-cost-tier-${tier.key}`}
       data-coverage-records={tier.recordCount}
-      className="flex flex-col gap-1.5 rounded-lg border border-border bg-muted/20 px-3 py-2.5"
+      data-emphasis={emphasis ? 'primary' : 'secondary'}
+      className={cn(
+        'flex flex-col gap-1.5 rounded-lg border px-3 py-2.5',
+        emphasis ? 'border-border bg-muted/30' : 'border-border/60 bg-background/40',
+      )}
     >
       <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium tracking-wide text-muted-foreground">{label}</span>
+          <span
+            className={cn(
+              'font-medium tracking-wide',
+              emphasis ? 'text-sm text-foreground' : 'text-xs text-muted-foreground',
+            )}
+          >
+            {label}
+          </span>
           <span
             data-testid={`summary-cost-${tier.key}-share`}
             className="rounded-full bg-foreground/5 px-2 py-0.5 text-[0.7rem] font-medium tabular-nums ring-1 ring-border"
@@ -184,7 +200,10 @@ function CostTierRow({
         <span
           data-testid={amountTestId}
           title={formatMoney(amount)}
-          className="font-heading max-w-full text-xl leading-tight font-semibold tabular-nums [overflow-wrap:anywhere]"
+          className={cn(
+            'font-heading max-w-full leading-tight font-semibold tabular-nums [overflow-wrap:anywhere]',
+            emphasis ? 'text-2xl' : 'text-base',
+          )}
         >
           {formatMoney(amount)}
         </span>
@@ -214,48 +233,102 @@ function CostTierRow({
 }
 
 /**
- * The sentence that answers "为什么差那么多" without the reader doing any arithmetic.
+ * Disclaims the headline `$0` in the two shapes where it is the absence of data rather than a real
+ * total, and renders nothing otherwise.
  *
- * Always rendered, in all four coverage shapes. The single-tier shapes matter as much as the
- * mixed one: an empty tier's `$0.0000` is the absence of coverage, and letting it stand
- * unqualified beside a real amount is the same misreading in a different costume.
+ * The previous version of this note ran unconditionally and had to talk about "两格的 $0" because
+ * two amounts were always on screen. With one headline there is only one zero to qualify, so the
+ * note disappears entirely whenever the estimate stands on real coverage — which is the common
+ * case, and a card that stops explaining itself when there is nothing to explain reads as working
+ * rather than as warning.
  */
-function CostComparabilityNote({ tiers }: { tiers: CostTiersView }) {
-  const text =
-    tiers.comparability === 'incomparable'
-      ? zh.overview.summary.costIncomparable(
-          formatCount(tiers.actual.recordCount),
-          formatCount(tiers.estimated.recordCount),
-        )
-      : tiers.comparability === 'actualOnly'
-        ? zh.overview.summary.costActualOnly
-        : tiers.comparability === 'estimatedOnly'
-          ? zh.overview.summary.costEstimatedOnly
-          : zh.overview.summary.costNoCoverage
+function CostPrimaryNote({ tiers }: { tiers: CostTiersView }) {
+  if (tiers.primaryNote === null) return null
   return (
-    <div
-      data-testid="summary-cost-comparability"
-      data-comparability={tiers.comparability}
+    <p
+      data-testid="summary-cost-primary-note"
+      data-primary-note={tiers.primaryNote}
       role="note"
-      className="flex flex-col gap-1 rounded-lg border border-border border-dashed bg-muted/30 px-3 py-2"
+      className="rounded-lg border border-border border-dashed bg-muted/30 px-3 py-2 text-[0.7rem] leading-relaxed text-muted-foreground"
     >
-      <p className="text-[0.7rem] leading-relaxed text-muted-foreground">{text}</p>
-      {tiers.comparability === 'incomparable' ? (
-        <p className="text-[0.7rem] leading-relaxed text-muted-foreground">
-          {zh.overview.summary.costUnitPriceHint}
-        </p>
+      {tiers.primaryNote === 'estimatedNoCoverage'
+        ? zh.overview.summary.costEstimatedNoCoverage
+        : zh.overview.summary.costNoCoverage}
+    </p>
+  )
+}
+
+/**
+ * The source-provided amount, behind a collapsed disclosure that names its own coverage.
+ *
+ * The trigger states the record count rather than the tier name, because the count is what makes
+ * the figure worth opening or ignoring: `另有 117 条记录自带上游金额` already tells a reader with
+ * 287,747 estimated records that this is a footnote, before any money is on screen. The
+ * incomparability sentence and the unit-price pointer live inside, next to the only two numbers
+ * they describe, instead of as a standing caveat on a card-wide comparison that no longer exists.
+ */
+function CostSourceProvidedDisclosure({ tiers, amount }: { tiers: CostTiersView; amount: number }) {
+  const [open, setOpen] = useState(false)
+  if (!tiers.hasSourceProvided) return null
+  return (
+    <div data-testid="summary-cost-source-provided" className="flex flex-col gap-2">
+      <Button
+        type="button"
+        size="sm"
+        variant="ghost"
+        aria-expanded={open}
+        className="self-start"
+        data-testid="summary-cost-source-toggle"
+        onClick={() => setOpen((current) => !current)}
+      >
+        {open
+          ? zh.overview.summary.costSourceHide
+          : zh.overview.summary.costSourceShow(formatCount(tiers.actual.recordCount))}
+      </Button>
+      {open ? (
+        <div className="flex flex-col gap-2">
+          <CostTierRow
+            label={zh.common.cost.actual}
+            tier={tiers.actual}
+            amount={amount}
+            amountTestId="summary-cost-actual"
+          />
+          <div
+            data-testid="summary-cost-source-explain"
+            data-comparability={tiers.comparability}
+            role="note"
+            className="flex flex-col gap-1 rounded-lg border border-border border-dashed bg-muted/30 px-3 py-2"
+          >
+            <p className="text-[0.7rem] leading-relaxed text-muted-foreground">
+              {zh.overview.summary.costSourceExplain}
+            </p>
+            {tiers.comparability === 'incomparable' ? (
+              <>
+                <p className="text-[0.7rem] leading-relaxed text-muted-foreground">
+                  {zh.overview.summary.costSourceIncomparable(
+                    formatCount(tiers.actual.recordCount),
+                    formatCount(tiers.estimated.recordCount),
+                  )}
+                </p>
+                <p className="text-[0.7rem] leading-relaxed text-muted-foreground">
+                  {zh.overview.summary.costUnitPriceHint}
+                </p>
+              </>
+            ) : null}
+          </div>
+        </div>
       ) : null}
     </div>
   )
 }
 
 /**
- * The 无可信成本 block is gated on a non-zero count, not merely styled differently at zero.
+ * The 目录无价 block is gated on a non-zero count, not merely styled differently at zero.
  *
- * Its second line — "这些记录不计入任何金额，也不当 0" — explains a discrepancy between the two
- * amounts above it and the archive. At zero there is no discrepancy to explain, so the sentence
- * describes nothing and reads as a warning about a problem the user does not have. The two amounts
- * stay unconditional by contrast: `$0.00` is a real total, not the absence of one.
+ * Its explanatory line describes why some usage has no amount attached. At zero there is nothing
+ * to explain, so the sentence describes nothing and reads as a warning about a problem the user
+ * does not have. The estimate headline stays unconditional by contrast: it is the one figure the
+ * card is *about*, and `$0.0000` there is qualified by {@link CostPrimaryNote} instead of hidden.
  */
 function CostCard({
   summary,
@@ -279,22 +352,18 @@ function CostCard({
         <CardDescription>{zh.overview.summary.costDescription}</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
-        <span className="text-[0.7rem] font-medium tracking-wide text-muted-foreground select-none">
-          {zh.overview.summary.costSplitLabel}
-        </span>
-        <CostTierRow
-          label={zh.common.cost.actual}
-          tier={tiers.actual}
-          amount={cost.actualSum}
-          amountTestId="summary-cost-actual"
-        />
         <CostTierRow
           label={zh.common.cost.estimated}
           tier={tiers.estimated}
           amount={cost.estimatedSum}
           amountTestId="summary-cost-estimated"
+          emphasis
         />
-        <CostComparabilityNote tiers={tiers} />
+        <span className="text-[0.7rem] leading-relaxed text-muted-foreground select-none">
+          {zh.overview.summary.costPrimaryHint}
+        </span>
+        <CostPrimaryNote tiers={tiers} />
+        <CostSourceProvidedDisclosure tiers={tiers} amount={cost.actualSum} />
         {hasUnavailable ? (
           <>
             <div

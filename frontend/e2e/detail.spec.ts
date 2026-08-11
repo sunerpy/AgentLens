@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test'
 
+import { zh } from '../src/i18n/zh'
 import { mockCalls, openShell, qaScreenshot } from './harness'
 
 /**
@@ -151,14 +152,15 @@ test('cost source and incomplete badges are rendered per row', async ({ page }) 
 
   // Seeded rows cycle actual → estimated → unavailable, so all three badges exist on page 1.
   await expect(page.getByTestId('detail-cost-source')).toHaveCount(PAGE_SIZE)
+  // 走字典而不是写死字面量：三态的中文名会随口径正名变化，字面量只会变成过期断言。
   await expect(
-    page.getByTestId('detail-cost-source').filter({ hasText: '实际' }).first(),
+    page.getByTestId('detail-cost-source').filter({ hasText: zh.common.cost.actual }).first(),
   ).toBeVisible()
   await expect(
-    page.getByTestId('detail-cost-source').filter({ hasText: '估算' }).first(),
+    page.getByTestId('detail-cost-source').filter({ hasText: zh.common.cost.estimated }).first(),
   ).toBeVisible()
   await expect(
-    page.getByTestId('detail-cost-source').filter({ hasText: '成本不可用' }).first(),
+    page.getByTestId('detail-cost-source').filter({ hasText: zh.common.cost.unavailable }).first(),
   ).toBeVisible()
 
   // `index % 11 === 0` → rows 0, 11, 22, 33, 44 on the first page.
@@ -217,7 +219,7 @@ test('malformed rows render without breaking the layout', async ({ page }) => {
   const row = page.locator('[data-testid="detail-row"][data-message-id="msg_malformed_0001"]')
   await expect(row).toBeVisible()
   await expect(row.getByTestId('detail-incomplete')).toBeVisible()
-  await expect(row.getByTestId('detail-cost-source')).toHaveText('成本不可用')
+  await expect(row.getByTestId('detail-cost-source')).toHaveText(zh.common.cost.unavailable)
 
   const overflow = await page.evaluate(
     () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
