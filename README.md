@@ -8,9 +8,9 @@
 
 **简体中文** · [English](docs/readme/README.en.md)
 
-AgentLens 是一个桌面用量看板：把本机与多台远端主机上 OpenCode、Claude Code、Codex 与
-Hermes 的用量记录采集进一个本地 SQLite 归档库，再按时区、Agent、模型与项目维度看趋势、
-查单条明细。默认只采集 OpenCode，其余三个源在主机卡片上逐个勾选后启用。
+AgentLens 是一个桌面用量看板。它把本机和多台远端主机上 OpenCode、Claude Code、Codex、
+Hermes 的用量记录采进同一个本地 SQLite 归档库，再按时区、Agent、模型和项目切开看趋势，
+或者下钻到单条明细。默认只采 OpenCode，另外三个源要在主机卡片上逐个勾选。
 
 ## 目录
 
@@ -26,49 +26,52 @@ Hermes 的用量记录采集进一个本地 SQLite 归档库，再按时区、Ag
 
 ## 界面
 
-总览页：左侧三态侧栏，右侧是区间与粒度、四类 Token 分桶、成本卡与用量趋势图。成本卡默认
-只给一个数：本机价目表乘可计费 Token 算出的「本地估算」，旁边标出它覆盖了多少条记录，
-以及每百万可计费 Token 的单价，单价是这张卡里唯一可以横向比较的数。带上游自带金额的记录
-折叠在一个入口后面，目录里查不到价格的记录另列，两者都不并进估算值。趋势图的斜纹区是
-无数据覆盖的断裂桶，底色区是部分覆盖，二者都不会被当成 0。
+总览页左边是三态侧栏，右边从上到下是区间与粒度、四类 Token 分桶、成本卡和用量趋势图。
+这页值得说的是成本卡为什么只给一个数。它给的是「本地估算」，本机价目表乘可计费 Token
+算出来的。别的数都不可比：带上游自带金额的记录用的是别人的价目表，目录里查不到价格的
+记录连基数都不全，两类各自折叠在一个入口后面，都不并进估算值。卡上真正能横向比较的只有
+每百万可计费 Token 的单价，它旁边那行「覆盖了多少条记录」是给这个估算标可信度的。趋势图
+里的斜纹是没有数据覆盖的断裂桶，底色是部分覆盖。都不是 0。
 
 ![总览页](assets/screenshots/overview.png)
 
-同一张趋势图切到「按模型」分组，并换成深海蓝主题。分组维度有不分组 / 模型 / agent / 工具
-四种，主题共六套，都在标题栏就地切换。侧栏可展开、收起成 64px 图标栏，或整条隐藏。
+同一张趋势图切到「按模型」分组，主题换成深海蓝。分组有不分组 / 模型 / agent / 工具四种，
+主题六套，都在标题栏就地切换，不用绕去设置页。侧栏能展开、收成 64px 图标栏，也能整条藏掉。
 
 ![按模型分组的总览页，深海蓝主题](assets/screenshots/overview-by-model-dark.png)
 
-用量分析页：来源 → agent → 模型 三级展开，区间与时区与总览共享同一状态。缺价的行挂
-「成本缺失」标记而不是填 0，占比按本级 token 合计算。
+用量分析页是来源 → agent → 模型 三级展开，区间和时区跟总览共用一份状态。这里唯一需要
+解释的是缺价的行：它挂一个「成本缺失」标记，不填 0。填 0 会让人以为这段用量是免费的。
+占比也只按本级 token 合计算，不跨级借基数。
 
 ![用量分析页的三级展开](assets/screenshots/usage-drilldown.png)
 
-主机页：本机与 SSH 远端并列，采集源在各自的主机卡片上逐个勾选。默认只有 OpenCode，
-Claude Code、Codex 与 Hermes 需要显式启用。
+主机页把本机和 SSH 远端并排放。采集源的开关做在每张主机卡上，不在设置页里，因为同一个源
+在哪台主机上开、在哪台不开，本来就是两件事。默认只勾了 OpenCode。
 
 ![主机管理页](assets/screenshots/hosts.png)
 
 ## 亮点
 
-- **归档库是权威历史，永不裁剪。** 源库轮转、备份被删或远端数据目录被清空，都不会导致
-  已归档的记录消失。
-- **远端采集只读。** 静态链接的 musl 采集器被推送到远端、校验 sha256 后就地执行、
-  退出时清理，从不写入远端工具的数据。
-- **凭据只进操作系统钥匙串**（Linux Secret Service / Windows 凭据管理器）。
-  口令不落任何配置文件，也不会经 IPC 回传给界面。
-- **日历分桶只有一份实现，在 Rust 侧。** 前端不引入 `date-fns` / `dayjs` / `moment`，
-  所有原始 epoch 都按报表时区分桶，后端格式化好的标签不会被前端二次转换。
-- **类型化 IPC。** TypeScript 契约由 `ts-rs` 从 Rust 类型生成，边界不会悄悄漂移。
-- **定价能跨 provider 回退。** 同一模型经不同网关接入时，价格条目往往只挂在归属方名下，
-  匹配因此允许跨 provider 回退。实测 251737 条记录的可定价比例从 0.1% 升到 99.4%。
-  手工覆盖价仍按 `(provider, model)` 精确匹配，不会外溢。
+- **归档库是权威历史，永不裁剪。** 源库轮转、备份被删、远端数据目录被整个清空，
+  已归档的记录都还在。
+- 远端采集全程只读。静态链接的 musl 采集器推到远端，校验 sha256，就地执行，退出时清掉
+  自己。它不动远端工具的任何数据。
+- 凭据只进操作系统钥匙串：Linux 走 Secret Service，Windows 走凭据管理器。口令不落配置
+  文件，也不经 IPC 回传给界面。
+- **日历分桶只有一份实现，在 Rust 侧。** 前端一个日期库都没装，没有 `date-fns`，
+  没有 `dayjs`，也没有 `moment`。原始 epoch 全在后端按报表时区分桶，前端拿到的标签已经
+  成型，不会被二次换算到另一个时区。
+- TypeScript 契约由 `ts-rs` 从 Rust 类型生成，不是手写的，边界不会悄悄漂移。
+- **定价允许跨 provider 回退。** 同一个模型经不同网关接入时，价格条目往往只挂在归属方
+  名下，严格按 `(provider, model)` 匹配会大面积查不到价。实测 251737 条记录，可定价
+  比例从 0.1% 提到 99.4%。手工覆盖价是例外，仍然精确匹配，不外溢。
   规则见 [docs/measurement.md](docs/measurement.md)。
 
 ## 安装
 
-预编译包：`.deb`（Linux x86_64）、NSIS 安装包（Windows x64）、`.dmg`（macOS
-aarch64）。一行式安装脚本会识别平台、**用发布清单校验 SHA-256**，并且从不自行提权。
+预编译包有三个：`.deb`（Linux x86_64）、NSIS 安装包（Windows x64）、`.dmg`（macOS
+aarch64）。一行式脚本会自己认平台，**用发布清单校验 SHA-256**，不自行提权。
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/sunerpy/AgentLens/main/scripts/install.sh | bash
@@ -114,8 +117,8 @@ sudo apt install ./AgentLens_*_amd64.deb
 | 桌面壳 | `src-tauri/` | Tauri 2 宿主、IPC 命令、托盘 |
 | 前端 | `frontend/` | React 18.3.1 + Vite 8 + Tailwind v4 |
 
-归档库是带去重与按源水位线的 SQLite；SSH 传输使用恒定的远端命令，载荷作为一个位置参数
-传入。详见 [docs/architecture.md](docs/architecture.md)。
+归档库是 SQLite，带去重和按源水位线。SSH 那一侧的远端命令是恒定的，变的只有当作位置参数
+传进去的载荷，命令本身不参与拼接。详见 [docs/architecture.md](docs/architecture.md)。
 
 ## 测试与质量
 
@@ -128,9 +131,9 @@ sudo apt install ./AgentLens_*_amd64.deb
 | 行覆盖率 | 实测 92.72%，下限 90% 由 `make coverage-gate` 强制 | `make coverage-gate` |
 
 GitHub Actions 的三平台矩阵（ubuntu / windows / macos）在 `main` 上全绿，三平台也都在
-AWS CodeBuild 上出过真实安装包。但**构建绿灯只说明缺陷没有复现，不代表产品可用**，
-所以 Windows 上另做了真机验收：EC2 Windows Server 上装了包、起了应用，25 条机器可判定的
-GUI 断言全过。
+AWS CodeBuild 上出过真实安装包。**绿灯只说明缺陷没有复现，不说明产品能用。** Windows
+上另跑了一轮真机验收：EC2 Windows Server 上装包、启动，25 条机器可判定的 GUI 断言
+全过。Linux 和 macOS 目前只到出包这一步，没做过同样的真机启动验收。
 
 覆盖率地板的实现方式、每个平台的构建 ID、产物字节数，以及真机验收的逐条断言：
 [docs/readme/development.zh.md](docs/readme/development.zh.md)。
