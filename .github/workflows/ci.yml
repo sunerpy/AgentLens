@@ -369,6 +369,18 @@ jobs:
         if: runner.os == 'Linux'
         run: make lint
 
+      # Windows 双格式清单契约。跑在 Linux 上，因为它对着假的 bundle 目录驱动
+      # scripts/ci/windows-collect-assets.ps1，不需要真构建（GitHub 的 ubuntu
+      # runner 自带 pwsh 7）。刻意不挂进 make lint：那会给每个开发者的 `make lint`
+      # 加一条 pwsh 硬依赖。
+      #
+      # 它覆盖的是同 job 的 Windows 构建**证明不了**的两件事：
+      #   1. 只出一种安装包时收集器必须失败（两个方向都测）；
+      #   2. 清单里多出的 .msi 行不会干扰 install.ps1 挑 -setup.exe。
+      - name: 门禁 Windows 双格式校验和契约（NSIS + MSI 都必须有 digest）
+        if: runner.os == 'Linux'
+        run: make dist-windows-manifest-verify
+
       # Windows / macOS 拆成裸命令，理由与 windows.yml 相同：不依赖 GNU make 与
       # Makefile 的 bash-ism。oxfmt 不在这两个平台重跑 —— 它检查的是平台无关的
       # YAML/JSON/Markdown，跑三遍纯属重复，Linux job 已经是权威。
@@ -555,7 +567,11 @@ jobs:
       # 必须从仓库根运行：在 frontend/ 下 Tauri 会 panic
       # "Couldn't recognize the current folder as a Tauri project"。
       # bundle overlay 已提交且由平台负责人持有，本文件不改它。
-      - name: 构建 Windows NSIS 安装包
+      #
+      # 两种格式与 release.yml 保持一致（NSIS 主推 + MSI 给企业分发）。升级语义分叉、
+      # upgradeCode 为何钉死、为何 Linux 交叉编译只能出 NSIS，逐条写在
+      # .github/workflows/release.yml 的同名步骤里，此处不复制以免两份注释漂移。
+      - name: 构建 Windows NSIS + MSI 安装包
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -566,24 +582,19 @@ jobs:
             Write-Host "gate ok: $what"
           }
 
-          cargo tauri build --bundles nsis --config src-tauri/tauri.bundle.windows.json
-          Assert-Ok "cargo tauri build --bundles nsis"
+          cargo tauri build --bundles nsis,msi --config src-tauri/tauri.bundle.windows.json
+          Assert-Ok "cargo tauri build --bundles nsis,msi"
 
-          $nsis = Get-ChildItem "target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue
-          if (-not $nsis) {
-            throw "NSIS installer not produced under target\release\bundle\nsis"
-          }
-          New-Item -ItemType Directory -Force -Path "artifacts\dist" | Out-Null
-          Copy-Item $nsis.FullName "artifacts\dist\" -Force
+          pwsh -NoProfile -File scripts/ci/windows-collect-assets.ps1 `
+            -BundleRoot "target\release\bundle" `
+            -Destination "artifacts\dist" `
+            -ManifestName "sha256sums.txt"
+          Assert-Ok "scripts/ci/windows-collect-assets.ps1"
+
+          # collector 清单是随包分发的 sidecar 校验表，不是发布资产，所以刻意在生成
+          # sha256sums.txt **之后**才拷进来：让它进清单会让 install.ps1 看到一个它
+          # 不认识、也拿不到的条目。
           Copy-Item "target\dist\binaries\collectors.sha256" "artifacts\dist\" -Force
-
-          Push-Location "artifacts\dist"
-          Get-ChildItem "*.exe" | ForEach-Object {
-            $h = (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower()
-            "$h  $($_.Name)"
-          } | Set-Content -Encoding ascii "sha256sums.txt"
-          Get-Content "sha256sums.txt" | Write-Host
-          Pop-Location
           Get-ChildItem "artifacts\dist" | Format-List Name,Length | Out-String | Write-Host
 
       # ---- macOS sidecar 归置 ---------------------------------------------

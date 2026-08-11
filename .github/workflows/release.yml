@@ -636,7 +636,28 @@ jobs:
       # 必须从仓库根运行：在 frontend/ 下 Tauri 会 panic
       # "Couldn't recognize the current folder as a Tauri project"。
       # 清单改名 sha256sums-windows.txt，避免与其他平台在同一 Release 上撞名。
-      - name: 构建 NSIS 安装包并归置发布资产
+      #
+      # ---- Windows 出两种安装包，NSIS 是主推格式 ------------------------------
+      # nsis → AgentLens_<version>_x64-setup.exe   scripts/install.ps1 默认装它
+      # msi  → AgentLens_<version>_x64_en-US.msi   给企业 SCCM / 组策略，只能手工下载
+      #
+      # ★ 两者的升级语义不同，装了一个不会被另一个识别为同一应用 ★
+      # MSI 按 ProductCode/UpgradeCode 判定升级链；NSIS 不用 upgradeCode，靠自己的
+      # 注册表项，且默认 currentUser 装到 %LOCALAPPDATA%，而 MSI 是 per-machine。
+      # 所以先装 NSIS 版的用户再装 MSI 版会得到**两份并存**的 AgentLens，反之亦然。
+      # 这是 Windows 安装体系的既有行为，不是本仓库能消除的，只能保证同一格式内部的
+      # 升级链是稳的。
+      #
+      # upgradeCode 已在 src-tauri/tauri.bundle.windows.json 里钉死（JSON 放不了注释，
+      # 所以理由写在这里）。不写时 Tauri 按 productName 派生：
+      #   Uuid::new_v5(NAMESPACE_DNS, "<productName>.exe.app.x64")
+      # 即哪天改了 productName，upgradeCode 会跟着变，已装 MSI 的用户下次升级会变成
+      # 装第二份。钉死的值 57809f90-bf2f-51e0-84e6-6d2c6f2aed0e 正是 productName
+      # "AgentLens" 当前派生出的那一个，所以钉死本身不改变任何现有行为。
+      #
+      # ★ MSI 只能在 Windows 上产出（WiX 只跑在 Windows），所以 Makefile 的
+      #   dist-windows（Linux + cargo-xwin 交叉编译）刻意只出 NSIS。★
+      - name: 构建 NSIS + MSI 安装包并归置发布资产
         shell: pwsh
         run: |
           function Assert-Ok([string]$what) {
@@ -646,28 +667,20 @@ jobs:
             Write-Host "gate ok: $what"
           }
 
-          cargo tauri build --bundles nsis --config src-tauri/tauri.bundle.windows.json
-          Assert-Ok "cargo tauri build --bundles nsis"
+          cargo tauri build --bundles nsis,msi --config src-tauri/tauri.bundle.windows.json
+          Assert-Ok "cargo tauri build --bundles nsis,msi"
 
-          $nsis = Get-ChildItem "target\release\bundle\nsis\*.exe" -ErrorAction SilentlyContinue
-          if (-not $nsis) {
-            throw "NSIS installer not produced under target\release\bundle\nsis"
-          }
-          New-Item -ItemType Directory -Force -Path "upload" | Out-Null
-          Copy-Item $nsis.FullName "upload\" -Force
-
-          Push-Location "upload"
-          Get-ChildItem "*.exe" | ForEach-Object {
-            $h = (Get-FileHash $_.Name -Algorithm SHA256).Hash.ToLower()
-            "$h  $($_.Name)"
-          } | Set-Content -Encoding ascii "sha256sums-windows.txt"
-          Get-Content "sha256sums-windows.txt" | Write-Host
-          Pop-Location
-
-          if (-not (Get-ChildItem "upload")) {
-            throw "upload directory is empty, refusing to upload"
-          }
-          Get-ChildItem "upload" | Format-List Name,Length | Out-String | Write-Host
+          # 产物归集与校验清单都交给 scripts/ci/windows-collect-assets.ps1。
+          # ★ 这里刻意不再用 `Get-ChildItem "*.exe"` 那种按后缀 glob 的写法 ★
+          # 那种写法在新增一种安装包格式时会**静默漏掉**新产物的校验和：拷贝步骤加了
+          # msi、清单步骤还只收 .exe，于是发出一个没有任何 digest 的资产，而 install.ps1
+          # 正是靠这份清单校验下载的。构建、上传、门禁全都不会红。那个脚本改成从「已通过
+          # 护栏的同一份列表」派生清单，并双向断言 2/2 格式，所以漏一个必然失败。
+          pwsh -NoProfile -File scripts/ci/windows-collect-assets.ps1 `
+            -BundleRoot "target\release\bundle" `
+            -Destination "upload" `
+            -ManifestName "sha256sums-windows.txt"
+          Assert-Ok "scripts/ci/windows-collect-assets.ps1"
 
       - name: 上传资产到 draft Release
         env:

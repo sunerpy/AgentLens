@@ -104,8 +104,33 @@ function Resolve-Architecture {
 }
 
 # Mapping is derived from .github/workflows/release.yml, the only authority on
-# which assets a release carries. Windows publishes exactly one installer:
-#   AgentLens_<version>_x64-setup.exe  +  sha256sums-windows.txt
+# which assets a release carries. Windows publishes TWO installers plus one
+# manifest covering both:
+#   AgentLens_<version>_x64-setup.exe    NSIS      <- this script installs this
+#   AgentLens_<version>_x64_en-US.msi    WiX MSI   <- download by hand
+#   sha256sums-windows.txt               digests for both
+#
+# THIS SCRIPT DELIBERATELY INSTALLS THE NSIS SETUP ONLY, and takes no -Format
+# switch. Three reasons, in order of weight:
+#   (1) The two formats do not share an upgrade identity. MSI upgrades are keyed
+#       on ProductCode/UpgradeCode; NSIS keeps its own registry state and
+#       installs per-user into %LOCALAPPDATA% while MSI is per-machine. A script
+#       that could install either would let one machine end up with two
+#       side-by-side AgentLens installations depending on which flag was passed
+#       last -- and this script cannot detect or repair that.
+#   (2) MSI's audience is enterprise deployment (SCCM, Group Policy), which
+#       fetches the .msi from the release page and applies it through its own
+#       machinery. A curl-pipe-to-shell bootstrap is not part of that workflow.
+#   (3) The suffix match below stays exactly one asset wide, so the manifest
+#       parsing and digest verification are unchanged -- and those had been
+#       verified byte-for-byte against a real CodeBuild artifact (see the header).
+#       Widening the selection is the kind of change that quietly turns the
+#       "refusing to guess which one is meant" guard into a coin flip.
+#
+# The .msi line in sha256sums-windows.txt is therefore inert here: Read-Manifest
+# filters on Suffix, so it never matches. That is asserted in
+# scripts/qa/windows-dual-format-manifest.sh (case 4).
+#
 # There is deliberately no arm64 and no 32-bit build, so those must fail with an
 # explanation instead of downloading the wrong installer.
 function Select-Artifact {

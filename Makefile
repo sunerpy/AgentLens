@@ -641,6 +641,11 @@ dist-stage-windows: dist-windows-toolchain ## 按 Windows 命名约定归置 4 �
 	@printf '[win] stage 就绪（%s 个文件）：\n' "$$(ls -1 $(STAGE_DIR) | wc -l)"
 	@ls -l $(STAGE_DIR)
 
+# ★ 刻意只出 NSIS，不出 MSI —— 这不是遗漏 ★
+# WiX 只跑在 Windows 上，所以 MSI 无法交叉编译；本目标的宿主是 Linux（cargo-xwin），
+# 加上 msi 必然失败。Windows 上的 GitHub Actions job 出 nsis,msi 两种，
+# 本地这条交叉链只覆盖 NSIS，是能力边界，不是配置差异。
+# 两种格式的升级语义分叉见 .github/workflows/release.yml 的构建步骤注释。
 dist-bundle-windows: dist-stage-windows ## 构建前端 + Windows NSIS 安装包（必传 --config）
 	@# ★★ --config 必传，漏掉会静默丢掉全部 sidecar 且构建仍 exit 0（实测踩过）★★
 	@# tauri.conf.json 的 bundle 里 externalBin 与 resources **都不存在**，4 个 sidecar
@@ -681,6 +686,14 @@ dist-collect-windows: dist-bundle-windows ## 归集 Windows 产物并生成 sha2
 	@echo '[win] 产物清单：'
 	@ls -l $(DIST_DIR)
 	@cat $(DIST_DIR)/sha256sums.txt
+
+# Windows 发布产物的**校验和覆盖**契约，与下面的 dist-windows-verify 是两件事：
+#   dist-windows-verify           NSIS 包内 sidecar 齐不齐（要真构建出包）
+#   dist-windows-manifest-verify  两种安装包是否都拿到了 digest（不需要真构建）
+# 后者对着假 bundle 目录驱动 scripts/ci/windows-collect-assets.ps1，所以在 Linux
+# 上几秒就能跑完，也能测「只出一种格式」这类负向路径——那在真构建里造不出来。
+dist-windows-manifest-verify: ## 校验 Windows 双格式（NSIS + MSI）都进了 sha256sums 清单
+	scripts/qa/windows-dual-format-manifest.sh
 
 # 缺 7z 时刻意不降级为「跳过」：数不到包内文件的护栏就是装饰品，宁可在这里红。
 # 包定位顺序：WIN_PKG 显式指定 → 归集目录 → NSIS 输出目录（未归集时也能校验）。
