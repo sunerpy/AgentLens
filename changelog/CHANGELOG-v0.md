@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.0.3](https://github.com/sunerpy/AgentLens/compare/v0.0.2...v0.0.3) (2026-08-11)
+
+
+### Bug Fixes
+
+* **tray:** 支持左键单击托盘图标打开主面板 ([#21](https://github.com/sunerpy/AgentLens/issues/21)) ([b9fff30](https://github.com/sunerpy/AgentLens/commit/b9fff303bff75ef25a24417a6f3ce4128e5ad5f8))
+
+
+### Documentation
+
+* **readme:** 重写语感并同步 Cargo.lock 到 0.0.2 版本号 ([#19](https://github.com/sunerpy/AgentLens/issues/19)) ([c6d5ad9](https://github.com/sunerpy/AgentLens/commit/c6d5ad9a9d3540b74535a78010c76fb4d3b97232))
+
+
+### Build System
+
+* **release-please:** 把 Cargo.lock 纳入发版版本号同步 ([#22](https://github.com/sunerpy/AgentLens/issues/22)) ([fd028fe](https://github.com/sunerpy/AgentLens/commit/fd028fe1432ffee6188e2424e6f19a022e7a9b53))
+
 ## [0.0.2](https://github.com/sunerpy/AgentLens/compare/v0.0.1...v0.0.2) (2026-08-11)
 
 
