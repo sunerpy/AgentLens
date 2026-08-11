@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.0.2](https://github.com/sunerpy/AgentLens/compare/v0.0.1...v0.0.2) (2026-08-11)
+
+
+### Bug Fixes
+
+* **overview:** 成本卡术语正名，默认只显示本地估算 ([9a1c3ce](https://github.com/sunerpy/AgentLens/commit/9a1c3ce45c1af608a0c6c50ee9ee2d7da16925ed))
+
+
+### Documentation
+
+* 换用用户提供的总览截图，同步成本卡描述 ([ddbfe95](https://github.com/sunerpy/AgentLens/commit/ddbfe95eeb9704d0a98a816e2d307d2459b3555d))
+
+
+### CI
+
+* setup-zig 关闭缓存，它会从 cancelled run 保存残缺产物 ([3b362a8](https://github.com/sunerpy/AgentLens/commit/3b362a8f52ee8c559f9e55124bae18963cb10717))
+
 ## 0.0.1 (2026-08-10)
 
 
