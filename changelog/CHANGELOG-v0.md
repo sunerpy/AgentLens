@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.5](https://github.com/sunerpy/AgentLens/compare/v0.0.4...v0.0.5) (2026-08-12)
+
+
+### Features
+
+* **updater:** 增加签名自动更新能力 ([#25](https://github.com/sunerpy/AgentLens/issues/25)) ([b72ad36](https://github.com/sunerpy/AgentLens/commit/b72ad36cb234ccf7ed10744bb0b3f9218c867b72))
+
 ## [0.0.4](https://github.com/sunerpy/AgentLens/compare/v0.0.3...v0.0.4) (2026-08-12)
 
 
