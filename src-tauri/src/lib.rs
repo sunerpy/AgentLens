@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod logging;
 mod state;
 mod tray;
+mod updater;
 
 mod bindings;
 
@@ -42,6 +43,8 @@ macro_rules! agentlens_handler {
             commands::credential_delete,
             commands::logs_tail,
             commands::diagnostics_report,
+            updater::updater_check,
+            updater::updater_install,
             $($debug_command),*
         ]
     };
@@ -53,7 +56,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let builder = tauri::Builder::default()
         // 「在系统文件管理器里定位归档库」与「在默认浏览器里打开反馈页」的唯一通道。
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state)
+        .manage(updater::PendingUpdateState::default())
         .on_window_event(tray::handle_window_event)
         .setup(|app| {
             // Logging comes first so that everything below it is diagnosable. The log

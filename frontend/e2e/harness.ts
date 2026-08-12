@@ -9,7 +9,7 @@
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import type { Page } from '@playwright/test'
+import type { Locator, Page } from '@playwright/test'
 
 import type { MockIpcConfig, MockIpcController } from '../src/lib/mockIpc'
 
@@ -27,6 +27,12 @@ export const QA_DIR = path.resolve(E2E_DIR, '../../artifacts/qa')
 export async function qaScreenshot(page: Page, name: string): Promise<string> {
   const target = path.join(QA_DIR, name)
   await page.screenshot({ path: target, fullPage: true, animations: 'disabled' })
+  return target
+}
+
+export async function qaLocatorScreenshot(locator: Locator, name: string): Promise<string> {
+  const target = path.join(QA_DIR, name)
+  await locator.screenshot({ path: target, animations: 'disabled' })
   return target
 }
 

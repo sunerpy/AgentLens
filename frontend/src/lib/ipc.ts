@@ -40,6 +40,8 @@ import type {
   SourceStatus,
   Summary,
   TriggerRefreshResult,
+  UpdateMetadata,
+  UpdateProgress,
 } from '@/generated'
 
 export const IPC_COMMANDS = [
@@ -57,6 +59,8 @@ export const IPC_COMMANDS = [
   'get_refresh_status',
   'get_settings',
   'set_settings',
+  'updater_check',
+  'updater_install',
   'price_catalog_get',
   'prices_get',
   'prices_set',
@@ -211,6 +215,16 @@ export function getSettings(): Promise<AppSettings> {
 /** Upsert-merge: keys absent from `settings.values` are left untouched by the backend. */
 export function setSettings(settings: AppSettings): Promise<AppSettings> {
   return invoke<AppSettings>('set_settings', { settings })
+}
+
+export function updaterCheck(): Promise<UpdateMetadata> {
+  return invoke<UpdateMetadata>('updater_check')
+}
+
+export function updaterInstall(onEvent: (event: UpdateProgress) => void): Promise<void> {
+  const channel = new Channel<UpdateProgress>()
+  channel.onmessage = onEvent
+  return invoke<void>('updater_install', { onEvent: channel })
 }
 
 export function priceCatalogGet(): Promise<PriceCatalog> {

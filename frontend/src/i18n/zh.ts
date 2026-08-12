@@ -687,6 +687,32 @@ export const zh = {
       applyHint: '间隔在保存后应用到刷新调度器',
     },
 
+    update: {
+      title: '应用更新',
+      description: '检查 GitHub Release 中由 AgentLens 发布密钥签名的新版本',
+      autoInstall: '允许应用内安装更新',
+      autoInstallOn: '已开启',
+      autoInstallOff: '已关闭',
+      autoInstallHint: '关闭后仍可检查新版本，但不会在应用内下载安装',
+      check: '检查更新',
+      checking: '正在检查…',
+      currentVersion: (version: string) => `当前版本 ${version}`,
+      latest: '当前已是最新版本',
+      available: (version: string) => `发现新版本 ${version}`,
+      releaseDate: (date: string) => `发布日期 ${date}`,
+      releaseNotes: '版本说明',
+      install: '下载并安装',
+      installing: '正在安装…',
+      progressPreparing: '正在准备下载',
+      progressDownloaded: '下载进度 100%，正在安装',
+      progressPercent: (percent: number) => `下载进度 ${percent}%`,
+      disabledAdvice: '自动安装已关闭；保存设置后可前往发布页手动下载安装包',
+      unsupportedAdvice: '当前平台仅提示新版本，请前往发布页下载安装包',
+      unsavedAdvice: '请先保存设置，再开始安装更新',
+      openRelease: '打开发布页',
+      openReleaseFailed: '系统未能打开发布页，请手动访问 GitHub Releases',
+    },
+
     /** 手工价格覆盖表：经 IPC 走 prices.json 的原子写，前端不直接写文件。 */
     prices: {
       title: '价格覆盖',

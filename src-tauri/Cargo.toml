@@ -28,6 +28,7 @@ tauri = { version = "2", features = ["tray-icon"] }
 # opener：唯一「在系统文件管理器里定位归档库」的通道。只用 reveal_item_in_dir —— 它不受
 # scope 约束（scope 只作用于 open_url / open_path），因此 capability 里不需要路径白名单。
 tauri-plugin-opener = "2"
+tauri-plugin-updater = "=2.10.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

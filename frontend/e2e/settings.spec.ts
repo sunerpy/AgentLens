@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test'
 
 import { zh } from '../src/i18n/zh'
-import { mockCalls, openShell, qaScreenshot } from './harness'
+import { mockCalls, openShell, qaLocatorScreenshot, qaScreenshot } from './harness'
 
 /**
  * Settings view spec (todo 19).
@@ -143,6 +143,7 @@ test('saving writes the owned keys through set_settings and clears the dirty fla
         'refresh.autoRefreshEnabled': 'true',
         'refresh.localIntervalMs': '600000',
         'refresh.remoteIntervalMs': '1200000',
+        'update.autoInstallEnabled': 'true',
       },
     },
   })
@@ -192,6 +193,60 @@ test('the auto-refresh toggle defaults on, persists, and disables the interval f
   await expect(page.getByTestId('view-overview')).toBeVisible()
   await page.getByTestId('nav-settings').click()
   await expect(page.getByTestId('settings-auto-refresh')).not.toBeChecked()
+})
+
+test('automatic updates default on and a newer signed release can be installed on Windows', async ({
+  page,
+}) => {
+  await openSettings(page, {
+    responses: {
+      updater_check: {
+        currentVersion: '0.0.4',
+        version: '0.0.5',
+        date: '2026-08-12T03:00:00Z',
+        body: 'signed updater release',
+        autoInstallSupported: true,
+      },
+    },
+  })
+
+  const toggle = page.getByTestId('settings-auto-update')
+  await expect(toggle).toBeChecked()
+  await page.getByTestId('settings-update-check').click()
+  await expect(page.getByTestId('settings-update-version')).toContainText('0.0.5')
+  await expect(page.getByTestId('settings-update-install')).toBeVisible()
+
+  await page.getByTestId('settings-update-install').click()
+  await expect(page.getByTestId('settings-update-progress')).toContainText('100%')
+  await qaLocatorScreenshot(page.getByTestId('settings-update'), 'settings-updater-installed.png')
+  expect(await mockCalls(page, 'updater_install')).toHaveLength(1)
+})
+
+test('turning automatic updates off still checks the version but only shows advice', async ({
+  page,
+}) => {
+  await openSettings(page, {
+    responses: {
+      updater_check: {
+        currentVersion: '0.0.4',
+        version: '0.0.5',
+        date: '2026-08-12T03:00:00Z',
+        body: 'signed updater release',
+        autoInstallSupported: true,
+      },
+    },
+  })
+
+  await page.getByTestId('settings-auto-update').uncheck()
+  await page.getByTestId('settings-save').click()
+  await page.getByTestId('settings-update-check').click()
+
+  await expect(page.getByTestId('settings-update-version')).toContainText('0.0.5')
+  await expect(page.getByTestId('settings-update-advice')).toBeVisible()
+  await expect(page.getByTestId('settings-update-install')).toHaveCount(0)
+  await qaLocatorScreenshot(page.getByTestId('settings-update'), 'settings-updater-advice.png')
+  expect(await mockCalls(page, 'updater_check')).toHaveLength(1)
+  expect(await mockCalls(page, 'updater_install')).toHaveLength(0)
 })
 
 /** 关闭状态下也不能让一个非法间隔溜过去：开关与下限校验是两件独立的事。 */

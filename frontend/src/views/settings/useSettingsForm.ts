@@ -26,9 +26,11 @@ import {
   DEFAULT_REMOTE_INTERVAL_SECONDS,
   SETTING_KEY_ARCHIVE_PATH,
   SETTING_KEY_AUTO_REFRESH_ENABLED,
+  SETTING_KEY_AUTO_UPDATE_ENABLED,
   SETTING_KEY_LOCAL_INTERVAL_MS,
   SETTING_KEY_REMOTE_INTERVAL_MS,
   autoRefreshEnabledFromSettings,
+  autoUpdateEnabledFromSettings,
   intervalSecondsFromSettings,
   parseIntervalSeconds,
   type IntervalIssue,
@@ -38,6 +40,7 @@ export interface SettingsFormValues {
   timezone: string
   weekStart: WeekStart
   autoRefreshEnabled: boolean
+  autoUpdateEnabled: boolean
   localIntervalSeconds: string
   remoteIntervalSeconds: string
 }
@@ -55,6 +58,7 @@ function persistedValues(settings: AppSettings): SettingsFormValues {
     timezone: values[SETTING_KEY_TIMEZONE] || systemTimezone(),
     weekStart: values[SETTING_KEY_WEEK_START] === 'sunday' ? 'sunday' : 'monday',
     autoRefreshEnabled: autoRefreshEnabledFromSettings(values),
+    autoUpdateEnabled: autoUpdateEnabledFromSettings(values),
     localIntervalSeconds: String(
       intervalSecondsFromSettings(
         values,
@@ -118,6 +122,7 @@ export function useSettingsForm() {
           [SETTING_KEY_TIMEZONE]: payload.timezone,
           [SETTING_KEY_WEEK_START]: payload.weekStart,
           [SETTING_KEY_AUTO_REFRESH_ENABLED]: String(payload.autoRefreshEnabled),
+          [SETTING_KEY_AUTO_UPDATE_ENABLED]: String(payload.autoUpdateEnabled),
           [SETTING_KEY_LOCAL_INTERVAL_MS]: String(localSeconds * 1000),
           [SETTING_KEY_REMOTE_INTERVAL_MS]: String(remoteSeconds * 1000),
         },

@@ -88,9 +88,21 @@ ZIG_BIN ?=
 # 必须有 musl ABI 的 aarch64 cc。优先用系统 aarch64-linux-musl-gcc，否则退到
 # `zig cc -target aarch64-linux-musl`（zig 自带 musl sysroot）。
 AARCH64_MUSL_CC ?= $(shell command -v aarch64-linux-musl-gcc 2>/dev/null)
-ZIG := $(shell command -v zig 2>/dev/null)
+# `command -v zig` 可能命中一个未选择版本的 mise shim；只有能执行 `zig version` 的
+# 候选才算可用，并在 PATH 候选失效时回退到 mise 已安装的真实二进制。
+ZIG := $(strip $(shell \
+	for candidate in '$(ZIG_BIN)' "$$(command -v zig 2>/dev/null)" \
+	  $${MISE_DATA_DIR:-$$HOME/.local/share/mise}/installs/zig/*/zig; do \
+	  if [ -n "$$candidate" ] && [ -x "$$candidate" ] \
+	    && "$$candidate" version >/dev/null 2>&1; then \
+	    printf '%s' "$$candidate"; break; \
+	  fi; \
+	done))
 # 缺 aarch64 工具链时 `dist` 只告警并产出单架构包；`dist-all` 则硬失败。
 DIST_REQUIRE_AARCH64 ?= 0
+# 没有发布私钥时必须显式 --no-sign，否则启用 createUpdaterArtifacts 后本地 dist 会
+# 因缺私钥失败；可信 main / release 只注入 TAURI_SIGNING_PRIVATE_KEY，表达式自动留空。
+TAURI_BUILD_ARGS ?= $(if $(strip $(TAURI_SIGNING_PRIVATE_KEY)),,--no-sign)
 
 # ---------------------------------------------------------------------------
 # 格式化分工：rustfmt 管 Rust，prettier 管 frontend/src 下的 TS/TSX，oxfmt 管
@@ -222,7 +234,7 @@ AWS_LOG_SINCE ?= 4h
 
 .DEFAULT_GOAL := help
 .PHONY: help fmt fmt-check lint check-release-lock test test-unit test-e2e test-e2e-real build dev clean \
-	coverage coverage-gate hooks \
+	coverage coverage-gate hooks updater-manifest-verify \
 	dist dist-all dist-reset dist-version dist-clean dist-collector-x86_64 dist-collector-aarch64 \
 	dist-askpass dist-stage dist-bundle dist-collect dist-verify \
 	dist-windows dist-windows-verify dist-windows-toolchain \
@@ -271,6 +283,9 @@ lint: fmt-check check-release-lock ## Rust clippy 零告警 + 前端格式 / lin
 # ---------------------------------------------------------------------------
 check-release-lock: ## 校验 release-please 的 Cargo.lock crate 名单与 workspace 成员一致
 	node scripts/check-release-lock.mjs
+
+updater-manifest-verify: ## 校验 updater latest.json 严格四平台与缺签名失败语义
+	scripts/qa/updater-manifest.sh
 
 test: ## 运行 Rust 测试
 	cargo test --workspace
@@ -402,9 +417,9 @@ dist-collector-aarch64: dist-version ## 构建 aarch64 静态 musl collector（�
 	    echo '  case "$$arg" in --target=*) ;; *) set -- "$$@" "$$arg" ;; esac'; \
 	    echo '  i=$$((i + 1))'; \
 	    echo 'done'; \
-	    echo 'exec zig cc -target aarch64-linux-musl "$$@"'; \
+	    echo 'exec "$(ZIG)" cc -target aarch64-linux-musl "$$@"'; \
 	  } > $(TOOLCHAIN_DIR)/aarch64-musl-cc; \
-	  printf '%s\n%s\n' '#!/bin/sh' 'exec zig ar "$$@"' > $(TOOLCHAIN_DIR)/aarch64-musl-ar; \
+	  printf '%s\n%s\n' '#!/bin/sh' 'exec "$(ZIG)" ar "$$@"' > $(TOOLCHAIN_DIR)/aarch64-musl-ar; \
 	  chmod +x $(TOOLCHAIN_DIR)/aarch64-musl-cc $(TOOLCHAIN_DIR)/aarch64-musl-ar; \
 	  cc="$$PWD/$(TOOLCHAIN_DIR)/aarch64-musl-cc"; \
 	  ar="$$PWD/$(TOOLCHAIN_DIR)/aarch64-musl-ar"; \
@@ -466,7 +481,7 @@ json.dump(c, open(sys.argv[2], "w"), indent=2, ensure_ascii=False)' \
 
 dist-bundle: dist-stage ## 构建前端 + 桌面 deb（内含 askpass 与 collector sidecar）
 	rm -rf $(DEB_DIR)
-	cargo tauri build --bundles deb --config target/dist/bundle-config.json
+	cargo tauri build --bundles deb --config target/dist/bundle-config.json $(TAURI_BUILD_ARGS)
 
 dist-collect: dist-bundle ## 归集全部发布产物并生成 sha256sums.txt
 	@rm -rf $(DIST_DIR)
@@ -660,7 +675,7 @@ dist-bundle-windows: dist-stage-windows ## 构建前端 + Windows NSIS 安装包
 	PATH='$(CURDIR)/$(TOOLCHAIN_DIR)':"$$PATH" \
 	  cargo tauri build --bundles nsis \
 	    --config $(BUNDLE_CONFIG_WIN) \
-	    --runner cargo-xwin --target $(WIN_TARGET)
+	    --runner cargo-xwin --target $(WIN_TARGET) $(TAURI_BUILD_ARGS)
 
 dist-collect-windows: dist-bundle-windows ## 归集 Windows 产物并生成 sha256sums.txt
 	@rm -rf $(DIST_DIR)

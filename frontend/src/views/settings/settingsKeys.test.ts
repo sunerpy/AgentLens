@@ -6,9 +6,11 @@ import {
   MIN_INTERVAL_SECONDS,
   SETTING_KEY_ARCHIVE_PATH,
   SETTING_KEY_AUTO_REFRESH_ENABLED,
+  SETTING_KEY_AUTO_UPDATE_ENABLED,
   SETTING_KEY_LOCAL_INTERVAL_MS,
   SETTING_KEY_REMOTE_INTERVAL_MS,
   autoRefreshEnabledFromSettings,
+  autoUpdateEnabledFromSettings,
   intervalSecondsFromSettings,
   parseIntervalSeconds,
 } from './settingsKeys'
@@ -27,6 +29,7 @@ describe('settingsKeys/键名逐字对齐 Rust', () => {
     expect(SETTING_KEY_LOCAL_INTERVAL_MS).toBe('refresh.localIntervalMs')
     expect(SETTING_KEY_REMOTE_INTERVAL_MS).toBe('refresh.remoteIntervalMs')
     expect(SETTING_KEY_AUTO_REFRESH_ENABLED).toBe('refresh.autoRefreshEnabled')
+    expect(SETTING_KEY_AUTO_UPDATE_ENABLED).toBe('update.autoInstallEnabled')
     expect(SETTING_KEY_ARCHIVE_PATH).toBe('archive.path')
   })
 
@@ -96,6 +99,21 @@ describe('settingsKeys/autoRefreshEnabledFromSettings', () => {
     expect(autoRefreshEnabledFromSettings({ [SETTING_KEY_AUTO_REFRESH_ENABLED]: 'False' })).toBe(
       true,
     )
+  })
+})
+
+describe('settingsKeys/autoUpdateEnabledFromSettings', () => {
+  it('键缺失视为开启，与 Rust 的自动安装缺省策略一致', () => {
+    expect(autoUpdateEnabledFromSettings({})).toBe(true)
+  })
+
+  it('只有 false / 0 / off / no 关闭，其余值保持开启', () => {
+    for (const raw of ['false', '0', 'off', 'no', '  no  ']) {
+      expect(autoUpdateEnabledFromSettings({ [SETTING_KEY_AUTO_UPDATE_ENABLED]: raw })).toBe(false)
+    }
+    for (const raw of ['true', '1', 'on', 'yes', '', 'anything', 'False']) {
+      expect(autoUpdateEnabledFromSettings({ [SETTING_KEY_AUTO_UPDATE_ENABLED]: raw })).toBe(true)
+    }
   })
 })
 

@@ -447,7 +447,12 @@ jobs:
       - name: 打包 deb + 双架构 musl collector（aarch64 缺席即失败）
         env:
           DIST_REQUIRE_AARCH64: "1"
-        run: make dist-all
+          # 只传密钥内容本身；不要同时设置 *_PATH，也不要给 cargo tauri 传 -f。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" \
+            || { echo '缺少 TAURI_SIGNING_PRIVATE_KEY，拒绝生成未签名发布包'; exit 1; }
+          make dist-all
 
       - name: 校验 deb 载荷含 askpass 与双架构 collector
         run: |
@@ -474,6 +479,12 @@ jobs:
           cp artifacts/dist/agentlens-collector-x86_64-unknown-linux-musl upload/
           cp artifacts/dist/agentlens-collector-aarch64-unknown-linux-musl upload/
           cp artifacts/dist/sha256sums.txt upload/sha256sums-linux.txt
+          shopt -s nullglob
+          signatures=(target/release/bundle/deb/*.deb.sig)
+          test "${#signatures[@]}" -eq 1 \
+            || { echo "Linux updater 签名数量应为 1，实际 ${#signatures[@]}"; exit 1; }
+          test -s "${signatures[0]}" || { echo 'Linux updater 签名为空'; exit 1; }
+          cp "${signatures[0]}" upload/
           test -n "$(ls -A upload)" || { echo "upload/ 为空，拒绝上传"; exit 1; }
           ls -l upload/
 
@@ -659,6 +670,8 @@ jobs:
       #   dist-windows（Linux + cargo-xwin 交叉编译）刻意只出 NSIS。★
       - name: 构建 NSIS + MSI 安装包并归置发布资产
         shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
           function Assert-Ok([string]$what) {
             if ($LASTEXITCODE -ne 0) {
@@ -667,6 +680,9 @@ jobs:
             Write-Host "gate ok: $what"
           }
 
+          if ([string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is required for release builds"
+          }
           cargo tauri build --bundles nsis,msi --config src-tauri/tauri.bundle.windows.json
           Assert-Ok "cargo tauri build --bundles nsis,msi"
 
@@ -681,6 +697,22 @@ jobs:
             -Destination "upload" `
             -ManifestName "sha256sums-windows.txt"
           Assert-Ok "scripts/ci/windows-collect-assets.ps1"
+
+          $formats = @(
+            [pscustomobject]@{ Dir = "nsis"; Pattern = "*-setup.exe" },
+            [pscustomobject]@{ Dir = "msi"; Pattern = "*.msi" }
+          )
+          foreach ($format in $formats) {
+            $assets = @(Get-ChildItem -File "target\release\bundle\$($format.Dir)\$($format.Pattern)")
+            if ($assets.Count -ne 1) {
+              throw "expected one signed asset in $($format.Dir), found $($assets.Count)"
+            }
+            $signature = "$($assets[0].FullName).sig"
+            if (-not (Test-Path -LiteralPath $signature) -or (Get-Item $signature).Length -eq 0) {
+              throw "missing or empty updater signature: $signature"
+            }
+            Copy-Item -LiteralPath $signature -Destination "upload\" -Force
+          }
 
       - name: 上传资产到 draft Release
         env:
@@ -791,15 +823,25 @@ jobs:
           chmod 0755 target/dist/binaries/*
 
       # env.CI 显式钉死 "true" —— 约束 (5)，与 macos.yml 一致。
+      # .app / .dmg 没有 Apple codesign / notarization；updater 的 minisign 签名独立生成。
       # ls -R 是从日志确认 sidecar 真的进了 .app 的唯一手段。
-      - name: 构建 .app / .dmg 并归置发布资产
+      - name: 构建 .app / .dmg / updater archive 并归置发布资产
         env:
           CI: "true"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
+          test -n "$TAURI_SIGNING_PRIVATE_KEY" \
+            || { echo '缺少 TAURI_SIGNING_PRIVATE_KEY，拒绝生成未签名发布包'; exit 1; }
           cargo tauri build --bundles app,dmg --target "$MACOS_TARGET" --config "$MACOS_BUNDLE_CONFIG"
           ls -R "target/$MACOS_TARGET/release/bundle/"
           mkdir -p upload
           cp "target/$MACOS_TARGET"/release/bundle/dmg/*.dmg upload/
+          shopt -s nullglob
+          updater_archives=("target/$MACOS_TARGET"/release/bundle/macos/*.app.tar.gz)
+          test "${#updater_archives[@]}" -eq 1 \
+            || { echo "macOS updater archive 数量应为 1，实际 ${#updater_archives[@]}"; exit 1; }
+          test -s "${updater_archives[0]}.sig" || { echo 'macOS updater 签名缺失或为空'; exit 1; }
+          cp "${updater_archives[0]}" "${updater_archives[0]}.sig" upload/
           ( cd upload && shasum -a 256 -- *.dmg > sha256sums-macos.txt && cat sha256sums-macos.txt )
           test -n "$(ls -A upload)" || { echo "upload/ 为空，拒绝上传"; exit 1; }
           ls -l upload/
@@ -863,25 +905,85 @@ jobs:
           fi
           cat /tmp/release-notes.md
 
-      # 发布前复核 draft 上的资产：三个 job 各自都断言过 upload/ 非空，这里再从
-      # Release 侧确认一次，防止上传步骤成功但资产实际没落到这个 Release 上。
-      # 顺带断言它此刻仍是 draft：若已是公开状态，说明有人绕过流水线手工发过，
-      # 与其在残缺状态上继续，不如停下。
-      - name: 复核 draft 资产齐全（deb / setup.exe / dmg）
+      - name: 安装 minisign（验签 draft 中的 updater 资产）
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends minisign
+          command -v minisign
+
+      # 从 draft Release 回读资产，而不是验构建目录：只有这样才能证明真正准备公开的
+      # 字节与其 .sig 配对。四个平台全部验签后才生成 latest.json；随后先上传清单，
+      # 再执行 --draft=false，任何缺件、空签名或签名不匹配都会让 Release 保持 draft。
+      - name: 验签四平台 updater 资产并生成 latest.json
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ needs.prepare.outputs.tag_name }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           gh release view "$TAG_NAME" --json isDraft,assets > /tmp/release.json
           jq -r '.isDraft' /tmp/release.json | grep -qx 'true' \
             || { echo "${TAG_NAME} 不是 draft，拒绝在未知状态上继续"; exit 1; }
           jq -r '.assets[].name' /tmp/release.json | tee /tmp/assets.txt
-          for pattern in '\.deb$' '\.exe$' '\.dmg$' \
+          for pattern in '\.deb$' '\.exe$' '\.msi$' '\.dmg$' '\.app\.tar\.gz$' \
             '^sha256sums-linux\.txt$' '^sha256sums-windows\.txt$' '^sha256sums-macos\.txt$'
           do
             grep -qE "$pattern" /tmp/assets.txt \
               || { echo "draft 缺少匹配 ${pattern} 的资产"; exit 1; }
           done
+
+          rm -rf /tmp/release-assets
+          mkdir -p /tmp/release-assets
+          gh release download "$TAG_NAME" --dir /tmp/release-assets
+
+          pub_date="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          node scripts/ci/generate-latest-json.mjs \
+            --assets /tmp/release-assets \
+            --version "$VERSION" \
+            --tag "$TAG_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --notes /tmp/release-notes.md \
+            --pub-date "$pub_date" \
+            --output /tmp/release-assets/latest.json
+
+          jq -er '.plugins.updater.pubkey' src-tauri/tauri.conf.json \
+            | base64 --decode > /tmp/updater.pub
+          test -s /tmp/updater.pub || { echo 'updater 公钥解码后为空'; exit 1; }
+
+          shopt -s nullglob
+          updater_assets=(
+            /tmp/release-assets/*-setup.exe
+            /tmp/release-assets/*.msi
+            /tmp/release-assets/*.deb
+            /tmp/release-assets/*.app.tar.gz
+          )
+          test "${#updater_assets[@]}" -eq 4 \
+            || { echo "updater 资产数量应为 4，实际 ${#updater_assets[@]}"; exit 1; }
+          for asset in "${updater_assets[@]}"; do
+            signature="${asset}.sig"
+            test -s "$signature" || { echo "缺少或为空：${signature}"; exit 1; }
+            decoded="${signature}.minisig"
+            base64 --decode "$signature" > "$decoded"
+            minisign -Vm "$asset" -p /tmp/updater.pub -x "$decoded"
+            rm -f "$decoded"
+          done
+
+          jq -e --arg version "$VERSION" '
+            .version == $version and
+            (.platforms | keys) == [
+              "darwin-aarch64",
+              "linux-x86_64-deb",
+              "windows-x86_64-msi",
+              "windows-x86_64-nsis"
+            ] and
+            all(.platforms[]; .signature != "")
+          ' /tmp/release-assets/latest.json >/dev/null
+          gh release upload "$TAG_NAME" /tmp/release-assets/latest.json --clobber
+
+          gh release view "$TAG_NAME" --json isDraft,assets > /tmp/release-ready.json
+          jq -r '.isDraft' /tmp/release-ready.json | grep -qx 'true' \
+            || { echo '上传 latest.json 前 Release 已被公开'; exit 1; }
+          jq -r '.assets[].name' /tmp/release-ready.json | grep -qx 'latest.json' \
+            || { echo 'latest.json 未出现在 draft Release'; exit 1; }
 
       - name: 翻转 draft 为正式 Release
         env:
