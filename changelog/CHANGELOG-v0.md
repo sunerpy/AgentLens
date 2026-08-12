@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.4](https://github.com/sunerpy/AgentLens/compare/v0.0.3...v0.0.4) (2026-08-12)
+
+
+### Features
+
+* **windows:** 增加 MSI 安装包并让校验和覆盖双格式 ([#23](https://github.com/sunerpy/AgentLens/issues/23)) ([39f95cf](https://github.com/sunerpy/AgentLens/commit/39f95cfec84cf9f0398a547f82a4320a1d2559db))
+
 ## [0.0.3](https://github.com/sunerpy/AgentLens/compare/v0.0.2...v0.0.3) (2026-08-11)
 
 
