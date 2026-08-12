@@ -12,7 +12,8 @@ use crate::contract::{
     IpcError, IpcErrorCode, MessageFilters, MessagePage, MessageRow, ObservedModelPrice,
     PriceCatalog, PriceEntry, PriceMatchKind, PriceTable, RefreshEvent, SeriesGroup,
     SeriesGroupDimension, SeriesPoint, SeriesQueryResult, SourceState, SourceStatus, Summary,
-    TimeBucket, TokenValues, TriggerMode, TriggerRefreshResult, WeekStart,
+    TimeBucket, TokenValues, TriggerMode, TriggerRefreshResult, UpdateMetadata, UpdateProgress,
+    WeekStart,
 };
 #[cfg(all(test, feature = "ts-export"))]
 use crate::credentials::{
@@ -59,6 +60,8 @@ pub(crate) fn export_all(output_dir: &Path) -> Result<(), ts_rs::ExportError> {
     export::<RefreshEvent>(output_dir)?;
     export::<TriggerRefreshResult>(output_dir)?;
     export::<AppSettings>(output_dir)?;
+    export::<UpdateMetadata>(output_dir)?;
+    export::<UpdateProgress>(output_dir)?;
     export::<PriceEntry>(output_dir)?;
     export::<PriceTable>(output_dir)?;
     export::<PriceMatchKind>(output_dir)?;
@@ -90,7 +93,7 @@ mod tests {
 
     use super::*;
 
-    const TYPE_NAMES: [&str; 51] = [
+    const TYPE_NAMES: [&str; 53] = [
         "IpcErrorCode",
         "IpcError",
         "WeekStart",
@@ -127,6 +130,8 @@ mod tests {
         "RefreshEvent",
         "TriggerRefreshResult",
         "AppSettings",
+        "UpdateMetadata",
+        "UpdateProgress",
         "PriceEntry",
         "PriceTable",
         "PriceMatchKind",

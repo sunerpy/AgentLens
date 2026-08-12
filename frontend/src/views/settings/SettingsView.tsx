@@ -15,6 +15,7 @@ import { AppearanceCard } from './AppearanceCard'
 import { ArchiveLocationCard } from './ArchiveLocationCard'
 import { PriceOverrideEditor } from './PriceOverrideEditor'
 import { ReportSettingsCard } from './ReportSettingsCard'
+import { UpdateSettingsCard } from './UpdateSettingsCard'
 import { usePriceOverrides } from './usePriceOverrides'
 import { useSettingsForm } from './useSettingsForm'
 
@@ -36,7 +37,10 @@ export function SettingsView() {
       ) : form.isPending ? (
         <LoadingState />
       ) : (
-        <ReportSettingsCard form={form} />
+        <>
+          <ReportSettingsCard form={form} />
+          <UpdateSettingsCard form={form} />
+        </>
       )}
 
       <PriceOverrideEditor overrides={overrides} />

@@ -78,6 +78,8 @@ import type {
   Summary,
   TokenValues,
   TriggerRefreshResult,
+  UpdateMetadata,
+  UpdateProgress,
 } from '@/generated'
 import { IPC_COMMANDS, type IpcCommand } from '@/lib/ipc'
 
@@ -902,7 +904,7 @@ function notFound(kind: string, id: string): IpcError {
 /** Mutable box so `set_settings` / `prices_set` can behave like real writes. */
 interface MockState {
   dataset: MockIpcDataset
-  sendChannel(channel: unknown, message: RefreshEvent): void
+  sendChannel(channel: unknown, message: RefreshEvent | UpdateProgress): void
 }
 
 /**
@@ -1003,6 +1005,27 @@ const HANDLERS: Record<IpcCommand, (state: MockState, args: Record<string, unkno
     state.dataset.settings = { values: { ...state.dataset.settings.values, ...incoming } }
     return state.dataset.settings
   },
+  updater_check: () =>
+    ({
+      currentVersion: '0.0.4',
+      version: null,
+      date: null,
+      body: null,
+      autoInstallSupported: true,
+    }) satisfies UpdateMetadata,
+  updater_install: (state, args) => {
+    state.sendChannel(args.onEvent, { event: 'started' })
+    state.sendChannel(args.onEvent, {
+      event: 'downloading',
+      data: { downloaded: 50, total: 100 },
+    })
+    state.sendChannel(args.onEvent, {
+      event: 'downloading',
+      data: { downloaded: 100, total: 100 },
+    })
+    state.sendChannel(args.onEvent, { event: 'downloaded' })
+    return null
+  },
   price_catalog_get: (state) => state.dataset.priceCatalog,
   prices_get: (state) => state.dataset.prices,
   prices_set: (state, args) => {
@@ -1064,7 +1087,7 @@ export function installMockIpc(config: MockIpcConfig = {}): MockIpcController {
     return match === null ? null : Number(match[1])
   }
 
-  const sendChannel = (channel: unknown, message: RefreshEvent) => {
+  const sendChannel = (channel: unknown, message: RefreshEvent | UpdateProgress) => {
     const callbackId = channelId(channel)
     if (callbackId === null) return
     const index = channelIndexes.get(callbackId) ?? 0
@@ -1135,7 +1158,7 @@ export function installMockIpc(config: MockIpcConfig = {}): MockIpcController {
       }
       return HANDLERS[command](state, args)
     } finally {
-      if (command === 'trigger_refresh') endChannel(args.onEvent)
+      if (command === 'trigger_refresh' || command === 'updater_install') endChannel(args.onEvent)
     }
   }
 

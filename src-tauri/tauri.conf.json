@@ -27,6 +27,7 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "nsis"],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -34,5 +35,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/sunerpy/AgentLens/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ4ODVFN0UzREIxMzY5OTcKUldTWGFSUGI0K2VGMk9JZjlZYnhGM1dTR1ROeVV5NVZGNHF1ZEk5TnpCVmwvRHZBbytUWXo0ODEK"
+    }
   }
 }

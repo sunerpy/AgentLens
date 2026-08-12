@@ -412,9 +412,9 @@ describe('ipc/主机视图侧的五个命令（hostsIpc）', () => {
 })
 
 describe('ipc/命令清单与 Rust 注册表一致', () => {
-  it('IPC_COMMANDS 恰好是 19 个且无重复', () => {
-    expect(ipc.IPC_COMMANDS).toHaveLength(19)
-    expect(new Set(ipc.IPC_COMMANDS).size).toBe(19)
+  it('IPC_COMMANDS 恰好是 21 个且无重复', () => {
+    expect(ipc.IPC_COMMANDS).toHaveLength(21)
+    expect(new Set(ipc.IPC_COMMANDS).size).toBe(21)
   })
 
   /**
@@ -424,7 +424,7 @@ describe('ipc/命令清单与 Rust 注册表一致', () => {
   it('两侧 wrapper 覆盖的命令集合 === src-tauri/src/lib.rs 的 generate_handler 注册表', () => {
     const libPath = path.resolve(import.meta.dirname, '../../../src-tauri/src/lib.rs')
     const source = readFileSync(libPath, 'utf8')
-    const registered = [...source.matchAll(/^\s*commands::([a-z0-9_]+),$/gm)].map(
+    const registered = [...source.matchAll(/^\s*(?:commands|updater)::([a-z0-9_]+),$/gm)].map(
       (match) => match[1],
     )
     expect(

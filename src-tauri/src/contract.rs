@@ -845,6 +845,36 @@ pub struct AppSettings {
     pub values: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMetadata {
+    pub current_version: String,
+    pub version: Option<String>,
+    pub date: Option<String>,
+    pub body: Option<String>,
+    pub auto_install_supported: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "event",
+    content = "data"
+)]
+pub enum UpdateProgress {
+    Started,
+    Downloading {
+        #[cfg_attr(feature = "ts-export", ts(type = "number"))]
+        downloaded: u64,
+        #[cfg_attr(feature = "ts-export", ts(type = "number | null"))]
+        total: Option<u64>,
+    },
+    Downloaded,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[cfg_attr(feature = "ts-export", derive(ts_rs::TS))]
 #[serde(rename_all = "camelCase")]

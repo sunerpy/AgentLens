@@ -16,6 +16,11 @@ export const SETTING_KEY_ARCHIVE_PATH = 'archive.path'
  * `resolve_auto_refresh_enabled`, so an installation predating the toggle keeps refreshing.
  */
 export const SETTING_KEY_AUTO_REFRESH_ENABLED = 'refresh.autoRefreshEnabled'
+/**
+ * Whether a checked update may be installed automatically. Absent means enabled, matching Rust's
+ * `resolve_auto_update_enabled`, so installations predating the setting retain the default policy.
+ */
+export const SETTING_KEY_AUTO_UPDATE_ENABLED = 'update.autoInstallEnabled'
 
 /**
  * Hard floor for both refresh intervals, mirroring `MIN_AUTO_REFRESH_INTERVAL_MS`.
@@ -59,6 +64,15 @@ export function autoRefreshEnabledFromSettings(
   values: Readonly<Record<string, string | undefined>>,
 ): boolean {
   const raw = values[SETTING_KEY_AUTO_REFRESH_ENABLED]
+  if (raw === undefined) return true
+  return !['false', '0', 'off', 'no'].includes(raw.trim())
+}
+
+/** Reads the automatic-update toggle exactly as `resolve_auto_update_enabled` does in Rust. */
+export function autoUpdateEnabledFromSettings(
+  values: Readonly<Record<string, string | undefined>>,
+): boolean {
+  const raw = values[SETTING_KEY_AUTO_UPDATE_ENABLED]
   if (raw === undefined) return true
   return !['false', '0', 'off', 'no'].includes(raw.trim())
 }

@@ -1017,7 +1017,7 @@ fn database_error(error: impl std::fmt::Display) -> IpcError {
 }
 
 #[cfg(test)]
-pub const REGISTERED_COMMANDS: [&str; 25] = [
+pub const REGISTERED_COMMANDS: [&str; 27] = [
     "get_summary",
     "get_trend",
     "get_breakdown",
@@ -1043,6 +1043,8 @@ pub const REGISTERED_COMMANDS: [&str; 25] = [
     "credential_delete",
     "logs_tail",
     "diagnostics_report",
+    "updater_check",
+    "updater_install",
 ];
 
 #[cfg(test)]
@@ -1103,7 +1105,7 @@ mod tests {
 
     #[test]
     fn registered_command_surface_is_complete_and_stable() {
-        assert_eq!(REGISTERED_COMMANDS.len(), 25);
+        assert_eq!(REGISTERED_COMMANDS.len(), 27);
         assert!(REGISTERED_COMMANDS.contains(&"query_messages"));
         assert!(REGISTERED_COMMANDS.contains(&"hosts_supported_sources"));
         assert!(REGISTERED_COMMANDS.contains(&"trigger_refresh"));
@@ -1112,6 +1114,8 @@ mod tests {
         assert!(REGISTERED_COMMANDS.contains(&"ssh_probe_cancel"));
         assert!(REGISTERED_COMMANDS.contains(&"logs_tail"));
         assert!(REGISTERED_COMMANDS.contains(&"diagnostics_report"));
+        assert!(REGISTERED_COMMANDS.contains(&"updater_check"));
+        assert!(REGISTERED_COMMANDS.contains(&"updater_install"));
     }
 
     #[test]
@@ -1920,13 +1924,24 @@ mod tests {
         assert_command_is_async!(credential_delete, (String, CredentialKind));
         assert_command_is_async!(logs_tail, (AppHandle, Option<u32>));
         assert_command_is_async!(diagnostics_report, ());
+        assert_command_is_async!(
+            crate::updater::updater_check::<tauri::test::MockRuntime>,
+            (AppHandle<tauri::test::MockRuntime>)
+        );
+        assert_command_is_async!(
+            crate::updater::updater_install::<tauri::test::MockRuntime>,
+            (
+                AppHandle<tauri::test::MockRuntime>,
+                Channel<crate::contract::UpdateProgress>,
+            )
+        );
 
         // `ssh_probe_cancel` is the deliberate exception: pure in-memory, and it must not queue
         // behind the blocking-pool task it exists to cancel. This binding pins that choice, so
         // making it `async` breaks the build just as loudly as un-asyncing the rest.
         let _: fn(String) -> IpcResult<()> = ssh_probe_cancel;
 
-        assert_eq!(REGISTERED_COMMANDS.len(), 25);
+        assert_eq!(REGISTERED_COMMANDS.len(), 27);
     }
 
     #[test]
