@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.6](https://github.com/sunerpy/AgentLens/compare/v0.0.5...v0.0.6) (2026-08-13)
+
+
+### Bug Fixes
+
+* **updater:** 修复更新请求代理支持 ([#27](https://github.com/sunerpy/AgentLens/issues/27)) ([2e4110a](https://github.com/sunerpy/AgentLens/commit/2e4110a726aa0411f783a91f8c5fd3f22b96c13a))
+
 ## [0.0.5](https://github.com/sunerpy/AgentLens/compare/v0.0.4...v0.0.5) (2026-08-12)
 
 
