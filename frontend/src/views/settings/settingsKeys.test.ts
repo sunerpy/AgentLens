@@ -9,10 +9,12 @@ import {
   SETTING_KEY_AUTO_UPDATE_ENABLED,
   SETTING_KEY_LOCAL_INTERVAL_MS,
   SETTING_KEY_REMOTE_INTERVAL_MS,
+  SETTING_KEY_UPDATE_PROXY_URL,
   autoRefreshEnabledFromSettings,
   autoUpdateEnabledFromSettings,
   intervalSecondsFromSettings,
   parseIntervalSeconds,
+  updateProxyIssue,
 } from './settingsKeys'
 
 /**
@@ -30,6 +32,7 @@ describe('settingsKeys/键名逐字对齐 Rust', () => {
     expect(SETTING_KEY_REMOTE_INTERVAL_MS).toBe('refresh.remoteIntervalMs')
     expect(SETTING_KEY_AUTO_REFRESH_ENABLED).toBe('refresh.autoRefreshEnabled')
     expect(SETTING_KEY_AUTO_UPDATE_ENABLED).toBe('update.autoInstallEnabled')
+    expect(SETTING_KEY_UPDATE_PROXY_URL).toBe('update.proxyUrl')
     expect(SETTING_KEY_ARCHIVE_PATH).toBe('archive.path')
   })
 
@@ -38,6 +41,34 @@ describe('settingsKeys/键名逐字对齐 Rust', () => {
     expect(MIN_INTERVAL_SECONDS * 1000).toBe(600_000)
     expect(DEFAULT_LOCAL_INTERVAL_SECONDS).toBeGreaterThanOrEqual(MIN_INTERVAL_SECONDS)
     expect(DEFAULT_REMOTE_INTERVAL_SECONDS).toBeGreaterThanOrEqual(MIN_INTERVAL_SECONDS)
+  })
+})
+
+describe('settingsKeys/updateProxyIssue', () => {
+  it('留空表示沿用系统代理，三种支持协议与 URL 内认证均可保存', () => {
+    for (const raw of [
+      '',
+      '   ',
+      'http://127.0.0.1:7890',
+      'https://proxy.example:8443',
+      'socks5://127.0.0.1:1080',
+      'http://user:pass@proxy.example:8080',
+    ]) {
+      expect(updateProxyIssue(raw)).toBeNull()
+    }
+  })
+
+  it('缺协议、缺主机与无效文本在保存前归为 malformed', () => {
+    for (const raw of ['proxy.example:8080', 'http://', 'not a proxy']) {
+      expect(updateProxyIssue(raw)).toBe('malformed')
+    }
+  })
+
+  it('拒绝未支持协议和代理端点之外的 URL 组成', () => {
+    expect(updateProxyIssue('ftp://proxy.example:21')).toBe('unsupportedScheme')
+    expect(updateProxyIssue('http://proxy.example:8080/path')).toBe('unsupportedShape')
+    expect(updateProxyIssue('http://proxy.example:8080?mode=fast')).toBe('unsupportedShape')
+    expect(updateProxyIssue('http://proxy.example:8080#fragment')).toBe('unsupportedShape')
   })
 })
 

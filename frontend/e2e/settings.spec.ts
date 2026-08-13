@@ -144,6 +144,7 @@ test('saving writes the owned keys through set_settings and clears the dirty fla
         'refresh.localIntervalMs': '600000',
         'refresh.remoteIntervalMs': '1200000',
         'update.autoInstallEnabled': 'true',
+        'update.proxyUrl': '',
       },
     },
   })
@@ -247,6 +248,64 @@ test('turning automatic updates off still checks the version but only shows advi
   await qaLocatorScreenshot(page.getByTestId('settings-update'), 'settings-updater-advice.png')
   expect(await mockCalls(page, 'updater_check')).toHaveLength(1)
   expect(await mockCalls(page, 'updater_install')).toHaveLength(0)
+})
+
+test('update proxy supports system, authenticated custom, and rejected URL states', async ({
+  page,
+}) => {
+  await openSettings(page)
+
+  const proxy = page.getByTestId('settings-update-proxy')
+  const state = page.getByTestId('settings-update-proxy-state')
+  const save = page.getByTestId('settings-save')
+  await expect(proxy).toHaveValue('')
+  await expect(state).toHaveText(zh.settings.update.proxySystem)
+  await qaLocatorScreenshot(page.getByTestId('settings-update'), 'settings-updater-proxy-system.png')
+
+  await proxy.fill('http://user:pass@127.0.0.1:7890')
+  await expect(page.getByTestId('settings-update-proxy-issue')).toHaveCount(0)
+  await expect(state).toHaveText(zh.settings.update.proxyCustom)
+  await expect(save).toBeEnabled()
+  await qaLocatorScreenshot(page.getByTestId('settings-update'), 'settings-updater-proxy-custom.png')
+  await save.click()
+  await expect(page.getByTestId('settings-saved')).toBeVisible()
+  const calls = await mockCalls(page, 'set_settings')
+  expect(calls).toHaveLength(1)
+  expect(
+    (calls[0].args as Record<string, { values: Record<string, string> }>).settings.values,
+  ).toMatchObject({ 'update.proxyUrl': 'http://user:pass@127.0.0.1:7890' })
+
+  await proxy.fill('ftp://127.0.0.1:21')
+  await expect(page.getByTestId('settings-update-proxy-issue')).toHaveText(
+    zh.settings.update.proxyUnsupportedScheme,
+  )
+  await expect(proxy).toHaveAttribute('aria-invalid', 'true')
+  await expect(save).toBeDisabled()
+  await expect(page.getByTestId('settings-update-check')).toBeDisabled()
+  await qaLocatorScreenshot(page.getByTestId('settings-update'), 'settings-updater-proxy-invalid.png')
+  expect(await mockCalls(page, 'set_settings')).toHaveLength(1)
+})
+
+test('an updater network failure names the active proxy mode and keeps the source error', async ({
+  page,
+}) => {
+  await openSettings(page, {
+    errors: {
+      updater_check: {
+        code: 'network',
+        message:
+          '无法检查更新：网络请求失败。当前代理模式：系统代理 / 环境变量（未配置时直连）。请检查网络或代理是否可用，也可在“设置 → 应用更新”中配置代理。底层错误：connection refused',
+        fields: { proxyMode: 'system', cause: 'connection refused' },
+      },
+    },
+  })
+
+  await page.getByTestId('settings-update-check').click()
+
+  const card = page.getByTestId('settings-update')
+  await expect(card.getByTestId('error-code')).toHaveText('network')
+  await expect(card.getByTestId('error-message')).toContainText('系统代理 / 环境变量')
+  await expect(card.getByTestId('error-message')).toContainText('connection refused')
 })
 
 /** 关闭状态下也不能让一个非法间隔溜过去：开关与下限校验是两件独立的事。 */

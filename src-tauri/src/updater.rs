@@ -1,40 +1,162 @@
-use std::sync::Mutex;
+use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 
 use agentlens_core::archive::read_app_settings;
+use reqwest::Url;
 use tauri::{ipc::Channel, AppHandle, Manager, Runtime};
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::{Error as UpdaterError, Update, Updater, UpdaterExt};
 
 use crate::contract::{IpcError, IpcErrorCode, UpdateMetadata, UpdateProgress};
 use crate::state::AppState;
 
 pub const SETTING_KEY_AUTO_UPDATE_ENABLED: &str = "update.autoInstallEnabled";
+pub const SETTING_KEY_UPDATE_PROXY_URL: &str = "update.proxyUrl";
 
 const PENDING_UPDATE_LOCK_ERROR: &str = "pending update lock is poisoned";
+const UPDATE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum UpdateProxy {
+    /// Let reqwest resolve HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY and, when the
+    /// `system-proxy` feature is enabled, the operating system proxy configuration.
+    System,
+    Custom(Url),
+}
+
+impl UpdateProxy {
+    fn parse(raw: Option<&str>) -> Result<Self, IpcError> {
+        let raw = raw.unwrap_or_default().trim();
+        if raw.is_empty() {
+            return Ok(Self::System);
+        }
+        if !raw.contains("://") {
+            return Err(IpcError::invalid_input(
+                SETTING_KEY_UPDATE_PROXY_URL,
+                "更新代理必须以 http://、https:// 或 socks5:// 开头",
+            ));
+        }
+
+        let url = Url::parse(raw).map_err(|error| {
+            IpcError::invalid_input(
+                SETTING_KEY_UPDATE_PROXY_URL,
+                format!("更新代理必须是完整 URL（支持 http://、https://、socks5://）：{error}"),
+            )
+        })?;
+        if !matches!(url.scheme(), "http" | "https" | "socks5") {
+            return Err(IpcError::invalid_input(
+                SETTING_KEY_UPDATE_PROXY_URL,
+                format!(
+                    "更新代理协议不受支持：{}；仅支持 http://、https://、socks5://",
+                    url.scheme()
+                ),
+            ));
+        }
+        if url.host_str().is_none() {
+            return Err(IpcError::invalid_input(
+                SETTING_KEY_UPDATE_PROXY_URL,
+                "更新代理 URL 必须包含主机名或 IP 地址",
+            ));
+        }
+        if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+            return Err(IpcError::invalid_input(
+                SETTING_KEY_UPDATE_PROXY_URL,
+                "更新代理 URL 只能包含协议、认证信息、主机和端口，不能包含路径、查询参数或片段",
+            ));
+        }
+
+        Ok(Self::Custom(url))
+    }
+
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Custom(_) => "custom",
+        }
+    }
+
+    fn diagnostic_label(&self) -> String {
+        match self {
+            Self::System => "系统代理 / 环境变量（未配置时直连）".to_owned(),
+            Self::Custom(url) => {
+                let port = url
+                    .port()
+                    .map_or_else(String::new, |port| format!(":{port}"));
+                format!(
+                    "自定义代理 {}://{}{}（认证信息已隐藏）",
+                    url.scheme(),
+                    url.host_str().unwrap_or("<unknown>"),
+                    port
+                )
+            }
+        }
+    }
+}
+
+pub(crate) fn validate_update_settings(values: &BTreeMap<String, String>) -> Result<(), IpcError> {
+    UpdateProxy::parse(values.get(SETTING_KEY_UPDATE_PROXY_URL).map(String::as_str))?;
+    Ok(())
+}
+
+fn resolve_update_proxy(state: &AppState) -> Result<UpdateProxy, IpcError> {
+    let archive = state.lock_archive()?;
+    let values = read_app_settings(archive.connection())
+        .map_err(|error| IpcError::new(IpcErrorCode::Database, error.to_string()))?;
+    UpdateProxy::parse(values.get(SETTING_KEY_UPDATE_PROXY_URL).map(String::as_str))
+}
+
+fn configured_updater<R: Runtime>(
+    app: &AppHandle<R>,
+    proxy: &UpdateProxy,
+) -> Result<Updater, IpcError> {
+    let builder = app.updater_builder().timeout(UPDATE_REQUEST_TIMEOUT);
+    let builder = match proxy {
+        UpdateProxy::System => builder,
+        UpdateProxy::Custom(url) => builder.proxy(url.clone()),
+    };
+    builder
+        .build()
+        .map_err(|error| updater_error("无法初始化更新检查", error, proxy))
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+struct PendingUpdate {
+    update: Update,
+    proxy: UpdateProxy,
+}
 
 /// A checked update is retained in Rust so the frontend can never bypass the persisted install
 /// policy by acquiring the updater plugin's resource id directly.
 #[derive(Default)]
 pub struct PendingUpdateState {
-    update: Mutex<Option<Update>>,
+    update: Mutex<Option<PendingUpdate>>,
 }
 
 impl PendingUpdateState {
-    fn replace(&self, update: Option<Update>) -> Result<(), IpcError> {
+    fn replace(&self, update: Option<Update>, proxy: UpdateProxy) -> Result<(), IpcError> {
         *self
             .update
             .lock()
             .map_err(|_| IpcError::new(IpcErrorCode::Internal, PENDING_UPDATE_LOCK_ERROR))? =
-            update;
+            update.map(|update| PendingUpdate { update, proxy });
         Ok(())
     }
 
     #[cfg(any(target_os = "windows", test))]
-    fn pending(&self) -> Result<Update, IpcError> {
-        self.update
+    fn pending(&self, proxy: &UpdateProxy) -> Result<Update, IpcError> {
+        let pending = self
+            .update
             .lock()
             .map_err(|_| IpcError::new(IpcErrorCode::Internal, PENDING_UPDATE_LOCK_ERROR))?
             .clone()
-            .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "没有可安装的已检查更新"))
+            .ok_or_else(|| IpcError::new(IpcErrorCode::NotFound, "没有可安装的已检查更新"))?;
+        if &pending.proxy != proxy {
+            return Err(IpcError::new(
+                IpcErrorCode::Conflict,
+                "更新代理设置已变化，请重新检查更新后再安装",
+            )
+            .with_field("settingKey", SETTING_KEY_UPDATE_PROXY_URL));
+        }
+        Ok(pending.update)
     }
 }
 
@@ -56,8 +178,22 @@ pub(crate) fn ensure_auto_update_enabled(state: &AppState) -> Result<(), IpcErro
     }
 }
 
-fn updater_error(context: &str, error: impl std::fmt::Display) -> IpcError {
-    IpcError::new(IpcErrorCode::Internal, format!("{context}: {error}"))
+fn updater_error(context: &str, error: UpdaterError, proxy: &UpdateProxy) -> IpcError {
+    let source = error.to_string();
+    if matches!(&error, UpdaterError::Reqwest(_) | UpdaterError::Network(_)) {
+        let proxy_label = proxy.diagnostic_label();
+        IpcError::new(
+            IpcErrorCode::Network,
+            format!(
+                "{context}：网络请求失败。当前代理模式：{proxy_label}。请检查网络或代理是否可用，也可在“设置 → 应用更新”中配置代理。底层错误：{source}"
+            ),
+        )
+        .with_field("proxyMode", proxy.mode())
+        .with_field("proxy", proxy_label)
+        .with_field("cause", source)
+    } else {
+        IpcError::new(IpcErrorCode::Internal, format!("{context}: {source}"))
+    }
 }
 
 fn ensure_auto_install_supported(auto_install_supported: bool) -> Result<(), IpcError> {
@@ -117,15 +253,14 @@ fn metadata_from_update(update: &Update) -> UpdateMetadata {
 #[tauri::command]
 pub async fn updater_check<R: Runtime>(app: AppHandle<R>) -> Result<UpdateMetadata, IpcError> {
     let current_version = app.package_info().version.to_string();
-    let update = app
-        .updater()
-        .map_err(|error| updater_error("无法初始化更新检查", error))?
+    let proxy = resolve_update_proxy(&app.state::<AppState>())?;
+    let update = configured_updater(&app, &proxy)?
         .check()
         .await
-        .map_err(|error| updater_error("无法检查更新", error))?;
+        .map_err(|error| updater_error("无法检查更新", error, &proxy))?;
 
     let metadata = checked_metadata(current_version, update.as_ref());
-    app.state::<PendingUpdateState>().replace(update)?;
+    app.state::<PendingUpdateState>().replace(update, proxy)?;
     Ok(metadata)
 }
 
@@ -152,6 +287,7 @@ fn send_progress(on_event: &Channel<UpdateProgress>, event: UpdateProgress) {
 #[cfg(target_os = "windows")]
 async fn download_and_install(
     update: Update,
+    proxy: &UpdateProxy,
     on_event: Channel<UpdateProgress>,
 ) -> Result<(), IpcError> {
     send_progress(&on_event, UpdateProgress::Started);
@@ -166,7 +302,7 @@ async fn download_and_install(
             move || send_progress(&on_event, UpdateProgress::Downloaded),
         )
         .await
-        .map_err(|error| updater_error("无法下载或安装更新", error))
+        .map_err(|error| updater_error("无法下载或安装更新", error, proxy))
 }
 
 /// The persisted switch is re-read immediately before download so turning it off after a check
@@ -183,8 +319,9 @@ pub async fn updater_install<R: Runtime>(
     #[cfg(target_os = "windows")]
     {
         ensure_auto_install_supported(true)?;
-        let update = app.state::<PendingUpdateState>().pending()?;
-        download_and_install(update, on_event).await
+        let proxy = resolve_update_proxy(&app.state::<AppState>())?;
+        let update = app.state::<PendingUpdateState>().pending(&proxy)?;
+        download_and_install(update, &proxy, on_event).await
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -201,17 +338,21 @@ mod tests {
         net::TcpListener,
         sync::{Arc, Mutex},
         thread,
+        time::Duration,
     };
 
+    use agentlens_core::archive::read_app_settings;
     use serde_json::json;
     use tauri::{ipc::Channel, Manager};
+    use tauri_plugin_updater::Error as UpdaterError;
     use tempfile::TempDir;
 
     use super::{
         current_metadata, ensure_auto_install_supported, ensure_auto_update_enabled,
         metadata_from_parts, next_download_progress, resolve_auto_update_enabled, send_progress,
-        updater_check, updater_error, updater_install, PendingUpdateState,
-        SETTING_KEY_AUTO_UPDATE_ENABLED,
+        updater_check, updater_error, updater_install, validate_update_settings,
+        PendingUpdateState, UpdateProxy, SETTING_KEY_AUTO_UPDATE_ENABLED,
+        SETTING_KEY_UPDATE_PROXY_URL,
     };
     use crate::commands::set_settings_impl;
     use crate::contract::{AppSettings, IpcErrorCode, UpdateProgress};
@@ -290,6 +431,60 @@ mod tests {
         (endpoint, server)
     }
 
+    fn serve_proxy_release(
+        version: &str,
+    ) -> (
+        String,
+        String,
+        std::sync::mpsc::Receiver<String>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind updater proxy");
+        let address = listener.local_addr().expect("read updater proxy address");
+        let body = json!({
+            "version": version,
+            "notes": "proxied release",
+            "pub_date": "2026-08-12T03:00:00Z",
+            "platforms": {
+                "test-target": {
+                    "url": "http://release.invalid/artifact",
+                    "signature": "test-signature"
+                }
+            }
+        })
+        .to_string();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            for response_body in [body.as_bytes(), b"signed artifact bytes"] {
+                let (mut stream, _) = listener.accept().expect("accept updater proxy request");
+                let mut request = [0_u8; 4096];
+                let bytes = stream
+                    .read(&mut request)
+                    .expect("read updater proxy request");
+                let request = String::from_utf8_lossy(&request[..bytes]);
+                let request_line = request.lines().next().unwrap_or_default().to_owned();
+                request_tx
+                    .send(request_line)
+                    .expect("record updater proxy request");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                )
+                .expect("write updater proxy response headers");
+                stream
+                    .write_all(response_body)
+                    .expect("write updater proxy response body");
+            }
+        });
+        (
+            "http://release.invalid/latest.json".to_owned(),
+            format!("http://{address}"),
+            request_rx,
+            server,
+        )
+    }
+
     #[test]
     fn auto_update_defaults_to_enabled_and_recognizes_disabled_spellings() {
         assert!(resolve_auto_update_enabled(None));
@@ -341,11 +536,113 @@ mod tests {
     }
 
     #[test]
-    fn updater_errors_preserve_the_operation_and_source_message() {
-        let error = updater_error("无法检查更新", "endpoint returned 503");
+    fn updater_errors_distinguish_network_failures_and_preserve_diagnostics() {
+        let error = updater_error(
+            "无法检查更新",
+            UpdaterError::Network("endpoint returned 503".to_owned()),
+            &UpdateProxy::System,
+        );
+
+        assert_eq!(error.code, IpcErrorCode::Network);
+        assert!(error.message.contains("系统代理 / 环境变量"));
+        assert!(error.message.contains("设置 → 应用更新"));
+        assert!(error.message.contains("endpoint returned 503"));
+        assert_eq!(
+            error.fields.get("proxyMode").map(String::as_str),
+            Some("system")
+        );
+        assert_eq!(
+            error.fields.get("cause").map(String::as_str),
+            Some("`endpoint returned 503`")
+        );
+    }
+
+    #[test]
+    fn updater_errors_keep_non_network_failures_internal() {
+        let error = updater_error(
+            "无法检查更新",
+            UpdaterError::ReleaseNotFound,
+            &UpdateProxy::System,
+        );
 
         assert_eq!(error.code, IpcErrorCode::Internal);
-        assert_eq!(error.message, "无法检查更新: endpoint returned 503");
+        assert!(error.message.contains("无法检查更新"));
+        assert!(error
+            .message
+            .contains("Could not fetch a valid release JSON from the remote"));
+    }
+
+    #[test]
+    fn network_diagnostics_never_expose_proxy_credentials() {
+        let proxy = UpdateProxy::parse(Some("http://alice:secret@proxy.example:8080"))
+            .expect("authenticated proxy must parse");
+
+        let error = updater_error(
+            "无法检查更新",
+            UpdaterError::Network("connection refused".to_owned()),
+            &proxy,
+        );
+
+        assert_eq!(error.code, IpcErrorCode::Network);
+        assert!(error.message.contains("http://proxy.example:8080"));
+        assert!(!error.message.contains("alice"));
+        assert!(!error.message.contains("secret"));
+        assert_eq!(
+            error.fields.get("proxyMode").map(String::as_str),
+            Some("custom")
+        );
+    }
+
+    #[test]
+    fn proxy_setting_accepts_supported_urls_and_rejects_invalid_values_before_persisting() {
+        for raw in [
+            "",
+            "http://127.0.0.1:7890",
+            "https://proxy.example:8443",
+            "socks5://127.0.0.1:1080",
+            "http://user:pass@proxy.example:8080",
+        ] {
+            let values =
+                BTreeMap::from([(SETTING_KEY_UPDATE_PROXY_URL.to_owned(), raw.to_owned())]);
+            validate_update_settings(&values).expect("supported proxy URL must be accepted");
+        }
+
+        for raw in [
+            "proxy.example:8080",
+            "ftp://proxy.example:21",
+            "http://",
+            "http://proxy.example:8080/path",
+        ] {
+            let values =
+                BTreeMap::from([(SETTING_KEY_UPDATE_PROXY_URL.to_owned(), raw.to_owned())]);
+            let error = validate_update_settings(&values)
+                .expect_err("invalid proxy URL must be rejected before persistence");
+            assert_eq!(error.code, IpcErrorCode::InvalidInput);
+            assert_eq!(
+                error.fields.get("field").map(String::as_str),
+                Some(SETTING_KEY_UPDATE_PROXY_URL)
+            );
+        }
+    }
+
+    #[test]
+    fn settings_command_rejects_an_invalid_proxy_url_without_writing_it() {
+        let (_data_dir, state) = state();
+        let values = BTreeMap::from([(
+            SETTING_KEY_UPDATE_PROXY_URL.to_owned(),
+            "not-a-proxy-url".to_owned(),
+        )]);
+
+        let error = set_settings_impl(&state, AppSettings { values })
+            .expect_err("settings command must reject an invalid proxy URL");
+
+        assert_eq!(error.code, IpcErrorCode::InvalidInput);
+        assert_eq!(
+            error.fields.get("field").map(String::as_str),
+            Some(SETTING_KEY_UPDATE_PROXY_URL)
+        );
+        let persisted = read_app_settings(state.lock_archive().unwrap().connection()).unwrap();
+        assert!(!persisted.contains_key(SETTING_KEY_UPDATE_PROXY_URL));
     }
 
     #[test]
@@ -389,7 +686,7 @@ mod tests {
         assert_eq!(metadata.version, None);
         assert_eq!(
             app.state::<PendingUpdateState>()
-                .pending()
+                .pending(&UpdateProxy::System)
                 .err()
                 .map(|error| error.code),
             Some(IpcErrorCode::NotFound)
@@ -414,9 +711,81 @@ mod tests {
         assert_eq!(metadata.body.as_deref(), Some("signed updater release"));
         let pending = app
             .state::<PendingUpdateState>()
-            .pending()
+            .pending(&UpdateProxy::System)
             .expect("available release must remain pending");
         assert_eq!(pending.version, "0.2.0");
+    }
+
+    #[test]
+    fn pending_update_rejects_install_after_the_proxy_setting_changes() {
+        let (endpoint, server) = serve_release("0.2.0", "signed updater release");
+        let (_data_dir, app) = mock_app(Some(&endpoint));
+        tauri::async_runtime::block_on(updater_check(app.clone()))
+            .expect("new-version check must succeed");
+        server.join().expect("updater endpoint must complete");
+        let changed_proxy =
+            UpdateProxy::parse(Some("http://127.0.0.1:7890")).expect("parse changed proxy");
+
+        let error = app
+            .state::<PendingUpdateState>()
+            .pending(&changed_proxy)
+            .err()
+            .expect("stale pending update must not use the previous proxy");
+
+        assert_eq!(error.code, IpcErrorCode::Conflict);
+        assert_eq!(
+            error.fields.get("settingKey").map(String::as_str),
+            Some(SETTING_KEY_UPDATE_PROXY_URL)
+        );
+    }
+
+    #[test]
+    fn check_and_download_route_through_the_configured_http_proxy() {
+        let (endpoint, proxy_url, request_rx, server) = serve_proxy_release("0.2.0");
+        let (_data_dir, app) = mock_app(Some(&endpoint));
+        let values = BTreeMap::from([(SETTING_KEY_UPDATE_PROXY_URL.to_owned(), proxy_url.clone())]);
+        set_settings_impl(&app.state::<AppState>(), AppSettings { values })
+            .expect("persist updater proxy");
+
+        let metadata = tauri::async_runtime::block_on(updater_check(app.clone()))
+            .expect("proxied update check must succeed");
+        let proxy = UpdateProxy::parse(Some(&proxy_url)).expect("parse persisted updater proxy");
+        let update = app
+            .state::<PendingUpdateState>()
+            .pending(&proxy)
+            .expect("checked update must remain pending");
+        let download_error = tauri::async_runtime::block_on(update.download(|_, _| {}, || {}))
+            .expect_err("fixture signature is intentionally invalid after the proxied download");
+        assert!(
+            matches!(
+                download_error,
+                UpdaterError::Minisign(_)
+                    | UpdaterError::Base64(_)
+                    | UpdaterError::SignatureUtf8(_)
+            ),
+            "download must reach signature verification after proxying: {download_error:?}"
+        );
+
+        let manifest_request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy must observe the updater manifest request");
+        let artifact_request = request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("proxy must observe the updater artifact request");
+        server.join().expect("updater proxy must complete");
+
+        println!(
+            "proxy observed updater requests via {proxy_url}: {manifest_request} | {artifact_request}"
+        );
+        assert_eq!(metadata.version.as_deref(), Some("0.2.0"));
+        assert_eq!(
+            manifest_request,
+            "GET http://release.invalid/latest.json HTTP/1.1"
+        );
+        assert_eq!(
+            artifact_request,
+            "GET http://release.invalid/artifact HTTP/1.1"
+        );
     }
 
     #[test]
@@ -460,10 +829,10 @@ mod tests {
         let state = PendingUpdateState::default();
 
         state
-            .replace(None)
+            .replace(None, UpdateProxy::System)
             .expect("empty pending state must be writable");
         let error = state
-            .pending()
+            .pending(&UpdateProxy::System)
             .err()
             .expect("install requires a previously checked update");
         assert_eq!(error.code, IpcErrorCode::NotFound);

@@ -29,6 +29,12 @@ tauri = { version = "2", features = ["tray-icon"] }
 # scope 约束（scope 只作用于 open_url / open_path），因此 capability 里不需要路径白名单。
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "=2.10.1"
+# updater 内部同样使用 reqwest 0.13；这个直接依赖只负责把 feature 统一进 crate 图：
+# system-proxy 让 Windows/macOS 读取系统代理，socks 让用户配置的 socks5:// 真正可用。
+reqwest = { version = "=0.13.4", default-features = false, features = [
+  "socks",
+  "system-proxy",
+] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
