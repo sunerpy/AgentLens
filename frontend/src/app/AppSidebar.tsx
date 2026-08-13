@@ -61,7 +61,7 @@ const VIEW_ICONS: Record<ViewKey, LucideIcon> = {
 const CONTROL_CLASS = cn(
   'inline-flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-md',
   'text-xs font-medium text-muted-foreground transition-colors outline-none',
-  'hover:bg-muted hover:text-foreground',
+  'hover:bg-foreground/10 hover:text-foreground',
   'focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1',
   'focus-visible:ring-offset-card',
   '[&_svg]:pointer-events-none [&_svg]:size-3.5 [&_svg]:shrink-0',
@@ -377,7 +377,7 @@ export function AppSidebar({
                     collapsed ? 'justify-center px-0' : 'justify-start gap-2.5 px-3',
                     isActive
                       ? 'bg-primary text-primary-foreground shadow-panel'
-                      : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+                      : 'text-muted-foreground hover:bg-foreground/10 hover:text-foreground',
                   )}
                 >
                   {/*

@@ -575,4 +575,51 @@
     user-select: none;
     -webkit-user-select: none;
   }
+
+  /*
+   * Cursor affordance. Tailwind v4's preflight dropped v3's `button { cursor: pointer }`,
+   * and preflight's own `button` reset still out-specifies the UA sheet, so every control
+   * in this app rendered with the plain arrow. In a desktop webview that is not cosmetic:
+   * the pointer shape is the FIRST signal that a thing can be clicked, and a window where
+   * nothing responds to the mouse reads as hung. Restored here rather than per-component
+   * because a new control would otherwise have to remember, and nothing would fail if it
+   * forgot.
+   *
+   * Allow-list, NOT `* { cursor: pointer }`: a pointer on something inert is worse than a
+   * missing one — it invites a click that does nothing. Only elements whose entire purpose
+   * is to be activated are listed. `label:has(input[type=checkbox])` is in because the
+   * caption is a real hit target for the box; a label wrapping a text field is not.
+   *
+   * Base layer, so any explicit `cursor-*` utility still wins — that is what keeps the
+   * sidebar's `cursor-col-resize` grip and `cursor-e-resize` recall edge intact.
+   */
+  button,
+  summary,
+  [role='button'],
+  [role='tab'],
+  [role='radio'],
+  [role='option'],
+  select,
+  input[type='checkbox'],
+  input[type='radio'],
+  input[type='range'],
+  input[type='color'],
+  input[type='file'],
+  label:has(input[type='checkbox']),
+  label:has(input[type='radio']) {
+    cursor: pointer;
+  }
+
+  /*
+   * A disabled control must not keep the pointer: that promises a click which is then
+   * rejected, which is more confusing than no affordance at all. Separate rule placed
+   * after the block above so it wins on equal specificity.
+   */
+  button:disabled,
+  select:disabled,
+  input:disabled,
+  textarea:disabled,
+  [aria-disabled='true'] {
+    cursor: not-allowed;
+  }
 }

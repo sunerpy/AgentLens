@@ -973,7 +973,7 @@ function GroupedLegend({
               onClick={() => onSelect(entry.key)}
               className={cn(
                 'flex min-w-0 flex-1 items-baseline gap-2 rounded-md px-1.5 py-0.5 text-left text-xs transition-colors',
-                'hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+                'hover:bg-foreground/10 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
                 selected && 'bg-muted ring-1 ring-inset ring-foreground/15',
                 dimmed && 'opacity-45',
               )}

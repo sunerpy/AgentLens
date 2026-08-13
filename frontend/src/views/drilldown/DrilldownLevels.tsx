@@ -37,9 +37,9 @@ function DrillName({
       onClick={onSelect}
       aria-pressed={selected}
       title={zh.drilldown.drillHint}
-      className="flex max-w-full flex-col items-start gap-0.5 rounded-md px-1 py-0.5 text-left outline-ring/50 focus-visible:outline-2"
+      className="group/drill flex max-w-full flex-col items-start gap-0.5 rounded-md px-1 py-0.5 text-left transition-colors outline-ring/50 hover:bg-foreground/10 focus-visible:outline-2"
     >
-      <span className="truncate text-sm font-medium">{label}</span>
+      <span className="truncate text-sm font-medium group-hover/drill:underline">{label}</span>
       <span className="truncate font-mono text-[11px] text-muted-foreground">{secondary}</span>
     </button>
   )
@@ -70,7 +70,7 @@ export function HostFilter({
         value={hostId ?? ''}
         disabled={unavailable}
         onChange={(event) => onSelectHost(event.target.value === '' ? null : event.target.value)}
-        className="rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground disabled:opacity-60"
+        className="rounded-md border border-border bg-background px-2 py-1 text-xs text-foreground outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 disabled:opacity-60"
       >
         <option value="">
           {unavailable ? zh.drilldown.hostUnavailable : zh.drilldown.hostAll}
@@ -255,7 +255,7 @@ export function ModelLevel({
                       aria-label={
                         expanded ? zh.drilldown.collapseVariants : zh.drilldown.expandVariants
                       }
-                      className="flex max-w-full items-start gap-2 rounded-md px-1 py-0.5 text-left outline-ring/50 focus-visible:outline-2"
+                      className="flex max-w-full items-start gap-2 rounded-md px-1 py-0.5 text-left transition-colors outline-ring/50 hover:bg-foreground/10 focus-visible:outline-2"
                     >
                       {expanded ? (
                         <ChevronDown className="mt-1 size-3.5 shrink-0 text-muted-foreground" />
