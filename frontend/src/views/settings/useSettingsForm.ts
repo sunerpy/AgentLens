@@ -29,11 +29,14 @@ import {
   SETTING_KEY_AUTO_UPDATE_ENABLED,
   SETTING_KEY_LOCAL_INTERVAL_MS,
   SETTING_KEY_REMOTE_INTERVAL_MS,
+  SETTING_KEY_UPDATE_PROXY_URL,
   autoRefreshEnabledFromSettings,
   autoUpdateEnabledFromSettings,
   intervalSecondsFromSettings,
   parseIntervalSeconds,
   type IntervalIssue,
+  type UpdateProxyIssue,
+  updateProxyIssue,
 } from './settingsKeys'
 
 export interface SettingsFormValues {
@@ -41,6 +44,7 @@ export interface SettingsFormValues {
   weekStart: WeekStart
   autoRefreshEnabled: boolean
   autoUpdateEnabled: boolean
+  updateProxyUrl: string
   localIntervalSeconds: string
   remoteIntervalSeconds: string
 }
@@ -50,6 +54,7 @@ type SettingsDraft = Partial<SettingsFormValues>
 export interface IntervalIssues {
   local: IntervalIssue | null
   remote: IntervalIssue | null
+  updateProxy: UpdateProxyIssue | null
 }
 
 function persistedValues(settings: AppSettings): SettingsFormValues {
@@ -59,6 +64,7 @@ function persistedValues(settings: AppSettings): SettingsFormValues {
     weekStart: values[SETTING_KEY_WEEK_START] === 'sunday' ? 'sunday' : 'monday',
     autoRefreshEnabled: autoRefreshEnabledFromSettings(values),
     autoUpdateEnabled: autoUpdateEnabledFromSettings(values),
+    updateProxyUrl: values[SETTING_KEY_UPDATE_PROXY_URL] ?? '',
     localIntervalSeconds: String(
       intervalSecondsFromSettings(
         values,
@@ -99,8 +105,12 @@ export function useSettingsForm() {
    */
   const local = values === undefined ? null : parseIntervalSeconds(values.localIntervalSeconds)
   const remote = values === undefined ? null : parseIntervalSeconds(values.remoteIntervalSeconds)
-  const issues: IntervalIssues = { local: local?.issue ?? null, remote: remote?.issue ?? null }
-  const hasIssue = issues.local !== null || issues.remote !== null
+  const issues: IntervalIssues = {
+    local: local?.issue ?? null,
+    remote: remote?.issue ?? null,
+    updateProxy: values === undefined ? null : updateProxyIssue(values.updateProxyUrl),
+  }
+  const hasIssue = issues.local !== null || issues.remote !== null || issues.updateProxy !== null
 
   const save = useMutation({
     /**
@@ -123,6 +133,7 @@ export function useSettingsForm() {
           [SETTING_KEY_WEEK_START]: payload.weekStart,
           [SETTING_KEY_AUTO_REFRESH_ENABLED]: String(payload.autoRefreshEnabled),
           [SETTING_KEY_AUTO_UPDATE_ENABLED]: String(payload.autoUpdateEnabled),
+          [SETTING_KEY_UPDATE_PROXY_URL]: payload.updateProxyUrl.trim(),
           [SETTING_KEY_LOCAL_INTERVAL_MS]: String(localSeconds * 1000),
           [SETTING_KEY_REMOTE_INTERVAL_MS]: String(remoteSeconds * 1000),
         },

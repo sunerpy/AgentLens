@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 
+import { THEME_KEYS, THEME_MODE, type ThemeKey } from '../src/app/theme/themes'
 import { zh } from '../src/i18n/zh'
 import { mockCalls, openShell, qaLocatorScreenshot, qaScreenshot } from './harness'
 
@@ -25,6 +26,22 @@ const SETTINGS_DATASET = {
     },
   },
 } as const
+
+type Rgb = readonly [number, number, number]
+
+function luminance([red, green, blue]: Rgb): number {
+  const [r, g, b] = [red, green, blue].map((raw) => {
+    const value = raw / 255
+    return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+  })
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b
+}
+
+function contrast(left: Rgb, right: Rgb): number {
+  const a = luminance(left)
+  const b = luminance(right)
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05)
+}
 
 async function openSettings(page: Parameters<typeof openShell>[0], config = {}) {
   await openShell(page, { dataset: SETTINGS_DATASET, ...config })
@@ -144,6 +161,7 @@ test('saving writes the owned keys through set_settings and clears the dirty fla
         'refresh.localIntervalMs': '600000',
         'refresh.remoteIntervalMs': '1200000',
         'update.autoInstallEnabled': 'true',
+        'update.proxyUrl': '',
       },
     },
   })
@@ -247,6 +265,163 @@ test('turning automatic updates off still checks the version but only shows advi
   await qaLocatorScreenshot(page.getByTestId('settings-update'), 'settings-updater-advice.png')
   expect(await mockCalls(page, 'updater_check')).toHaveLength(1)
   expect(await mockCalls(page, 'updater_install')).toHaveLength(0)
+})
+
+test('update proxy supports system, authenticated custom, and rejected URL states', async ({
+  page,
+}) => {
+  await openSettings(page)
+
+  const proxy = page.getByTestId('settings-update-proxy')
+  const state = page.getByTestId('settings-update-proxy-state')
+  const save = page.getByTestId('settings-save')
+  await expect(proxy).toHaveValue('')
+  await expect(state).toHaveText(zh.settings.update.proxySystem)
+  await qaLocatorScreenshot(
+    page.getByTestId('settings-update'),
+    'settings-updater-proxy-system.png',
+  )
+
+  await proxy.fill('http://user:pass@127.0.0.1:7890')
+  await expect(page.getByTestId('settings-update-proxy-issue')).toHaveCount(0)
+  await expect(state).toHaveText(zh.settings.update.proxyCustom)
+  await expect(save).toBeEnabled()
+  await qaLocatorScreenshot(
+    page.getByTestId('settings-update'),
+    'settings-updater-proxy-custom.png',
+  )
+  await save.click()
+  await expect(page.getByTestId('settings-saved')).toBeVisible()
+  const calls = await mockCalls(page, 'set_settings')
+  expect(calls).toHaveLength(1)
+  expect(
+    (calls[0].args as Record<string, { values: Record<string, string> }>).settings.values,
+  ).toMatchObject({ 'update.proxyUrl': 'http://user:pass@127.0.0.1:7890' })
+
+  await proxy.fill('ftp://127.0.0.1:21')
+  await expect(page.getByTestId('settings-update-proxy-issue')).toHaveText(
+    zh.settings.update.proxyUnsupportedScheme,
+  )
+  await expect(page.getByTestId('settings-update-proxy-hint')).toHaveText(
+    zh.settings.update.proxyHint,
+  )
+  await expect(proxy).toHaveAttribute('aria-invalid', 'true')
+  await expect(save).toBeDisabled()
+  await expect(page.getByTestId('settings-update-check')).toBeDisabled()
+  await qaLocatorScreenshot(
+    page.getByTestId('settings-update'),
+    'settings-updater-proxy-invalid.png',
+  )
+  expect(await mockCalls(page, 'set_settings')).toHaveLength(1)
+})
+
+test('proxy error and guidance remain readable without overlap in every theme', async ({
+  page,
+}) => {
+  await openSettings(page, {
+    dataset: {
+      settings: {
+        values: {
+          ...SETTINGS_DATASET.settings.values,
+          'ui.theme': 'violet',
+        },
+      },
+    },
+  })
+
+  await page.getByTestId('settings-update-proxy').fill('ftp://127.0.0.1:21')
+  const card = page.getByTestId('settings-update')
+  const issue = page.getByTestId('settings-update-proxy-issue')
+  const hint = page.getByTestId('settings-update-proxy-hint')
+  await expect(issue).toHaveText(zh.settings.update.proxyUnsupportedScheme)
+  await expect(hint).toHaveText(zh.settings.update.proxyHint)
+  await page.addStyleTag({
+    content: '*, *::before, *::after { transition: none !important; animation: none !important }',
+  })
+
+  for (const theme of THEME_KEYS) {
+    await page.evaluate(
+      ({ theme, dark }: { theme: ThemeKey; dark: boolean }) => {
+        document.documentElement.setAttribute('data-theme', theme)
+        document.documentElement.classList.toggle('dark', dark)
+      },
+      { theme, dark: THEME_MODE[theme] === 'dark' },
+    )
+
+    const paint = await page.evaluate(() => {
+      const canvas = document.createElement('canvas')
+      canvas.width = 1
+      canvas.height = 1
+      const context = canvas.getContext('2d', { willReadFrequently: true })
+      const toRgb = (colour: string): [number, number, number] => {
+        if (context === null) return [-1, -1, -1]
+        context.clearRect(0, 0, 1, 1)
+        context.fillStyle = colour
+        context.fillRect(0, 0, 1, 1)
+        const [red, green, blue] = context.getImageData(0, 0, 1, 1).data
+        return [red, green, blue]
+      }
+      const find = (testId: string) => document.querySelector(`[data-testid="${testId}"]`)
+      const style = (testId: string) => getComputedStyle(find(testId) as Element)
+      const cardRect = find('settings-update')?.getBoundingClientRect()
+      const issueRect = find('settings-update-proxy-issue')?.getBoundingClientRect()
+      const hintRect = find('settings-update-proxy-hint')?.getBoundingClientRect()
+      return {
+        card: toRgb(style('settings-update').backgroundColor),
+        issue: toRgb(style('settings-update-proxy-issue').color),
+        hint: toRgb(style('settings-update-proxy-hint').color),
+        geometry:
+          cardRect === undefined || issueRect === undefined || hintRect === undefined
+            ? null
+            : {
+                separated: issueRect.bottom <= hintRect.top,
+                contained:
+                  issueRect.left >= cardRect.left &&
+                  issueRect.right <= cardRect.right &&
+                  hintRect.left >= cardRect.left &&
+                  hintRect.right <= cardRect.right,
+              },
+      }
+    })
+
+    expect(paint.geometry, `${theme} helper geometry`).toEqual({
+      separated: true,
+      contained: true,
+    })
+    expect(
+      contrast(paint.card, paint.issue),
+      `${theme} proxy error contrast`,
+    ).toBeGreaterThanOrEqual(4.5)
+    expect(contrast(paint.card, paint.hint), `${theme} proxy hint contrast`).toBeGreaterThanOrEqual(
+      4.5,
+    )
+  }
+
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'violet')
+  await expect(page.locator('html')).toHaveClass(/dark/)
+  await qaLocatorScreenshot(card, 'settings-updater-proxy-invalid-violet.png')
+})
+
+test('an updater network failure names the active proxy mode and keeps the source error', async ({
+  page,
+}) => {
+  await openSettings(page, {
+    errors: {
+      updater_check: {
+        code: 'network',
+        message:
+          '无法检查更新：网络请求失败。当前代理模式：系统代理 / 环境变量（未配置时直连）。请检查网络或代理是否可用，也可在“设置 → 应用更新”中配置代理。底层错误：connection refused',
+        fields: { proxyMode: 'system', cause: 'connection refused' },
+      },
+    },
+  })
+
+  await page.getByTestId('settings-update-check').click()
+
+  const card = page.getByTestId('settings-update')
+  await expect(card.getByTestId('error-code')).toHaveText('network')
+  await expect(card.getByTestId('error-message')).toContainText('系统代理 / 环境变量')
+  await expect(card.getByTestId('error-message')).toContainText('connection refused')
 })
 
 /** 关闭状态下也不能让一个非法间隔溜过去：开关与下限校验是两件独立的事。 */

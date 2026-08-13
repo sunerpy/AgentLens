@@ -21,6 +21,7 @@ export const SETTING_KEY_AUTO_REFRESH_ENABLED = 'refresh.autoRefreshEnabled'
  * `resolve_auto_update_enabled`, so installations predating the setting retain the default policy.
  */
 export const SETTING_KEY_AUTO_UPDATE_ENABLED = 'update.autoInstallEnabled'
+export const SETTING_KEY_UPDATE_PROXY_URL = 'update.proxyUrl'
 
 /**
  * Hard floor for both refresh intervals, mirroring `MIN_AUTO_REFRESH_INTERVAL_MS`.
@@ -37,6 +38,7 @@ export const DEFAULT_LOCAL_INTERVAL_SECONDS = 600
 export const DEFAULT_REMOTE_INTERVAL_SECONDS = 900
 
 export type IntervalIssue = 'malformed' | 'belowFloor'
+export type UpdateProxyIssue = 'malformed' | 'unsupportedScheme' | 'unsupportedShape'
 
 export interface ParsedInterval {
   seconds: number | null
@@ -57,6 +59,25 @@ export function parseIntervalSeconds(raw: string): ParsedInterval {
   if (!Number.isSafeInteger(parsed) || parsed <= 0) return { seconds: null, issue: 'malformed' }
   if (parsed < MIN_INTERVAL_SECONDS) return { seconds: null, issue: 'belowFloor' }
   return { seconds: parsed, issue: null }
+}
+
+export function updateProxyIssue(raw: string): UpdateProxyIssue | null {
+  const trimmed = raw.trim()
+  if (trimmed === '') return null
+  if (!trimmed.includes('://')) return 'malformed'
+
+  let url: URL
+  try {
+    url = new URL(trimmed)
+  } catch {
+    return 'malformed'
+  }
+  if (!['http:', 'https:', 'socks5:'].includes(url.protocol)) return 'unsupportedScheme'
+  if (url.hostname === '') return 'malformed'
+  if ((url.pathname !== '' && url.pathname !== '/') || url.search !== '' || url.hash !== '') {
+    return 'unsupportedShape'
+  }
+  return null
 }
 
 /** Reads the auto-refresh toggle exactly as `resolve_auto_refresh_enabled` does in Rust. */

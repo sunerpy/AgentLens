@@ -8,12 +8,19 @@ import type { UpdateMetadata, UpdateProgress } from '@/generated'
 import { zh } from '@/i18n/zh'
 import { updaterCheck, updaterInstall } from '@/lib/ipc'
 
-import { SettingsField } from './SettingsField'
+import { CONTROL_CLASS, SettingsField } from './SettingsField'
+import type { UpdateProxyIssue } from './settingsKeys'
 import type { useSettingsForm } from './useSettingsForm'
 
 type Form = ReturnType<typeof useSettingsForm>
 
 const RELEASE_URL = 'https://github.com/sunerpy/AgentLens/releases/latest'
+
+const PROXY_ISSUE_TEXT: Record<UpdateProxyIssue, string> = {
+  malformed: zh.settings.update.proxyMalformed,
+  unsupportedScheme: zh.settings.update.proxyUnsupportedScheme,
+  unsupportedShape: zh.settings.update.proxyUnsupportedShape,
+}
 
 function progressPercent(progress: UpdateProgress | null): number | null {
   if (progress?.event !== 'downloading') return null
@@ -51,6 +58,8 @@ export function UpdateSettingsCard({ form }: { form: Form }) {
           ? zh.settings.update.unsavedAdvice
           : null
   const percent = progressPercent(progress)
+  const proxyIssue = form.issues.updateProxy
+  const usingSystemProxy = values.updateProxyUrl.trim() === ''
 
   const check = async () => {
     setChecking(true)
@@ -116,12 +125,59 @@ export function UpdateSettingsCard({ form }: { form: Form }) {
           </div>
         </SettingsField>
 
+        <SettingsField
+          id="settings-update-proxy"
+          label={zh.settings.update.proxy}
+          hint={
+            <span className="flex flex-col gap-1">
+              {proxyIssue === null ? null : (
+                <span
+                  data-testid="settings-update-proxy-issue"
+                  className="font-medium text-destructive"
+                >
+                  {PROXY_ISSUE_TEXT[proxyIssue]}
+                </span>
+              )}
+              <span data-testid="settings-update-proxy-hint">{zh.settings.update.proxyHint}</span>
+            </span>
+          }
+        >
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <input
+              id="settings-update-proxy"
+              data-testid="settings-update-proxy"
+              type="text"
+              inputMode="url"
+              autoCapitalize="off"
+              autoComplete="off"
+              spellCheck={false}
+              aria-invalid={proxyIssue !== null}
+              className={`${CONTROL_CLASS} min-w-0 flex-1 font-mono`}
+              placeholder={zh.settings.update.proxyPlaceholder}
+              value={values.updateProxyUrl}
+              onChange={(event) => {
+                setMetadata(null)
+                setError(null)
+                form.update({ updateProxyUrl: event.target.value })
+              }}
+            />
+            {proxyIssue === null ? (
+              <span
+                data-testid="settings-update-proxy-state"
+                className="w-fit rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground select-none"
+              >
+                {usingSystemProxy ? zh.settings.update.proxySystem : zh.settings.update.proxyCustom}
+              </span>
+            ) : null}
+          </div>
+        </SettingsField>
+
         <div className="flex flex-wrap items-center gap-3 border-t border-border pt-4">
           <Button
             type="button"
             variant="outline"
             data-testid="settings-update-check"
-            disabled={checking || installing}
+            disabled={checking || installing || form.dirty || form.hasIssue}
             onClick={() => void check()}
           >
             {checking ? zh.settings.update.checking : zh.settings.update.check}

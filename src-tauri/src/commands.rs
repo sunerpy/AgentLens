@@ -463,6 +463,7 @@ pub async fn set_settings<R: Runtime>(
 
 pub(crate) fn set_settings_impl(state: &AppState, settings: AppSettings) -> IpcResult<AppSettings> {
     validate_refresh_settings(&settings.values)?;
+    crate::updater::validate_update_settings(&settings.values)?;
     let mut archive = state.lock_archive()?;
     write_app_settings(archive.connection_mut(), &settings.values).map_err(database_error)?;
     drop(archive);

@@ -9,4 +9,5 @@ export type IpcErrorCode =
   | 'database'
   | 'pricing'
   | 'refresh'
+  | 'network'
   | 'internal'

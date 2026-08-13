@@ -79,6 +79,7 @@ const IPC_ERROR_CODES: readonly IpcErrorCode[] = [
   'database',
   'pricing',
   'refresh',
+  'network',
   'internal',
 ]
 

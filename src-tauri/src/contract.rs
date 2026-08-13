@@ -40,6 +40,7 @@ pub enum IpcErrorCode {
     Database,
     Pricing,
     Refresh,
+    Network,
     Internal,
 }
 
