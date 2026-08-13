@@ -154,7 +154,7 @@ export function ReportSettingsCard({ form }: { form: Form }) {
                 id="settings-auto-refresh"
                 data-testid="settings-auto-refresh"
                 type="checkbox"
-                className="size-4 accent-primary"
+                className="size-4 accent-primary outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
                 checked={values.autoRefreshEnabled}
                 onChange={(event) => form.update({ autoRefreshEnabled: event.target.checked })}
               />

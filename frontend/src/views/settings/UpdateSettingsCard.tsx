@@ -113,7 +113,7 @@ export function UpdateSettingsCard({ form }: { form: Form }) {
               id="settings-auto-update"
               data-testid="settings-auto-update"
               type="checkbox"
-              className="size-4 accent-primary"
+              className="size-4 accent-primary outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
               checked={values.autoUpdateEnabled}
               onChange={(event) => form.update({ autoUpdateEnabled: event.target.checked })}
             />

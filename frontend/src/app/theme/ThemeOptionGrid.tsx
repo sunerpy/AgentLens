@@ -58,7 +58,7 @@ export function ThemeOptionGrid({
             className={cn(
               'flex min-w-0 items-center gap-3 rounded-lg px-2.5 py-2 text-left transition-colors',
               'outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
-              active ? 'bg-accent text-accent-foreground' : 'hover:bg-muted',
+              active ? 'bg-accent text-accent-foreground' : 'hover:bg-foreground/10',
             )}
           >
             <Swatch theme={candidate} />

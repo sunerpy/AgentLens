@@ -257,7 +257,7 @@ const SourceEditor = memo(function SourceEditor({
                 id={inputId}
                 type="checkbox"
                 data-testid={inputId}
-                className="size-3.5 accent-primary"
+                className="size-3.5 accent-primary outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
                 checked={selected.includes(source)}
                 onChange={(event) => toggle(source, event.target.checked)}
               />
