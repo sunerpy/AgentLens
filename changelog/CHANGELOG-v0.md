@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.7](https://github.com/sunerpy/AgentLens/compare/v0.0.6...v0.0.7) (2026-08-13)
+
+
+### Bug Fixes
+
+* **ui:** 修复全部页面缺失的鼠标交互反馈 ([#29](https://github.com/sunerpy/AgentLens/issues/29)) ([7a08212](https://github.com/sunerpy/AgentLens/commit/7a08212aeb139f3a29713517c9afcc378495be27))
+
 ## [0.0.6](https://github.com/sunerpy/AgentLens/compare/v0.0.5...v0.0.6) (2026-08-13)
 
 
