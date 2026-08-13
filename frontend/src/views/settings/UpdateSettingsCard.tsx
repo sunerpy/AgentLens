@@ -129,13 +129,17 @@ export function UpdateSettingsCard({ form }: { form: Form }) {
           id="settings-update-proxy"
           label={zh.settings.update.proxy}
           hint={
-            proxyIssue === null ? (
-              zh.settings.update.proxyHint
-            ) : (
-              <span data-testid="settings-update-proxy-issue" className="text-destructive">
-                {PROXY_ISSUE_TEXT[proxyIssue]}
-              </span>
-            )
+            <span className="flex flex-col gap-1">
+              {proxyIssue === null ? null : (
+                <span
+                  data-testid="settings-update-proxy-issue"
+                  className="font-medium text-destructive"
+                >
+                  {PROXY_ISSUE_TEXT[proxyIssue]}
+                </span>
+              )}
+              <span data-testid="settings-update-proxy-hint">{zh.settings.update.proxyHint}</span>
+            </span>
           }
         >
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
